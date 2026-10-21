@@ -4068,10 +4068,11 @@ impl Server {
             return false;
         };
         let source_path = uri_to_path(source_uri.as_str());
+        // The project that owns the document answers about it, as every
+        // other request is answered, not a copy another project keeps.
         let Some((shadow_uri, generated_text, generated_range, version)) = runtime
-            .overlays
-            .iter()
-            .filter_map(|overlay| {
+            .overlay_for_source(&source_path)
+            .and_then(|overlay| {
                 let shadow = overlay.shadow_for_source(&source_path)?;
                 let ranges = generated_component_ranges(
                     overlay.projection_map(&source_path)?,
@@ -4085,7 +4086,6 @@ impl Server {
                     shadow.version.saturating_add(10_000),
                 ))
             })
-            .next()
         else {
             return false;
         };

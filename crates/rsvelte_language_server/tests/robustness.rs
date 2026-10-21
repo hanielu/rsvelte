@@ -841,6 +841,71 @@ fn a_project_loaded_later_gets_the_unsaved_buffers_it_copies() {
     server.shutdown();
 }
 
+/// Component-attribute completion asks tsgo about the component through the
+/// project that owns the document, even when another project holding a copy
+/// of it loaded first (review s9).
+#[cfg(unix)]
+#[test]
+fn component_attribute_completion_asks_the_owning_project() {
+    let dir = TestDir::new("component-query-owner");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = fs::canonicalize(&dir.0).unwrap().join("ws");
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir_all(root.join("b")).unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    fs::write(root.join("a/tsconfig.json"), "{}").unwrap();
+    fs::write(root.join("b/tsconfig.json"), "{}").unwrap();
+    let parent =
+        "<script lang=\"ts\">\n\timport Child from './Child.svelte';\n</script>\n\n<Child  />\n";
+    fs::write(root.join("b/Parent.svelte"), parent).unwrap();
+    fs::write(
+        root.join("b/Child.svelte"),
+        "<script lang=\"ts\">\n\tlet { alpha }: { alpha: string } = $props();\n</script>\n",
+    )
+    .unwrap();
+    let uses = "<script lang=\"ts\">\n\timport Parent from '../b/Parent.svelte';\n</script>\n\n<Parent />\n";
+    fs::write(root.join("a/Uses.svelte"), uses).unwrap();
+    let mut server = Server::start(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+        ],
+    );
+    // The project holding a copy of Parent loads first.
+    let uses_uri = file_uri(&root.join("a/Uses.svelte"));
+    server.open(&uses_uri, uses);
+    hover(&mut server, &uses_uri);
+    let parent_uri = file_uri(&root.join("b/Parent.svelte"));
+    server.open(&parent_uri, parent);
+    let id = server.request(
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": parent_uri },
+            "position": { "line": 4, "character": 7 },
+            "context": { "triggerKind": 1 },
+        }),
+    );
+    let response = server.response(id, Duration::from_secs(10));
+    assert!(response.get("result").is_some(), "{response}");
+    let completions = traffic(&log)
+        .into_iter()
+        .filter(|line| line.starts_with("textDocument/completion "))
+        .collect::<Vec<_>>();
+    assert!(
+        completions.len() >= 2,
+        "the editor's completion and the component query: {completions:?}"
+    );
+    assert!(
+        completions
+            .iter()
+            .all(|line| line.contains("/.svelte-rs/projects/b/")),
+        "{completions:?}"
+    );
+    server.shutdown();
+}
+
 #[cfg(unix)]
 const FAKE_TSGO_TRAFFIC: &str = r###"
 use std::fs::OpenOptions;
