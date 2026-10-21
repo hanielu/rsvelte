@@ -1,9 +1,17 @@
-//! Diskless Svelte projections for the tsgo LSP child process.
+//! Svelte projections for the tsgo LSP child process.
 //!
-//! tsgo only considers an in-memory file during module resolution when its
-//! parent directory exists. This module therefore persists the minimum viable
-//! project — a tsconfig, the svelte2tsx shims, and empty parent directories —
-//! while every generated `.svelte.tsx` body stays in memory.
+//! Every project gets an overlay tsconfig, the svelte2tsx shims and a shadow
+//! tree mirroring the workspace. The generated `.svelte.tsx` body of every
+//! component the project serves is written into that tree, where the config's
+//! `svelte/**/*` include finds it, so tsgo builds the program from disk exactly
+//! once, and only for a project a request actually needs. Only documents open
+//! in the editor (and JavaScript components, whose script kind the `.tsx` name
+//! would lose) are handed to tsgo as in-memory buffers, and an open buffer
+//! always wins over the body on disk.
+//!
+//! Keeping the bodies in memory instead — `didOpen` for every component — makes
+//! each `didOpen` a file *creation* for tsgo, so it rebuilds the whole program
+//! once per component before it can answer the first request.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -26,7 +34,9 @@ use sourcemap::{SourceMap, SourceMapBuilder};
 
 use crate::text::LineIndex;
 
-const CACHE_DIRECTORY: &str = ".rsvelte-language-server";
+/// Distinct from upstream rsvelte's diskless `.rsvelte-language-server`, which
+/// refuses to run over a shadow body that exists on disk.
+pub(crate) const CACHE_DIRECTORY: &str = ".svelte-rs";
 const NESTED_PROJECTS_DIRECTORY: &str = "projects";
 const TSGO_DIRECTORY: &str = "tsgo";
 const SHADOW_DIRECTORY: &str = "svelte";
@@ -46,7 +56,8 @@ pub struct ShadowDocument {
     pub shadow_uri: Uri,
     /// LSP language id sent to tsgo.
     pub language_id: String,
-    /// Generated svelte2tsx body. This text is never persisted by the overlay.
+    /// Generated svelte2tsx body. The overlay persists it for a closed document
+    /// ([`TsgoOverlay::persist_body`]); an editor buffer's text is never written.
     pub text: String,
     /// Document version sent to tsgo.
     pub version: i32,
@@ -66,17 +77,17 @@ pub struct ShadowResolutionInfo {
     pub shadow_in_cache: bool,
     /// Whether tsgo's required on-disk parent directory exists.
     pub parent_directory_exists: bool,
-    /// Whether an in-memory shadow body is registered for this route.
+    /// Whether a shadow body is registered for this route.
     pub shadow_registered: bool,
     /// Whether the overlay tsconfig's include pattern admits the shadow.
     pub included_by_overlay_config: bool,
-    /// Whether the shadow body was accidentally written to disk.
+    /// Whether the body tsgo reads for a closed document is on disk.
     pub body_exists_on_disk: bool,
 }
 
 impl ShadowResolutionInfo {
     /// Whether the route has every invariant needed to avoid ambient-any
-    /// fallback while retaining diskless overlay semantics.
+    /// fallback: tsgo finds the body through the overlay config's include.
     #[must_use]
     pub const fn is_resolvable(&self) -> bool {
         self.source_in_workspace
@@ -84,7 +95,7 @@ impl ShadowResolutionInfo {
             && self.parent_directory_exists
             && self.shadow_registered
             && self.included_by_overlay_config
-            && !self.body_exists_on_disk
+            && self.body_exists_on_disk
     }
 }
 
@@ -201,7 +212,15 @@ struct ShadowState {
     parser_error: Option<String>,
 }
 
-/// Workspace-scoped diskless overlay used by the tsgo LSP proxy.
+impl ShadowState {
+    /// A `.svelte` component's shadow — a projection or its parser-error
+    /// fallback — rather than a plain module routed through the project.
+    const fn is_component(&self) -> bool {
+        !self.identity || self.parser_error.is_some()
+    }
+}
+
+/// Workspace-scoped overlay used by the tsgo LSP proxy.
 pub struct TsgoOverlay {
     workspace: PathBuf,
     /// The directory the shadow tree mirrors. The workspace itself, except for
@@ -654,12 +673,14 @@ impl TsgoOverlay {
         self.open_or_update(&source_path, &text, version)
     }
 
-    /// Close an editor buffer while keeping its project shadow eagerly open.
+    /// Close an editor buffer while keeping its component in the project.
     ///
     /// If the source remains on disk, the returned document contains a fresh
-    /// disk projection and should be sent as `didChange`. If the source was
-    /// deleted, its route is removed and `None` is returned; the caller should
-    /// send `didClose` for the previously known shadow URI.
+    /// disk projection: the caller persists it ([`Self::persist_body`]) before
+    /// sending `didClose`, so tsgo reads the saved component from disk. If the
+    /// source was deleted, its route and body are removed and `None` is
+    /// returned; the caller should send `didClose` for the previously known
+    /// shadow URI.
     pub fn close(
         &mut self,
         source_path: &Path,
@@ -681,7 +702,8 @@ impl TsgoOverlay {
         }
     }
 
-    /// Reconcile eager shadows with the current workspace tree.
+    /// Reconcile eager shadows with the current workspace tree. A removed
+    /// source's body is deleted; the caller persists new and changed ones.
     pub fn refresh(&mut self) -> Result<OverlayUpdate, TsgoOverlayError> {
         self.refresh_except(|_| false)
     }
@@ -1121,7 +1143,7 @@ impl TsgoOverlay {
                             .to_string_lossy()
                             .ends_with(".svelte.tsx")
                     }),
-                body_exists_on_disk: entry.shadow_path.exists(),
+                body_exists_on_disk: entry.shadow_path.is_file(),
             })
             .collect()
     }
@@ -1133,6 +1155,79 @@ impl TsgoOverlay {
             .into_iter()
             .filter(|info| !info.is_resolvable())
             .collect()
+    }
+
+    /// Every component shadow this overlay holds — projections and
+    /// parser-error fallbacks, not plain modules routed through the project.
+    #[must_use]
+    pub fn component_shadows(&self) -> Vec<&ShadowDocument> {
+        self.entries
+            .values()
+            .filter(|entry| entry.is_component())
+            .map(|entry| &entry.document)
+            .collect()
+    }
+
+    /// Write `source_path`'s component shadow where the overlay config's
+    /// include finds it, atomically (a sibling temporary file the include
+    /// ignores, then a rename). Returns the change tsgo has to be told about
+    /// through `workspace/didChangeWatchedFiles`, or `None` when the file
+    /// already holds exactly this text or the route is a plain module.
+    ///
+    /// The caller decides *which* text is persisted: an editor buffer's
+    /// projection belongs in tsgo's in-memory overlay, never on disk.
+    pub fn persist_body(
+        &self,
+        source_path: &Path,
+    ) -> Result<Option<lsp_types::FileChangeType>, TsgoOverlayError> {
+        let path = self.lookup_source_path(source_path);
+        let Some(entry) = self.entries.get(&path).filter(|entry| entry.is_component()) else {
+            return Ok(None);
+        };
+        write_body(&entry.shadow_path, &self.cache_dir, &entry.document.text)
+    }
+
+    /// Delete every body in the shadow tree that `keep` rejects — a source
+    /// deleted or renamed while no server ran, or a route this overlay no
+    /// longer serves — along with any temporary file an interrupted write left
+    /// behind. Otherwise the include glob would keep a ghost component in the
+    /// program. Returns the shadow paths removed.
+    pub fn sweep_bodies(&self, keep: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+        let mut removed = Vec::new();
+        let mut pending = vec![self.shadow_dir.clone()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                let path = entry.path();
+                if file_type.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let stale = if name.ends_with(BODY_TEMP_SUFFIX) {
+                    true
+                } else if name.ends_with(".svelte.tsx") {
+                    !(self
+                        .by_shadow
+                        .get(&path)
+                        .and_then(|source| self.entries.get(source))
+                        .is_some_and(ShadowState::is_component)
+                        && keep(&path))
+                } else {
+                    false
+                };
+                if stale && fs::remove_file(&path).is_ok() && !name.ends_with(BODY_TEMP_SUFFIX) {
+                    removed.push(path);
+                }
+            }
+        }
+        removed
     }
 
     fn projection_options(
@@ -1353,12 +1448,6 @@ impl TsgoOverlay {
         fs::create_dir_all(parent)?;
         reject_symlink_components(parent, &self.cache_dir)?;
         reject_symlink_components(shadow_path, &self.cache_dir)?;
-        if shadow_path.exists() {
-            return Err(TsgoOverlayError::InvalidSource {
-                path: shadow_path.to_path_buf(),
-                reason: "diskless shadow path already exists on disk",
-            });
-        }
         Ok(())
     }
 
@@ -1427,6 +1516,14 @@ impl TsgoOverlay {
             return Ok(());
         };
         self.by_shadow.remove(&entry.shadow_path);
+        if entry.is_component() {
+            reject_symlink_components(&entry.shadow_path, &self.cache_dir)?;
+            match fs::remove_file(&entry.shadow_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         self.prune_empty_skeleton(entry.shadow_path.parent())
     }
 
@@ -2273,6 +2370,56 @@ fn write_cache_gitignore(cache_root: &Path) {
     let _ = write_if_changed(&path, CACHE_GITIGNORE);
 }
 
+/// Suffix of the temporary file a body is written to before the rename. The
+/// name also starts with a dot, so neither tsgo's include wildcards nor the
+/// sweep's `.svelte.tsx` match ever sees it as a component.
+const BODY_TEMP_SUFFIX: &str = ".tmp";
+
+fn write_body(
+    path: &Path,
+    cache_dir: &Path,
+    text: &str,
+) -> Result<Option<lsp_types::FileChangeType>, TsgoOverlayError> {
+    reject_symlink_components(path, cache_dir)?;
+    let existed = match fs::read(path) {
+        Ok(existing) if existing == text.as_bytes() => return Ok(None),
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(TsgoOverlayError::InvalidSource {
+            path: path.to_path_buf(),
+            reason: "shadow has no parent directory",
+        });
+    };
+    fs::create_dir_all(parent)?;
+    reject_symlink_components(parent, cache_dir)?;
+    let temporary = parent.join(format!(
+        ".{}.{}{BODY_TEMP_SUFFIX}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    fs::write(&temporary, text)?;
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(Some(if existed {
+        lsp_types::FileChangeType::CHANGED
+    } else {
+        lsp_types::FileChangeType::CREATED
+    }))
+}
+
+/// Whether `path` lies inside an overlay cache, where every file is this
+/// server's own output and never a change to the user's project.
+#[must_use]
+pub fn is_cache_path(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == CACHE_DIRECTORY)
+}
+
 fn write_if_changed(path: &Path, contents: &str) -> Result<(), TsgoOverlayError> {
     if fs::read_to_string(path).is_ok_and(|existing| existing == contents) {
         return Ok(());
@@ -2706,7 +2853,7 @@ mod tests {
     }
 
     #[test]
-    fn build_is_diskless_and_discovers_project_components() {
+    fn build_discovers_project_components_and_persists_their_bodies() {
         let workspace = TestWorkspace::new("build");
         let app = workspace.0.join("src/App.svelte");
         let nested = workspace.0.join("src/lib/Nested.svelte");
@@ -2719,15 +2866,102 @@ mod tests {
 
         let overlay = build_overlay(&workspace.0).unwrap();
         assert_eq!(overlay.eager_shadows().len(), 2);
-        let shadow = overlay.shadow_for_source(&app).unwrap();
+        let shadow = overlay.shadow_for_source(&app).unwrap().clone();
         let shadow_path = overlay.shadow_dir.join("src/App.svelte.tsx");
         assert_eq!(shadow.shadow_uri, path_to_uri(&shadow_path).unwrap());
         assert!(shadow_path.parent().unwrap().is_dir());
-        assert!(!shadow_path.exists());
         assert!(overlay.tsconfig_path().is_file());
         assert!(overlay.cache_dir().join(SHIM_SHIMS_V4_NAME).is_file());
         assert!(overlay.cache_dir().join(SHIM_JSX_V4_NAME).is_file());
+        assert_eq!(
+            overlay.unresolved_shadow_routes().len(),
+            2,
+            "a body tsgo cannot read is not resolvable"
+        );
+
+        assert_eq!(
+            overlay.persist_body(&app).unwrap(),
+            Some(lsp_types::FileChangeType::CREATED)
+        );
+        assert_eq!(
+            overlay.persist_body(&nested).unwrap(),
+            Some(lsp_types::FileChangeType::CREATED)
+        );
+        assert_eq!(fs::read_to_string(&shadow_path).unwrap(), shadow.text);
         assert!(overlay.unresolved_shadow_routes().is_empty());
+        assert_eq!(overlay.persist_body(&app).unwrap(), None, "unchanged");
+        let leftovers = fs::read_dir(shadow_path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(BODY_TEMP_SUFFIX)
+            })
+            .count();
+        assert_eq!(leftovers, 0, "the temporary file is renamed into place");
+    }
+
+    #[test]
+    fn a_changed_source_rewrites_its_body_and_a_deleted_one_removes_it() {
+        let workspace = TestWorkspace::new("body-lifecycle");
+        let app = workspace.0.join("src/App.svelte");
+        write(&app, "<p>one</p>");
+        let mut overlay = build_overlay(&workspace.0).unwrap();
+        let body = overlay.shadow_dir.join("src/App.svelte.tsx");
+        overlay.persist_body(&app).unwrap();
+
+        write(
+            &app,
+            "<script lang=\"ts\">let two = 2;</script><p>{two}</p>",
+        );
+        let update = overlay.refresh().unwrap();
+        assert_eq!(update.opened_or_changed.len(), 1);
+        assert_eq!(
+            overlay.persist_body(&app).unwrap(),
+            Some(lsp_types::FileChangeType::CHANGED)
+        );
+        assert!(fs::read_to_string(&body).unwrap().contains("let two = 2;"));
+
+        fs::remove_file(&app).unwrap();
+        let update = overlay.refresh().unwrap();
+        assert_eq!(update.closed.len(), 1);
+        assert!(!body.exists(), "a deleted component leaves no ghost behind");
+        assert!(!overlay.shadow_dir.join("src").exists(), "nor its skeleton");
+    }
+
+    #[test]
+    fn the_sweep_removes_orphan_bodies_and_torn_writes_only() {
+        let workspace = TestWorkspace::new("sweep");
+        let app = workspace.0.join("src/App.svelte");
+        write(&app, "<p />");
+        let overlay = build_overlay(&workspace.0).unwrap();
+        overlay.persist_body(&app).unwrap();
+        let orphan = overlay.shadow_dir.join("src/Gone.svelte.tsx");
+        let torn = overlay.shadow_dir.join("src/.App.svelte.tsx.42.tmp");
+        let foreign = overlay.shadow_dir.join("src/notes.txt");
+        write(&orphan, "export default {}");
+        write(&torn, "partial");
+        write(&foreign, "left alone");
+
+        let removed = overlay.sweep_bodies(|_| true);
+        assert_eq!(removed, vec![orphan.clone()]);
+        assert!(!orphan.exists() && !torn.exists());
+        assert!(foreign.exists());
+        assert!(overlay.shadow_dir.join("src/App.svelte.tsx").is_file());
+
+        let removed = overlay.sweep_bodies(|_| false);
+        assert_eq!(removed, vec![overlay.shadow_dir.join("src/App.svelte.tsx")]);
+    }
+
+    #[test]
+    fn only_paths_inside_an_overlay_cache_are_cache_paths() {
+        assert!(is_cache_path(Path::new(
+            "/w/.svelte-rs/projects/a/tsgo/tsconfig.json"
+        )));
+        assert!(!is_cache_path(Path::new("/w/src/tsconfig.json")));
+        assert!(!is_cache_path(Path::new("/w/src/.svelte-rs-notes/a.ts")));
     }
 
     #[test]
@@ -3035,6 +3269,9 @@ mod tests {
         );
         let reverted = overlay.close(&app).unwrap().unwrap();
         assert_eq!(reverted.version, 8);
+        overlay.persist_body(&app).unwrap();
+        let body = overlay.shadow_dir.join("src/App.svelte.tsx");
+        assert_eq!(fs::read_to_string(&body).unwrap(), reverted.text);
         assert_eq!(
             overlay
                 .entries
@@ -3047,6 +3284,7 @@ mod tests {
         fs::remove_file(&app).unwrap();
         assert!(overlay.close(&app).unwrap().is_none());
         assert!(overlay.shadow_for_source(&app).is_none());
+        assert!(!body.exists());
         assert!(!overlay.shadow_dir.join("src").exists());
     }
 
@@ -3092,7 +3330,8 @@ mod tests {
             .unwrap();
         let shadow_path = overlay.shadow_dir.join("src/main.ts");
         assert_eq!(shadow.shadow_uri, path_to_uri(&shadow_path).unwrap());
-        assert!(!shadow_path.exists());
+        assert_eq!(overlay.persist_body(&source).unwrap(), None);
+        assert!(!shadow_path.exists(), "a plain module is never written");
         assert_eq!(overlay.eager_shadows().len(), 0);
         assert_eq!(
             overlay.map_source_position(&source, Position::new(0, 17)),

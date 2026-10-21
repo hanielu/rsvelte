@@ -602,7 +602,8 @@ fn collect_source_directory(directory: &Path, sources: &mut HashMap<PathBuf, Fil
             if matches!(
                 entry.file_name().to_str(),
                 Some("node_modules" | ".git" | ".rsvelte-language-server" | "target")
-            ) {
+            ) || entry.file_name() == crate::tsgo_overlay::CACHE_DIRECTORY
+            {
                 continue;
             }
             collect_source_directory(&path, sources);

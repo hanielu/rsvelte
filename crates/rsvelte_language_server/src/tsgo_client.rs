@@ -235,6 +235,26 @@ impl TsgoClient {
         self.send(ClientCommand::Close(uri))
     }
 
+    /// Tell tsgo that files it may have read from disk changed. tsgo only
+    /// rereads a file on such an event, so every shadow body the overlay
+    /// rewrites behind a closed document is announced here, in one batch.
+    pub fn notify_watched_files(
+        &self,
+        changes: Vec<(Uri, lsp_types::FileChangeType)>,
+    ) -> Result<(), TsgoClientClosed> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let changes = changes
+            .into_iter()
+            .map(|(uri, change)| json!({ "uri": uri.as_str(), "type": change }))
+            .collect::<Vec<_>>();
+        self.forward(Message::Notification(Notification::new(
+            "workspace/didChangeWatchedFiles".to_string(),
+            json!({ "changes": changes }),
+        )))
+    }
+
     /// Replace the four raw settings layers used to answer future
     /// `workspace/configuration` requests.
     pub fn update_configuration(
