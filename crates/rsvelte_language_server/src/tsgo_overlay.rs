@@ -641,6 +641,14 @@ impl TsgoOverlay {
             preprocess_map,
             version,
         )?;
+        // A component that joins outside discovery and file events — the
+        // editor opened it before it reached disk, or saved it as a new name —
+        // is still this project's own when it lives where the project owns
+        // files; a copy at the same depth must never answer for it.
+        if !self.entries.contains_key(&state.source_path) && self.owns_location(&state.source_path)
+        {
+            self.owned.insert(state.source_path.clone());
+        }
         Ok(self.insert_state(state))
     }
 
@@ -5209,6 +5217,28 @@ mod tests {
             Some(saved),
             "the buffer is left alone"
         );
+    }
+
+    #[test]
+    fn a_component_opened_before_it_exists_is_owned_by_its_project() {
+        let workspace = TestWorkspace::new("owned-on-open");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        write(&root.join("b/tsconfig.json"), "{}");
+        write(&root.join("b/Other.svelte"), "<p />");
+        let fresh = root.join("b/Fresh.svelte");
+        let mut b =
+            TsgoOverlay::build_nested(&root.join("b"), &root.join("b/tsconfig.json"), &root)
+                .unwrap();
+        // The editor opens a file that is not on disk yet.
+        b.open_or_update(&fresh, "<p />", 1).unwrap();
+        assert!(b.owns(&fresh));
+        // A copy another project projects is not owned there.
+        write(&root.join("a/tsconfig.json"), "{}");
+        let mut a =
+            TsgoOverlay::build_nested(&root.join("a"), &root.join("a/tsconfig.json"), &root)
+                .unwrap();
+        a.open_or_update(&fresh, "<p />", 1).unwrap();
+        assert!(!a.owns(&fresh));
     }
 
     #[test]
