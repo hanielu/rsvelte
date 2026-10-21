@@ -932,6 +932,100 @@ fn component_attribute_completion_asks_the_owning_project() {
     server.shutdown();
 }
 
+/// Component-attribute completion probes in the shadow's own buffer, which
+/// tsgo reuses the program for, instead of opening a document beside it
+/// (a new root file: two full program builds per completion). Nothing else
+/// reads the shadow until the probe is swapped back out.
+#[cfg(unix)]
+#[test]
+fn component_attribute_completion_probes_in_the_shadow_and_holds_other_requests() {
+    let dir = TestDir::new("component-query-in-place");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = fs::canonicalize(&dir.0).unwrap().join("ws");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    fs::write(root.join("tsconfig.json"), "{}").unwrap();
+    let parent =
+        "<script lang=\"ts\">\n\timport Child from './Child.svelte';\n</script>\n\n<Child  />\n";
+    fs::write(root.join("Parent.svelte"), parent).unwrap();
+    fs::write(
+        root.join("Child.svelte"),
+        "<script lang=\"ts\">\n\tlet { alpha }: { alpha: string } = $props();\n</script>\n",
+    )
+    .unwrap();
+    let mut server = Server::start_with_settings(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            (
+                "RSVELTE_TEST_MARKER",
+                Path::new("__rsvelte_component_info_probe"),
+            ),
+            ("RSVELTE_TEST_SLOW_COMPLETION_MS", Path::new("150")),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+    );
+    let parent_uri = file_uri(&root.join("Parent.svelte"));
+    server.open(&parent_uri, parent);
+    hover(&mut server, &parent_uri);
+    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/Parent.svelte.tsx"));
+    let completion = server.request(
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": parent_uri },
+            "position": { "line": 4, "character": 7 },
+            "context": { "triggerKind": 1 },
+        }),
+    );
+    // Once the probe is in the shadow, ask about the document.
+    let probing = format!("textDocument/didChange {shadow} marked");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !traffic(&log).contains(&probing) {
+        assert!(Instant::now() < deadline, "no probe: {:?}", traffic(&log));
+        thread::sleep(Duration::from_millis(5));
+    }
+    let held = server.request(
+        "textDocument/hover",
+        json!({ "textDocument": { "uri": parent_uri }, "position": { "line": 1, "character": 5 } }),
+    );
+    assert!(
+        server
+            .response(completion, Duration::from_secs(10))
+            .get("result")
+            .is_some()
+    );
+    assert!(
+        server
+            .response(held, Duration::from_secs(10))
+            .to_string()
+            .contains("recorded")
+    );
+    let lines = traffic(&log);
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains(".rsvelte-component-info")),
+        "no probe document: {lines:?}"
+    );
+    let restored = lines
+        .iter()
+        .rposition(|line| line == &format!("textDocument/didChange {shadow}"))
+        .expect("the shadow's own text comes back");
+    let last_probe = lines.iter().rposition(|line| line == &probing).unwrap();
+    assert!(last_probe < restored);
+    let hover_after = lines
+        .iter()
+        .rposition(|line| line == &format!("textDocument/hover {shadow}"))
+        .unwrap();
+    assert!(
+        restored < hover_after,
+        "the hover waits for the shadow's own text: {lines:?}"
+    );
+    server.shutdown();
+}
+
 /// A workspace with three projects that own components and one that owns
 /// none, for the background-loading tests.
 #[cfg(unix)]
@@ -1092,6 +1186,12 @@ fn main() {
             write_message(&mut output, &format!(
                 r#"{{"jsonrpc":"2.0","id":{id},"result":{{"capabilities":{{"positionEncoding":"utf-8","hoverProvider":true,"workspaceSymbolProvider":true,"documentSymbolProvider":true,"referencesProvider":true}}}}}}"#
             )).unwrap();
+        } else if method == "textDocument/completion" {
+            if let Some(delay) = std::env::var("RSVELTE_TEST_SLOW_COMPLETION_MS").ok().and_then(|ms| ms.parse().ok()) {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+            let id = json_id(&message);
+            write_message(&mut output, &format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#)).unwrap();
         } else if method == "textDocument/hover" {
             let id = json_id(&message);
             write_message(&mut output, &format!(

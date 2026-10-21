@@ -273,6 +273,9 @@ pub enum ComponentInfoQueryError {
 /// Open/change bodies are virtual and must only be sent to tsgo, never written.
 pub struct ComponentInfoQuery {
     query_uri: Uri,
+    /// The version the shadow had before an in-place probe
+    /// ([`Self::in_place`]), which the query puts back with its text.
+    in_place: Option<i32>,
     generated_text: String,
     generated_component_range: ByteRange<usize>,
     component_expression: String,
@@ -317,6 +320,7 @@ impl ComponentInfoQuery {
             .map_err(|_| InvalidComponentQuery)?;
         Ok(Self {
             query_uri,
+            in_place: None,
             generated_text,
             generated_component_range,
             component_expression,
@@ -330,9 +334,60 @@ impl ComponentInfoQuery {
         })
     }
 
+    /// A query that probes in the shadow's own buffer rather than in a new
+    /// document beside it. A new document matches the project's include, so
+    /// tsgo rebuilds the whole program when it opens and again when it
+    /// closes — and tsrs keeps memory from every full build. The probe has
+    /// the shadow's imports, so swapping it into the shadow's buffer and back
+    /// is a content change tsgo reuses the program for. The buffer must be
+    /// open in tsgo with exactly `generated_text` at `shadow_version`, and
+    /// nothing else may read or change it until the query ends: it opens
+    /// with a `Change` and closes with a `Change` back to that text and
+    /// version ([`Self::restore`]).
+    pub fn in_place(
+        shadow_uri: &Uri,
+        generated_text: impl Into<String>,
+        generated_component_range: ByteRange<usize>,
+        component_expression: impl Into<String>,
+        shadow_version: i32,
+    ) -> Result<Self, InvalidComponentQuery> {
+        let mut query = Self::new(
+            shadow_uri,
+            generated_text,
+            generated_component_range,
+            component_expression,
+            shadow_version.saturating_add(10_000),
+        )?;
+        query.query_uri = shadow_uri.clone();
+        query.in_place = Some(shadow_version);
+        Ok(query)
+    }
+
+    /// Whether the probe runs in the shadow's own buffer.
+    #[must_use]
+    pub const fn is_in_place(&self) -> bool {
+        self.in_place.is_some()
+    }
+
     #[must_use]
     pub const fn query_uri(&self) -> &Uri {
         &self.query_uri
+    }
+
+    /// What ends the probe early (a cancellation, a crash): closing its
+    /// document, or putting the shadow's own text and version back.
+    #[must_use]
+    pub fn restore(&self) -> ComponentInfoAction {
+        match self.in_place {
+            Some(version) => ComponentInfoAction::Change {
+                uri: self.query_uri.clone(),
+                version,
+                text: self.generated_text.clone(),
+            },
+            None => ComponentInfoAction::Close {
+                uri: self.query_uri.clone(),
+            },
+        }
     }
 
     /// Return the next operation, or `None` while a request response is pending.
@@ -344,11 +399,19 @@ impl ComponentInfoQuery {
             QueryStage::Open => {
                 self.stage = QueryStage::Completion;
                 let (text, _) = self.probe(ComponentPart::ALL[self.part_index]);
-                Some(ComponentInfoAction::Open {
-                    uri: self.query_uri.clone(),
-                    language_id: "typescriptreact",
-                    version: self.version,
-                    text,
+                Some(if self.in_place.is_some() {
+                    ComponentInfoAction::Change {
+                        uri: self.query_uri.clone(),
+                        version: self.version,
+                        text,
+                    }
+                } else {
+                    ComponentInfoAction::Open {
+                        uri: self.query_uri.clone(),
+                        language_id: "typescriptreact",
+                        version: self.version,
+                        text,
+                    }
                 })
             }
             QueryStage::Completion => {
@@ -382,9 +445,7 @@ impl ComponentInfoQuery {
             QueryStage::Resolve => self.advance_part(),
             QueryStage::Close => {
                 self.stage = QueryStage::Complete;
-                Some(ComponentInfoAction::Close {
-                    uri: self.query_uri.clone(),
-                })
+                Some(self.restore())
             }
             QueryStage::Complete => {
                 self.stage = QueryStage::Done;
@@ -975,6 +1036,60 @@ mod tests {
                 kind: MarkupKind::Markdown,
                 value: "Heading".to_string()
             }))
+        );
+    }
+
+    #[test]
+    fn an_in_place_query_swaps_the_probe_into_the_shadow_and_back() {
+        let shadow_uri = Uri::from_str("file:///cache/svelte/App.svelte.tsx").unwrap();
+        let generated = "use(Components.Button);";
+        let range = generated.find("Components.Button").unwrap()
+            ..generated.find("Components.Button").unwrap() + "Components.Button".len();
+        let mut query =
+            ComponentInfoQuery::in_place(&shadow_uri, generated, range, "Components.Button", 7)
+                .unwrap();
+        assert!(query.is_in_place());
+        assert_eq!(query.query_uri(), &shadow_uri, "the shadow itself");
+        let Some(ComponentInfoAction::Change { uri, version, text }) = query.next_action() else {
+            panic!("the probe replaces the shadow's text, it opens no document");
+        };
+        assert_eq!(uri, shadow_uri);
+        assert!(version > 7);
+        assert!(text.contains("$$prop_def"));
+        for part in ComponentPart::ALL {
+            let Some(ComponentInfoAction::Request { id, params, .. }) = query.next_action() else {
+                panic!("expected completion request");
+            };
+            assert_eq!(params["textDocument"]["uri"], shadow_uri.as_str());
+            assert_eq!(id, ComponentInfoRequestId::Completion(part));
+            query.accept_response(id, Value::Null).unwrap();
+            if part != ComponentPart::DefaultSlotLets {
+                assert!(matches!(
+                    query.next_action(),
+                    Some(ComponentInfoAction::Change { .. })
+                ));
+            }
+        }
+        assert_eq!(
+            query.next_action(),
+            Some(ComponentInfoAction::Change {
+                uri: shadow_uri.clone(),
+                version: 7,
+                text: generated.to_string(),
+            }),
+            "the shadow's own text and version come back"
+        );
+        assert!(matches!(
+            query.next_action(),
+            Some(ComponentInfoAction::Complete(_))
+        ));
+        assert_eq!(
+            query.restore(),
+            ComponentInfoAction::Change {
+                uri: shadow_uri,
+                version: 7,
+                text: generated.to_string(),
+            }
         );
     }
 

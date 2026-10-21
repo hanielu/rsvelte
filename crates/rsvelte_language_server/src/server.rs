@@ -337,6 +337,16 @@ struct PendingTsgoRequest {
     completion_site_data: Option<(String, serde_json::Value)>,
 }
 
+/// Work held while a component query probes in a shadow's own buffer.
+enum Deferred {
+    /// An editor request, replayed from the start.
+    Request(Request),
+    /// A request on its way to tsgo, with its native fallback.
+    Forward(Request, Option<serde_json::Value>),
+    /// A diagnostic pull for a client that takes pushed diagnostics.
+    PushDiagnostics(Uri, i32, Vec<lsp_types::Diagnostic>),
+}
+
 struct PendingComponentQuery {
     query: ComponentInfoQuery,
     site: ComponentCompletionSite,
@@ -1001,6 +1011,9 @@ struct Server {
     rename_aggregates: HashMap<RequestId, RenameAggregate>,
     component_queries: HashMap<RequestId, PendingComponentQuery>,
     component_query_requests: HashMap<RequestId, (RequestId, ComponentInfoRequestId)>,
+    /// What waits for a probe in a shadow's buffer to end (see
+    /// [`ComponentInfoQuery::in_place`]).
+    deferred: Vec<Deferred>,
     outgoing: HashMap<RequestId, Outgoing>,
     next_request_id: u32,
     tsgo: Option<TsgoRuntime>,
@@ -1067,6 +1080,7 @@ impl Server {
             rename_aggregates: HashMap::new(),
             component_queries: HashMap::new(),
             component_query_requests: HashMap::new(),
+            deferred: Vec::new(),
             outgoing: HashMap::new(),
             next_request_id: 0,
             tsgo,
@@ -1177,6 +1191,10 @@ impl Server {
                 ErrorCode::InvalidRequest as i32,
                 "server is shutting down".to_string(),
             ));
+            return;
+        }
+        if self.probe_in_flight() {
+            self.deferred.push(Deferred::Request(request));
             return;
         }
         match request.method.as_str() {
@@ -2424,12 +2442,8 @@ impl Server {
                 );
             }
         }
-        if let Some(component) = &component
-            && let Some(runtime) = &self.tsgo
-        {
-            let _ = runtime
-                .client
-                .close_buffer(component.query.query_uri().clone());
+        if let Some(component) = &component {
+            self.run_component_action(component.query.restore());
         }
         let child_rename_ids = self
             .pending_tsgo
@@ -2462,12 +2476,20 @@ impl Server {
                 .into(),
             );
         }
-        if native || tsgo || rename || component.is_some() {
+        let deferred = self.deferred.len();
+        self.deferred.retain(|request| match request {
+            Deferred::Request(request) | Deferred::Forward(request, _) => request.id != id,
+            Deferred::PushDiagnostics(..) => true,
+        });
+        if native || tsgo || rename || component.is_some() || self.deferred.len() != deferred {
             self.respond(Response::new_err(
                 id,
                 ErrorCode::RequestCanceled as i32,
                 "request cancelled by client".to_string(),
             ));
+        }
+        if component.is_some() {
+            self.replay_deferred();
         }
     }
 
@@ -2480,6 +2502,11 @@ impl Server {
         mut request: Request,
         fallback_result: Option<serde_json::Value>,
     ) {
+        if self.probe_in_flight() {
+            self.deferred
+                .push(Deferred::Forward(request, fallback_result));
+            return;
+        }
         if !self.settings.tsgo_method_enabled(&request.method) {
             self.respond(Response::new_ok(
                 request.id,
@@ -2582,6 +2609,11 @@ impl Server {
         version: i32,
         native: Vec<lsp_types::Diagnostic>,
     ) {
+        if self.probe_in_flight() {
+            self.deferred
+                .push(Deferred::PushDiagnostics(uri, version, native));
+            return;
+        }
         if !self.settings.tsgo_method_enabled("textDocument/diagnostic") {
             self.publish(uri, version, native);
             return;
@@ -2824,6 +2856,9 @@ impl Server {
         let script = !svelte && is_typescript_or_javascript(&language_id, &path);
         if !svelte && !script {
             return;
+        }
+        if let Some(shadow_uri) = self.probed_shadow_of(&path) {
+            self.end_probe_in(&shadow_uri);
         }
         let Some(owner) = self.ensure_tsgo_project(&path) else {
             return;
@@ -3321,6 +3356,9 @@ impl Server {
         let path = fs::canonicalize(&path).unwrap_or(path);
         if let Some(runtime) = &mut self.tsgo {
             runtime.document_imports.remove(&path);
+        }
+        if let Some(shadow_uri) = self.probed_shadow_of(&path) {
+            self.end_probe_in(&shadow_uri);
         }
         if is_svelte_document(&language_id, &path) {
             let mut closed_source = None;
@@ -4303,17 +4341,14 @@ impl Server {
         }
         self.component_query_requests.clear();
         for (id, pending) in std::mem::take(&mut self.component_queries) {
-            if let Some(runtime) = &self.tsgo {
-                let _ = runtime
-                    .client
-                    .close_buffer(pending.query.query_uri().clone());
-            }
+            self.run_component_action(pending.query.restore());
             self.respond(Response::new_err(
                 id,
                 ErrorCode::InternalError as i32,
                 message.to_string(),
             ));
         }
+        self.replay_deferred();
     }
 
     fn on_tsgo_message(&mut self, message: Message) {
@@ -4745,32 +4780,48 @@ impl Server {
         let source_path = uri_to_path(source_uri.as_str());
         // The project that owns the document answers about it, as every
         // other request is answered, not a copy another project keeps.
-        let Some((shadow_uri, generated_text, generated_range, version)) = runtime
-            .overlay_for_source(&source_path)
-            .and_then(|overlay| {
-                let shadow = overlay.shadow_for_source(&source_path)?;
-                let ranges = generated_component_ranges(
-                    overlay.projection_map(&source_path)?,
-                    &site,
-                    &shadow.text,
-                );
-                Some((
-                    shadow.shadow_uri.clone(),
-                    shadow.text.clone(),
-                    ranges.into_iter().next_back()?,
-                    shadow.version.saturating_add(10_000),
-                ))
-            })
+        let Some((shadow, generated_range)) =
+            runtime
+                .overlay_for_source(&source_path)
+                .and_then(|overlay| {
+                    let shadow = overlay.shadow_for_source(&source_path)?;
+                    let ranges = generated_component_ranges(
+                        overlay.projection_map(&source_path)?,
+                        &site,
+                        &shadow.text,
+                    );
+                    Some((shadow.clone(), ranges.into_iter().next_back()?))
+                })
         else {
             return false;
         };
-        let Ok(query) = ComponentInfoQuery::new(
-            &shadow_uri,
-            generated_text,
-            generated_range,
-            site.component_expression(),
-            version,
-        ) else {
+        // The probe has the shadow's imports, so in the shadow's own buffer
+        // it is a content change; a new document beside it would be a new
+        // root file for tsgo, which rebuilds the program to open it and again
+        // to close it. A JavaScript shadow keeps the separate TypeScript
+        // probe document, since the probe is TypeScript.
+        let in_place = shadow.language_id == "typescriptreact"
+            && runtime
+                .open_shadows
+                .contains_key(shadow.shadow_uri.as_str());
+        let query = if in_place {
+            ComponentInfoQuery::in_place(
+                &shadow.shadow_uri,
+                shadow.text,
+                generated_range,
+                site.component_expression(),
+                shadow.version,
+            )
+        } else {
+            ComponentInfoQuery::new(
+                &shadow.shadow_uri,
+                shadow.text,
+                generated_range,
+                site.component_expression(),
+                shadow.version.saturating_add(10_000),
+            )
+        };
+        let Ok(query) = query else {
             return false;
         };
         self.component_queries.insert(
@@ -4878,31 +4929,9 @@ impl Server {
                 return;
             };
             match action {
-                ComponentInfoAction::Open {
-                    uri,
-                    language_id,
-                    version,
-                    text,
-                } => {
-                    if let Some(runtime) = &self.tsgo {
-                        let _ = runtime.client.open_buffer(OpenBuffer::new(
-                            uri,
-                            language_id,
-                            version,
-                            text,
-                        ));
-                    }
-                }
-                ComponentInfoAction::Change { uri, version, text } => {
-                    if let Some(runtime) = &self.tsgo {
-                        let _ = runtime.client.change_buffer(OpenBuffer::new(
-                            uri,
-                            "typescriptreact",
-                            version,
-                            text,
-                        ));
-                    }
-                }
+                action @ (ComponentInfoAction::Open { .. }
+                | ComponentInfoAction::Change { .. }
+                | ComponentInfoAction::Close { .. }) => self.run_component_action(action),
                 ComponentInfoAction::Request { id, method, params } => {
                     self.next_request_id += 1;
                     let child_id = RequestId::from(format!(
@@ -4922,11 +4951,6 @@ impl Server {
                     }
                     let _ = pending.query.accept_error(id);
                 }
-                ComponentInfoAction::Close { uri } => {
-                    if let Some(runtime) = &self.tsgo {
-                        let _ = runtime.client.close_buffer(uri);
-                    }
-                }
                 ComponentInfoAction::Complete(info) => {
                     let manual = info.completion_items(&pending.site);
                     append_component_completions(
@@ -4935,7 +4959,100 @@ impl Server {
                         pending.site.was_colon_triggered(),
                     );
                     self.respond(Response::new_ok(editor_id.clone(), pending.result));
+                    self.replay_deferred();
                     return;
+                }
+            }
+        }
+    }
+
+    /// Hand tsgo a probe document operation of a component query.
+    fn run_component_action(&self, action: ComponentInfoAction) {
+        let Some(runtime) = &self.tsgo else {
+            return;
+        };
+        match action {
+            ComponentInfoAction::Open {
+                uri,
+                language_id,
+                version,
+                text,
+            } => {
+                let _ =
+                    runtime
+                        .client
+                        .open_buffer(OpenBuffer::new(uri, language_id, version, text));
+            }
+            ComponentInfoAction::Change { uri, version, text } => {
+                let _ = runtime.client.change_buffer(OpenBuffer::new(
+                    uri,
+                    "typescriptreact",
+                    version,
+                    text,
+                ));
+            }
+            ComponentInfoAction::Close { uri } => {
+                let _ = runtime.client.close_buffer(uri);
+            }
+            ComponentInfoAction::Request { .. } | ComponentInfoAction::Complete(_) => {}
+        }
+    }
+
+    /// The shadow of `path` a component query is probing in, if any.
+    fn probed_shadow_of(&self, path: &Path) -> Option<Uri> {
+        if !self.probe_in_flight() {
+            return None;
+        }
+        self.tsgo
+            .as_ref()?
+            .owner_shadow(path)
+            .map(|shadow| shadow.shadow_uri.clone())
+    }
+
+    /// Whether a component query is probing in a shadow's own buffer, which
+    /// no other request may read until the probe is swapped back out.
+    fn probe_in_flight(&self) -> bool {
+        self.component_queries
+            .values()
+            .any(|pending| pending.query.is_in_place())
+    }
+
+    /// The editor changed or closed a document whose shadow holds a probe:
+    /// the change replaces the probe, so the query ends, answered with what
+    /// tsgo offered without the component's own members.
+    fn end_probe_in(&mut self, shadow_uri: &Uri) {
+        let probing = self
+            .component_queries
+            .iter()
+            .filter(|(_, pending)| {
+                pending.query.is_in_place() && pending.query.query_uri() == shadow_uri
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        if probing.is_empty() {
+            return;
+        }
+        for id in probing {
+            if let Some(pending) = self.component_queries.remove(&id) {
+                self.respond(Response::new_ok(id, pending.result));
+            }
+        }
+        self.replay_deferred();
+    }
+
+    /// Hand on the requests held while a probe was in a shadow's buffer.
+    fn replay_deferred(&mut self) {
+        if self.probe_in_flight() {
+            return;
+        }
+        for deferred in std::mem::take(&mut self.deferred) {
+            match deferred {
+                Deferred::Request(request) => self.on_request(request),
+                Deferred::Forward(request, fallback) => {
+                    self.forward_tsgo_request_with_fallback(request, fallback);
+                }
+                Deferred::PushDiagnostics(uri, version, native) => {
+                    self.pull_and_publish_tsgo_diagnostics(uri, version, native);
                 }
             }
         }
