@@ -600,15 +600,19 @@ fn a_document_loads_only_its_own_project_and_the_rest_is_read_from_disk() {
         fs::write(root.join(project).join("tsconfig.json"), "{}").unwrap();
     }
     let source = "<script lang=\"ts\">\nlet answer = 42;\n</script>\n<p>{answer}</p>\n";
-    fs::write(root.join("a/X.svelte"), source).unwrap();
+    let x_source =
+        "<script lang=\"ts\">\nimport Legacy from './Legacy.svelte';\n</script>\n<Legacy />\n";
+    fs::write(root.join("a/X.svelte"), x_source).unwrap();
     fs::write(
         root.join("a/Sibling.svelte"),
         "<script lang=\"ts\"></script><p />",
     )
     .unwrap();
-    // A JavaScript component is the exception: its script kind comes from
-    // the buffer's language id, so its project opens it before the document.
+    // A JavaScript component the document reaches is the exception: its
+    // script kind comes from the buffer's language id, so its project opens
+    // it before the document. One nothing open reaches stays on disk.
     fs::write(root.join("a/Legacy.svelte"), "<p />").unwrap();
+    fs::write(root.join("a/Unreached.svelte"), "<p />").unwrap();
     fs::write(root.join("b/Y.svelte"), source).unwrap();
     let mut server = Server::start(
         Some(&root),
@@ -641,7 +645,7 @@ fn a_document_loads_only_its_own_project_and_the_rest_is_read_from_disk() {
     };
 
     let x = file_uri(&root.join("a/X.svelte"));
-    server.open(&x, source);
+    server.open(&x, x_source);
     assert!(hover(&mut server, &x).to_string().contains("recorded"));
     assert_eq!(
         opened(&log),
@@ -649,7 +653,11 @@ fn a_document_loads_only_its_own_project_and_the_rest_is_read_from_disk() {
             file_uri(&shadow("a", "Legacy")),
             file_uri(&shadow("a", "X"))
         ],
-        "only the editor's document (and a JavaScript component) is a tsgo buffer"
+        "only the editor's document (and a JavaScript component it imports) is a tsgo buffer"
+    );
+    assert!(
+        shadow("a", "Unreached").is_file(),
+        "a JavaScript component no open document reaches is read from disk"
     );
     assert!(
         shadow("a", "Sibling").is_file(),

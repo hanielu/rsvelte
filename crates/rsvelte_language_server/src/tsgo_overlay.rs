@@ -140,6 +140,11 @@ impl EditorBuffers {
     pub fn contains(&self, path: &Path) -> bool {
         self.0.contains_key(path)
     }
+
+    /// The open documents' paths.
+    pub fn paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.0.keys()
+    }
 }
 
 /// Failure to prepare or update an overlay.
@@ -286,6 +291,10 @@ pub struct TsgoOverlay {
     /// The `paths` patterns imports are followed through, read once: a
     /// config change rebuilds the overlay.
     aliases: OnceLock<Vec<AliasPattern>>,
+    /// Components a plain module this project owns imports — a barrel's
+    /// re-exports. Any document may reach them through the module, which
+    /// [`Self::reachable_javascript`] does not follow, so they always count.
+    module_imports: BTreeSet<PathBuf>,
 }
 
 impl fmt::Debug for TsgoOverlay {
@@ -584,6 +593,7 @@ impl TsgoOverlay {
             owned: BTreeSet::new(),
             missing: BTreeSet::new(),
             aliases: OnceLock::new(),
+            module_imports: BTreeSet::new(),
         };
         overlay.materialize_support_files()?;
         if load {
@@ -1200,9 +1210,13 @@ impl TsgoOverlay {
             let Some(directory) = path.parent() else {
                 continue;
             };
+            let module = !path.to_string_lossy().ends_with(".svelte");
             for specifier in svelte_specifiers(&text) {
                 for target in resolve_svelte_specifier(directory, specifier, &aliases) {
                     let target = fs::canonicalize(&target).unwrap_or(target);
+                    if module && target.starts_with(&self.mirror_root) && target.is_file() {
+                        self.module_imports.insert(target.clone());
+                    }
                     if !target.starts_with(&self.mirror_root) || self.entries.contains_key(&target)
                     {
                         continue;
@@ -1332,6 +1346,7 @@ impl TsgoOverlay {
         self.owned = discovered.clone();
         let aliases = self.alias_patterns();
         let mut missing = BTreeSet::new();
+        let mut module_imports = BTreeSet::new();
         let mut pending = discovered.iter().cloned().collect::<Vec<_>>();
         pending.extend(owned_modules);
         while let Some(path) = pending.pop() {
@@ -1344,25 +1359,82 @@ impl TsgoOverlay {
             let Some(directory) = path.parent() else {
                 continue;
             };
+            let module = !path.to_string_lossy().ends_with(".svelte");
             for specifier in svelte_specifiers(&text) {
-                for target in resolve_svelte_specifier(directory, specifier, &aliases) {
+                for target in resolve_svelte_specifier(directory, specifier, aliases) {
                     let Ok(target) = fs::canonicalize(&target) else {
                         if target.starts_with(&self.mirror_root) {
                             missing.insert(target);
                         }
                         continue;
                     };
-                    if target.starts_with(&self.mirror_root)
-                        && target.is_file()
-                        && discovered.insert(target.clone())
-                    {
+                    if !target.starts_with(&self.mirror_root) || !target.is_file() {
+                        continue;
+                    }
+                    if module {
+                        module_imports.insert(target.clone());
+                    }
+                    if discovered.insert(target.clone()) {
                         pending.push(target);
                     }
                 }
             }
         }
         self.missing = missing;
+        self.module_imports = module_imports;
         discovered
+    }
+
+    /// The JavaScript components an editor document can see the types of:
+    /// those reachable from `roots` through `.svelte` imports among the
+    /// components this project holds, plus every component an owned plain
+    /// module imports (and what they reach). tsgo takes a buffer's script
+    /// kind from its language id while it parses a body on disk by its
+    /// `.tsx` name, losing JSDoc types, so these are opened as buffers; a
+    /// JavaScript component nothing open reaches can stay on disk, where
+    /// opening it would only cost a `didOpen` (a snapshot update in tsgo).
+    #[must_use]
+    pub fn reachable_javascript(
+        &self,
+        roots: impl IntoIterator<Item = PathBuf>,
+    ) -> Vec<&ShadowDocument> {
+        let mut pending = roots
+            .into_iter()
+            .chain(self.module_imports.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut seen = BTreeSet::new();
+        let mut reached = Vec::new();
+        while let Some(path) = pending.pop() {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let Some(entry) = self.entries.get(&path) else {
+                continue;
+            };
+            if entry.is_component() && entry.document.language_id == "javascriptreact" {
+                reached.push(&entry.document);
+            }
+            if !entry.source_text.contains(".svelte") {
+                continue;
+            }
+            let Some(directory) = path.parent() else {
+                continue;
+            };
+            for specifier in svelte_specifiers(&entry.source_text) {
+                for target in resolve_svelte_specifier(directory, specifier, self.alias_patterns())
+                {
+                    let target = if self.entries.contains_key(&target) {
+                        target
+                    } else {
+                        fs::canonicalize(&target).unwrap_or(target)
+                    };
+                    if self.entries.contains_key(&target) && !seen.contains(&target) {
+                        pending.push(target);
+                    }
+                }
+            }
+        }
+        reached
     }
 
     /// The project's `paths` patterns, with each target absolute, plus the
@@ -2699,6 +2771,18 @@ fn shadow_language_id(source: &str) -> &'static str {
     } else {
         "javascriptreact"
     }
+}
+
+/// A fingerprint of the `.svelte` specifiers `source` imports: when it
+/// changes, the components a document reaches may have.
+#[must_use]
+pub fn svelte_import_fingerprint(source: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    if source.contains(".svelte") {
+        svelte_specifiers(source).hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// The `.svelte` module specifiers in `source`, found the same way
@@ -5360,6 +5444,49 @@ mod tests {
                 .shadow_for_source(&root.join("src/ui.v1.svelte"))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn javascript_components_an_open_document_reaches_are_the_ones_found() {
+        let workspace = TestWorkspace::new("reachable-javascript");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        write(&root.join("tsconfig.json"), "{}");
+        write(
+            &root.join("src/Page.svelte"),
+            "<script lang=\"ts\">import Card from './Card.svelte';</script><Card />",
+        );
+        write(
+            &root.join("src/Card.svelte"),
+            "<script>import Icon from './Icon.svelte';</script><Icon />",
+        );
+        write(&root.join("src/Icon.svelte"), "<p />");
+        write(&root.join("src/Unreached.svelte"), "<p />");
+        write(&root.join("src/Exported.svelte"), "<p />");
+        write(
+            &root.join("src/index.ts"),
+            "export { default as Exported } from './Exported.svelte';\n",
+        );
+        let overlay = build_overlay(&root).unwrap();
+        let names = |shadows: Vec<&ShadowDocument>| {
+            let mut names = shadows
+                .into_iter()
+                .map(|shadow| {
+                    uri_to_path_for_test(&shadow.source_uri)
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(overlay.reachable_javascript([root.join("src/Page.svelte")])),
+            ["Card.svelte", "Exported.svelte", "Icon.svelte"],
+            "transitively, plus what a module re-exports; not Unreached"
+        );
+        assert_eq!(names(overlay.reachable_javascript([])), ["Exported.svelte"]);
     }
 
     #[test]

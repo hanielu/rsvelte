@@ -392,11 +392,17 @@ struct TsgoRuntime {
     /// keystroke. Cleared whenever `overlays` is reordered or rebuilt.
     resolved_dirs: HashMap<PathBuf, usize>,
     /// Shadows tsgo holds as in-memory buffers: editor documents, and the
-    /// JavaScript components of an activated project. tsgo reads every other
-    /// component from the body the overlay keeps on disk.
+    /// JavaScript components they reach. tsgo reads every other component
+    /// from the body the overlay keeps on disk.
     open_shadows: HashMap<String, Uri>,
-    /// Overlays, by cache directory, whose JavaScript components are open.
+    /// Overlays, by cache directory, that have served the editor.
     activated: HashSet<PathBuf>,
+    /// JavaScript component shadows an editor document reached this
+    /// session: they stay buffers, including after a change on disk.
+    javascript_buffers: HashSet<String>,
+    /// Each open document's `.svelte` imports, as a fingerprint: when they
+    /// change, the JavaScript components it reaches may have.
+    document_imports: HashMap<PathBuf, u64>,
 }
 
 /// tsgo takes a buffer's script kind from its language id. A JavaScript
@@ -603,6 +609,8 @@ impl TsgoRuntime {
             resolved_dirs: HashMap::new(),
             open_shadows: HashMap::new(),
             activated: HashSet::new(),
+            javascript_buffers: HashSet::new(),
+            document_imports: HashMap::new(),
         })
     }
 
@@ -708,25 +716,39 @@ impl TsgoRuntime {
         self.overlay_for_source(source)?.shadow_for_source(source)
     }
 
-    /// Open the JavaScript components of `overlays[index]`, once, before its
-    /// first editor document reaches tsgo (see [`JAVASCRIPT_SHADOW`]). Their
-    /// bodies are on disk too, so each open is a content change for tsgo
-    /// rather than a new root file.
-    fn activate_project(&mut self, index: usize) -> bool {
+    /// Set `overlays[index]` up for the editor, once: open the JavaScript
+    /// components the editor documents `roots` reach, before the first of
+    /// them reaches tsgo (see [`JAVASCRIPT_SHADOW`]). Returns whether it did.
+    fn activate_project(&mut self, index: usize, roots: &[PathBuf]) -> bool {
         let overlay = &self.overlays[index];
         if !overlay.is_loaded() || !self.activated.insert(overlay.cache_dir().to_path_buf()) {
             return false;
         }
-        let shadows = overlay
-            .component_shadows()
+        self.open_reachable_javascript(index, roots.iter().cloned());
+        true
+    }
+
+    /// Open, as buffers, the JavaScript components of `overlays[index]` that
+    /// `roots` reach and tsgo does not hold yet. Their bodies are on disk
+    /// too, so each open is a content change for tsgo rather than a new root
+    /// file — but still one snapshot update each, which is why a component
+    /// no open document reaches is left on disk.
+    fn open_reachable_javascript(
+        &mut self,
+        index: usize,
+        roots: impl IntoIterator<Item = PathBuf>,
+    ) {
+        let shadows = self.overlays[index]
+            .reachable_javascript(roots)
             .into_iter()
-            .filter(|shadow| shadow.language_id == JAVASCRIPT_SHADOW)
+            .filter(|shadow| !self.open_shadows.contains_key(shadow.shadow_uri.as_str()))
             .cloned()
             .collect::<Vec<_>>();
         for shadow in &shadows {
+            self.javascript_buffers
+                .insert(shadow.shadow_uri.as_str().to_string());
             open_shadow(&self.client, &mut self.open_shadows, shadow);
         }
-        true
     }
 
     /// Hand tsgo a shadow `overlays[index]` projected from the file on disk:
@@ -747,9 +769,8 @@ impl TsgoRuntime {
                 source.display()
             )),
         }
-        let javascript =
-            shadow.language_id == JAVASCRIPT_SHADOW && self.activated.contains(overlay.cache_dir());
-        if javascript || self.open_shadows.contains_key(shadow.shadow_uri.as_str()) {
+        let uri = shadow.shadow_uri.as_str();
+        if self.javascript_buffers.contains(uri) || self.open_shadows.contains_key(uri) {
             open_shadow(&self.client, &mut self.open_shadows, shadow);
         }
     }
@@ -2642,12 +2663,18 @@ impl Server {
             }
             vec![owner]
         };
+        // The JavaScript components the document reaches, when its imports
+        // changed (and when it opens).
+        let fingerprint = tsgo_overlay::svelte_import_fingerprint(&text);
+        let reach_changed =
+            runtime.document_imports.insert(path.clone(), fingerprint) != Some(fingerprint);
         // A new import in the buffer gets its copy now, not when it is saved.
         let documents = &self.documents;
         let is_open =
             |target: &Path| path_to_uri(target).is_some_and(|uri| documents.get(&uri).is_some());
         let following = updated
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|&index| runtime.overlays[index].has_new_imports(&path, &text, is_open))
             .collect::<Vec<_>>();
         if !following.is_empty() {
@@ -2664,6 +2691,11 @@ impl Server {
             }
             let _ = runtime.client.notify_watched_files(events);
             self.preprocess_known_empty = false;
+        }
+        if reach_changed && let Some(runtime) = &mut self.tsgo {
+            for index in updated {
+                runtime.open_reachable_javascript(index, [path.clone()]);
+            }
         }
     }
 
@@ -2682,10 +2714,18 @@ impl Server {
         if loaded {
             self.mirror_editor_buffers(owner);
         }
+        let roots = self
+            .documents
+            .iter()
+            .map(|document| {
+                let path = uri_to_path(document.uri.as_str());
+                fs::canonicalize(&path).unwrap_or(path)
+            })
+            .collect::<Vec<_>>();
         let activated = self
             .tsgo
             .as_mut()
-            .is_some_and(|runtime| runtime.activate_project(owner));
+            .is_some_and(|runtime| runtime.activate_project(owner, &roots));
         if activated {
             self.preprocess_loaded_project(owner);
         }
@@ -2756,6 +2796,9 @@ impl Server {
         let language_id = document.language_id.clone();
         let path = uri_to_path(uri.as_str());
         let path = fs::canonicalize(&path).unwrap_or(path);
+        if let Some(runtime) = &mut self.tsgo {
+            runtime.document_imports.remove(&path);
+        }
         if is_svelte_document(&language_id, &path) {
             let mut closed_source = None;
             if let Some(runtime) = &mut self.tsgo
@@ -2881,10 +2924,30 @@ impl Server {
             return;
         };
         let mut events = Vec::new();
+        let mut javascript_arrived = Vec::new();
         for (index, update) in updates {
             runtime.deliver_update(index, &update, &mut events);
+            if update
+                .opened_or_changed
+                .iter()
+                .chain(&update.buffers)
+                .any(|shadow| shadow.language_id == JAVASCRIPT_SHADOW)
+                && runtime
+                    .activated
+                    .contains(runtime.overlays[index].cache_dir())
+            {
+                javascript_arrived.push(index);
+            }
         }
         let _ = runtime.client.notify_watched_files(events);
+        // A JavaScript component that joined may be one an open document
+        // reaches (an import that resolves now).
+        if !javascript_arrived.is_empty() {
+            let roots = editor.paths().cloned().collect::<Vec<_>>();
+            for index in javascript_arrived {
+                runtime.open_reachable_javascript(index, roots.iter().cloned());
+            }
+        }
     }
 
     fn rebuild_tsgo_overlays(&mut self) {
@@ -2915,6 +2978,8 @@ impl Server {
             let _ = runtime.client.close_buffer(uri);
         }
         runtime.activated.clear();
+        runtime.javascript_buffers.clear();
+        runtime.document_imports.clear();
         // Every project is reloaded on demand: re-syncing the open documents
         // below loads theirs, and tsgo restarts afterwards.
         runtime.overlays = rebuilt;
