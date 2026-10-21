@@ -1,6 +1,6 @@
 //! The LSP message loop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,6 +36,7 @@ use lsp_types::{
 
 use rsvelte_projection::is_typescript_component;
 
+use crate::background;
 use crate::client::ClientState;
 use crate::completions::TRIGGER_CHARACTERS;
 use crate::document::{Document, DocumentStore};
@@ -65,7 +66,7 @@ use crate::tsgo_custom::{
     component_probe_position, component_reference_code_lens, filter_component_references,
     prepare_code_lenses, resolve_code_lens, rewrite_will_rename_params, rewrite_will_rename_result,
 };
-use crate::tsgo_overlay::{self, EditorBuffers, TsgoOverlay};
+use crate::tsgo_overlay::{self, EditorBuffers, ProjectSpec, TsgoOverlay};
 use crate::tsgo_rename::{
     PrepareRenamePlan, RenameDocument, merge_workspace_edits, prepare_rename_plan,
     rewrite_prepare_response, rewrite_workspace_edit,
@@ -403,6 +404,14 @@ struct TsgoRuntime {
     /// Each open document's `.svelte` imports, as a fingerprint: when they
     /// change, the JavaScript components it reaches may have.
     document_imports: HashMap<PathBuf, u64>,
+    /// One component shadow per loaded project, by cache directory, held as
+    /// a buffer so tsgo keeps the project: tsgo unloads a project none of
+    /// whose files is open, and workspace-wide requests only see the
+    /// projects it has. The source path names the component.
+    keep_alive: HashMap<PathBuf, (PathBuf, Uri)>,
+    /// Whether every loaded project is kept, which starts with the first
+    /// background load or workspace-wide request.
+    keep_all: bool,
 }
 
 /// tsgo takes a buffer's script kind from its language id. A JavaScript
@@ -480,7 +489,7 @@ fn locate_project(overlays: &[TsgoOverlay], source: &Path) -> Option<ProjectLoca
 /// Write the body of every component a loaded overlay holds and sweep the
 /// bodies it no longer does. Returns the watched-file changes, which only
 /// matter once tsgo has loaded the project.
-fn persist_bodies(overlay: &TsgoOverlay) -> Vec<(Uri, lsp_types::FileChangeType)> {
+pub(crate) fn persist_bodies(overlay: &TsgoOverlay) -> Vec<(Uri, lsp_types::FileChangeType)> {
     let mut events = Vec::new();
     for shadow in overlay.component_shadows() {
         let source = uri_to_path(shadow.source_uri.as_str());
@@ -611,6 +620,8 @@ impl TsgoRuntime {
             activated: HashSet::new(),
             javascript_buffers: HashSet::new(),
             document_imports: HashMap::new(),
+            keep_alive: HashMap::new(),
+            keep_all: false,
         })
     }
 
@@ -770,8 +781,84 @@ impl TsgoRuntime {
             )),
         }
         let uri = shadow.shadow_uri.as_str();
-        if self.javascript_buffers.contains(uri) || self.open_shadows.contains_key(uri) {
+        if self.javascript_buffers.contains(uri)
+            || self.open_shadows.contains_key(uri)
+            || self.is_keep_alive(uri)
+        {
             open_shadow(&self.client, &mut self.open_shadows, shadow);
+        }
+    }
+
+    /// Whether `uri` is a shadow held open only to keep its project in tsgo.
+    fn is_keep_alive(&self, uri: &str) -> bool {
+        self.keep_alive
+            .values()
+            .any(|(_, shadow)| shadow.as_str() == uri)
+    }
+
+    /// Hold one component shadow of `overlays[index]` open as a buffer, so
+    /// tsgo keeps the project (see `keep_alive`), when every project is to
+    /// be kept. A component the project owns, else a copy; the existing one
+    /// stays while the project still holds it. Returns the shadow when it
+    /// opened one now.
+    fn keep_project_alive(&mut self, index: usize) -> Option<Uri> {
+        let overlay = self.overlays.get(index)?;
+        if !self.keep_all || !overlay.is_loaded() {
+            return None;
+        }
+        let cache = overlay.cache_dir().to_path_buf();
+        if let Some((source, uri)) = self.keep_alive.get(&cache)
+            && overlay
+                .shadow_for_source(source)
+                .is_some_and(|shadow| &shadow.shadow_uri == uri)
+        {
+            return None;
+        }
+        let shadows = overlay.component_shadows();
+        let shadow = shadows
+            .iter()
+            .find(|shadow| overlay.owns(&uri_to_path(shadow.source_uri.as_str())))
+            .or_else(|| shadows.first())
+            .map(|shadow| (*shadow).clone());
+        let Some(shadow) = shadow else {
+            self.keep_alive.remove(&cache);
+            return None;
+        };
+        self.keep_alive.insert(
+            cache,
+            (
+                uri_to_path(shadow.source_uri.as_str()),
+                shadow.shadow_uri.clone(),
+            ),
+        );
+        if self.open_shadows.contains_key(shadow.shadow_uri.as_str()) {
+            return None;
+        }
+        open_shadow(&self.client, &mut self.open_shadows, &shadow);
+        Some(shadow.shadow_uri)
+    }
+
+    /// The project that owns `source`, as a [`ProjectSpec`], whether or not
+    /// it exists yet.
+    fn project_spec_for(&self, source: &Path) -> Option<ProjectSpec> {
+        let source = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+        match locate_project(&self.overlays, &source)? {
+            ProjectLocation::Existing(index) => {
+                let overlay = &self.overlays[index];
+                Some(ProjectSpec {
+                    config: (overlay.workspace() != overlay.mirror_root())
+                        .then(|| overlay.source_tsconfig().map(Path::to_path_buf))
+                        .flatten(),
+                    mirror_root: overlay.mirror_root().to_path_buf(),
+                })
+            }
+            ProjectLocation::Nested {
+                config,
+                mirror_root,
+            } => Some(ProjectSpec {
+                config: Some(config),
+                mirror_root,
+            }),
         }
     }
 
@@ -825,6 +912,70 @@ impl TsgoRuntime {
     }
 }
 
+/// The projects loaded in the background (see [`background`]).
+struct BackgroundProjects {
+    worker: Option<background::Worker>,
+    /// Bumped whenever the overlays are rebuilt or the folders change, so a
+    /// result for the old set is dropped.
+    generation: u64,
+    /// The projects still to load, once enumerated.
+    queue: Option<VecDeque<ProjectSpec>>,
+    enumerating: bool,
+    in_flight: Option<ProjectSpec>,
+    /// File events that arrived while a load was in flight: its overlay was
+    /// built from the disk before them.
+    missed_events: Vec<(PathBuf, lsp_types::FileChangeType)>,
+    /// The request that has tsgo build the project loaded last.
+    warming: Option<RequestId>,
+    /// Every project that owns a component is loaded.
+    complete: bool,
+    /// The editor's last message.
+    last_activity: Instant,
+}
+
+impl BackgroundProjects {
+    fn new() -> Self {
+        Self {
+            worker: background::Worker::spawn(),
+            generation: 0,
+            queue: None,
+            enumerating: false,
+            in_flight: None,
+            missed_events: Vec::new(),
+            warming: None,
+            complete: false,
+            last_activity: Instant::now(),
+        }
+    }
+
+    /// Start over, for a new set of overlays. The caller has waited for the
+    /// job in flight, which writes into the same caches.
+    fn reset(&mut self) {
+        self.generation += 1;
+        self.queue = None;
+        self.enumerating = false;
+        self.in_flight = None;
+        self.missed_events.clear();
+        self.warming = None;
+        self.complete = false;
+    }
+}
+
+/// Requests whose answer spans projects: tsgo searches only the projects it
+/// has, so every project that owns a component is loaded first.
+fn is_workspace_wide(method: &str) -> bool {
+    matches!(
+        method,
+        "workspace/symbol"
+            | "textDocument/references"
+            | "textDocument/implementation"
+            | "textDocument/rename"
+            | "callHierarchy/incomingCalls"
+            | "callHierarchy/outgoingCalls"
+            | "workspace/willRenameFiles"
+    )
+}
+
 struct Server {
     sender: Sender<Message>,
     client: ClientState,
@@ -869,6 +1020,7 @@ struct Server {
     /// directory has a config.
     preprocess_known_empty: bool,
     initialize_params: serde_json::Value,
+    background: BackgroundProjects,
     shutdown_requested: bool,
     exiting: bool,
 }
@@ -928,6 +1080,7 @@ impl Server {
             preprocess_configs: PreprocessConfigCache::default(),
             preprocess_known_empty: false,
             initialize_params,
+            background: BackgroundProjects::new(),
             shutdown_requested: false,
             exiting: false,
         }
@@ -950,19 +1103,39 @@ impl Server {
             .as_ref()
             .map(|runtime| runtime.client.events().clone())
             .unwrap_or_else(never);
+        let background_done = self
+            .background
+            .worker
+            .as_ref()
+            .map(|worker| worker.done().clone())
+            .unwrap_or_else(never);
 
         while !self.exiting {
-            // Rearmed each turn: the debounce deadline moves with every edit.
-            let timer = match self.scheduled.values().min() {
-                Some(&deadline) => after(deadline.saturating_duration_since(Instant::now())),
+            // Rearmed each turn: the debounce deadline moves with every edit,
+            // and the background waits for the editor to be quiet.
+            let timer = match self
+                .scheduled
+                .values()
+                .copied()
+                .chain(self.background_deadline())
+                .min()
+            {
+                Some(deadline) => after(deadline.saturating_duration_since(Instant::now())),
                 None => never(),
             };
             select! {
-                recv(connection.receiver) -> message => match message {
-                    Ok(Message::Request(request)) => self.on_request(request),
-                    Ok(Message::Notification(notification)) => self.on_notification(notification),
-                    Ok(Message::Response(response)) => self.on_response(response),
-                    Err(_) => break,
+                recv(connection.receiver) -> message => {
+                    self.background.last_activity = Instant::now();
+                    match message {
+                        Ok(Message::Request(request)) => self.on_request(request),
+                        Ok(Message::Notification(notification)) => self.on_notification(notification),
+                        Ok(Message::Response(response)) => self.on_response(response),
+                        Err(_) => break,
+                    }
+                },
+                recv(background_done) -> done => match done {
+                    Ok(done) => self.on_background_done(done),
+                    Err(_) => self.background.worker = None,
                 },
                 recv(outcomes) -> outcome => match outcome {
                     Ok(outcome) => self.on_outcome(outcome),
@@ -976,7 +1149,10 @@ impl Server {
                     Ok(event) => self.on_preprocess_event(event),
                     Err(_) => self.preprocess = None,
                 },
-                recv(timer) -> _ => self.run_scheduled_lints(),
+                recv(timer) -> _ => {
+                    self.run_scheduled_lints();
+                    self.step_background();
+                },
             }
         }
 
@@ -1302,6 +1478,9 @@ impl Server {
             self.respond_nothing(id);
             return;
         };
+        if is_workspace_wide(method) {
+            self.load_all_projects();
+        }
         let Some(runtime) = &self.tsgo else {
             self.respond_nothing(id);
             return;
@@ -1394,6 +1573,7 @@ impl Server {
         };
         let source_path = uri_to_path(source_uri.as_str());
         self.ensure_tsgo_project(&source_path);
+        self.load_all_projects();
         let Some(runtime) = &self.tsgo else {
             self.respond(Response::new_ok(
                 request.id,
@@ -1476,6 +1656,7 @@ impl Server {
         let old_path = uri_to_path(old_uri.as_str());
         let new_path = uri_to_path(new_uri.as_str());
         self.ensure_tsgo_project(&old_path);
+        self.load_all_projects();
         let Some(runtime) = &self.tsgo else {
             self.respond_nothing(request.id);
             return;
@@ -2093,6 +2274,11 @@ impl Server {
                                 .iter()
                                 .map(|change| (uri_to_path(change.uri.as_str()), change.typ))
                                 .collect::<Vec<_>>();
+                            if self.background.in_flight.is_some() {
+                                self.background
+                                    .missed_events
+                                    .extend(changes.iter().cloned());
+                            }
                             self.refresh_tsgo_overlays(&changes);
                         }
                         if let Some(runtime) = &self.tsgo {
@@ -2290,6 +2476,9 @@ impl Server {
                 fallback_result.unwrap_or_else(|| tsgo_unmapped_result(&request.method)),
             ));
             return;
+        }
+        if is_workspace_wide(&request.method) {
+            self.load_all_projects();
         }
         let Ok(completion_site_data) = self.completion_data_site(&mut request) else {
             // Without tsgo's payload the child rejects the request outright; the
@@ -2708,11 +2897,25 @@ impl Server {
     /// project serves the editor, its JavaScript components open as buffers
     /// and its members are queued for preprocessing.
     fn ensure_tsgo_project(&mut self, path: &Path) -> Option<usize> {
+        // The background may be loading this very project into the same
+        // cache: take its result rather than race it.
+        if let Some(spec) = &self.background.in_flight
+            && self
+                .tsgo
+                .as_ref()
+                .and_then(|runtime| runtime.project_spec_for(path))
+                .is_some_and(|wanted| wanted.same_project(spec))
+        {
+            self.wait_for_background();
+        }
         let runtime = self.tsgo.as_mut()?;
         let (owner, loaded) = runtime.ensure_project_for(path);
         let owner = owner?;
         if loaded {
             self.mirror_editor_buffers(owner);
+            if let Some(runtime) = &mut self.tsgo {
+                runtime.keep_project_alive(owner);
+            }
         }
         let roots = self
             .documents
@@ -2730,6 +2933,316 @@ impl Server {
             self.preprocess_loaded_project(owner);
         }
         Some(owner)
+    }
+
+    /// When the next background step is due: the editor's first project has
+    /// been served, no request is waiting on tsgo, nothing is loading, and
+    /// the editor has been quiet for [`background::IDLE`].
+    fn background_deadline(&self) -> Option<Instant> {
+        let background = &self.background;
+        if !self.settings.background_projects_enable
+            || background.complete
+            || background.worker.is_none()
+            || background.enumerating
+            || background.in_flight.is_some()
+            || background.warming.is_some()
+            || !self.pending_tsgo.is_empty()
+            || !self.component_queries.is_empty()
+        {
+            return None;
+        }
+        let runtime = self.tsgo.as_ref()?;
+        runtime
+            .overlays
+            .iter()
+            .any(TsgoOverlay::is_loaded)
+            .then(|| background.last_activity + background::IDLE)
+    }
+
+    /// Hand the background thread its next job, when one is due: find the
+    /// projects that own a component, then load them one at a time.
+    fn step_background(&mut self) {
+        if self
+            .background_deadline()
+            .is_none_or(|deadline| Instant::now() < deadline)
+        {
+            return;
+        }
+        let Some(runtime) = &mut self.tsgo else {
+            return;
+        };
+        if !runtime.keep_all {
+            runtime.keep_all = true;
+            for index in 0..runtime.overlays.len() {
+                runtime.keep_project_alive(index);
+            }
+        }
+        let generation = self.background.generation;
+        let Some(worker) = &self.background.worker else {
+            return;
+        };
+        let Some(queue) = &mut self.background.queue else {
+            let roots = runtime
+                .overlays
+                .iter()
+                .filter(|overlay| overlay.workspace() == overlay.mirror_root())
+                .map(|overlay| overlay.workspace().to_path_buf())
+                .collect();
+            if worker.submit(background::Job::Enumerate { generation, roots }) {
+                self.background.enumerating = true;
+            } else {
+                self.background.worker = None;
+            }
+            return;
+        };
+        while let Some(spec) = queue.pop_front() {
+            if runtime
+                .overlays
+                .iter()
+                .any(|overlay| overlay.is_project(&spec) && overlay.is_loaded())
+            {
+                continue;
+            }
+            if worker.submit(background::Job::Load {
+                generation,
+                spec: spec.clone(),
+            }) {
+                self.background.in_flight = Some(spec);
+            } else {
+                self.background.worker = None;
+            }
+            return;
+        }
+        self.background.complete = true;
+        log::info(format_args!(
+            "every TypeScript project that owns a component is loaded"
+        ));
+    }
+
+    fn on_background_done(&mut self, done: background::Done) {
+        match done {
+            background::Done::Enumerated {
+                generation,
+                projects,
+            } => {
+                if generation == self.background.generation {
+                    self.background.enumerating = false;
+                    self.background.queue = Some(projects.into());
+                }
+            }
+            background::Done::Loaded {
+                generation,
+                spec,
+                loaded,
+            } => {
+                if generation != self.background.generation {
+                    return;
+                }
+                self.background.in_flight = None;
+                match loaded {
+                    Ok(loaded) => {
+                        let loaded = *loaded;
+                        let elapsed = loaded.elapsed;
+                        let Some(index) =
+                            self.install_project(&spec, loaded.overlay, loaded.events)
+                        else {
+                            return;
+                        };
+                        if let Some(runtime) = &self.tsgo {
+                            let overlay = &runtime.overlays[index];
+                            log::info(format_args!(
+                                "loaded TypeScript project {} ({} components) in {} ms in the background",
+                                overlay
+                                    .source_tsconfig()
+                                    .unwrap_or_else(|| overlay.workspace())
+                                    .display(),
+                                overlay.component_shadows().len(),
+                                elapsed.as_millis()
+                            ));
+                        }
+                        self.warm_up(index);
+                    }
+                    Err(error) => log::warn(format_args!(
+                        "could not load tsgo project {}: {error}",
+                        spec.config
+                            .as_deref()
+                            .unwrap_or(&spec.mirror_root)
+                            .display()
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Install a project loaded off the main loop, unless the editor got
+    /// there first: replay the file events it missed, mirror the editor's
+    /// buffers it holds, and keep it in tsgo. Returns its index.
+    fn install_project(
+        &mut self,
+        spec: &ProjectSpec,
+        overlay: TsgoOverlay,
+        events: Vec<(Uri, lsp_types::FileChangeType)>,
+    ) -> Option<usize> {
+        let runtime = self.tsgo.as_mut()?;
+        if runtime
+            .overlays
+            .iter()
+            .any(|overlay| overlay.is_project(spec) && overlay.is_loaded())
+        {
+            return None;
+        }
+        let index = match runtime
+            .overlays
+            .iter()
+            .position(|overlay| overlay.is_project(spec))
+        {
+            Some(index) => {
+                runtime.overlays[index] = overlay;
+                index
+            }
+            None => {
+                runtime.overlays.push(overlay);
+                runtime.overlays.len() - 1
+            }
+        };
+        runtime.resolved_dirs.clear();
+        let _ = runtime.client.notify_watched_files(events);
+        let missed = std::mem::take(&mut self.background.missed_events);
+        if !missed.is_empty() {
+            let editor = editor_buffers(&self.documents);
+            if let Some(runtime) = &mut self.tsgo {
+                let overlay = &mut runtime.overlays[index];
+                let update = match overlay.apply_file_changes(&missed, &editor) {
+                    Ok(Some(update)) => Ok(update),
+                    Ok(None) => overlay.refresh_except(&editor),
+                    Err(error) => Err(error),
+                };
+                match update {
+                    Ok(update) => {
+                        let mut events = Vec::new();
+                        runtime.deliver_update(index, &update, &mut events);
+                        let _ = runtime.client.notify_watched_files(events);
+                    }
+                    Err(error) => log::warn(format_args!(
+                        "could not refresh tsgo overlay for {}: {error}",
+                        runtime.overlays[index].workspace().display()
+                    )),
+                }
+            }
+        }
+        self.mirror_editor_buffers(index);
+        if let Some(runtime) = &mut self.tsgo {
+            runtime.keep_project_alive(index);
+        }
+        Some(index)
+    }
+
+    /// Have tsgo build `overlays[index]` now, while the editor is quiet,
+    /// rather than at the editor's next request: one cheap request about the
+    /// shadow that keeps the project open.
+    fn warm_up(&mut self, index: usize) {
+        let Some(runtime) = &self.tsgo else {
+            return;
+        };
+        let Some((_, uri)) = runtime
+            .overlays
+            .get(index)
+            .and_then(|overlay| runtime.keep_alive.get(overlay.cache_dir()))
+        else {
+            return;
+        };
+        self.next_request_id += 1;
+        let id = RequestId::from(format!(
+            "rsvelte-background-warm-up-{}",
+            self.next_request_id
+        ));
+        let request = Request::new(
+            id.clone(),
+            "textDocument/documentSymbol".to_string(),
+            serde_json::json!({ "textDocument": { "uri": uri } }),
+        );
+        if runtime.client.forward(request.into()).is_ok() {
+            self.background.warming = Some(id);
+        }
+    }
+
+    /// Wait for the background job in flight, if any, and take its result.
+    fn wait_for_background(&mut self) {
+        while self.background.enumerating || self.background.in_flight.is_some() {
+            let Some(done) = self
+                .background
+                .worker
+                .as_ref()
+                .and_then(|worker| worker.done().recv().ok())
+            else {
+                self.background.enumerating = false;
+                self.background.in_flight = None;
+                return;
+            };
+            self.on_background_done(done);
+        }
+    }
+
+    /// Load every project that owns a component before a workspace-wide
+    /// request reaches tsgo, which searches only the projects it has: what
+    /// the background has not loaded yet is loaded now.
+    fn load_all_projects(&mut self) {
+        if self.tsgo.is_none() || self.background.complete {
+            return;
+        }
+        let started = Instant::now();
+        self.wait_for_background();
+        let Some(runtime) = &mut self.tsgo else {
+            return;
+        };
+        if !runtime.keep_all {
+            runtime.keep_all = true;
+            for index in 0..runtime.overlays.len() {
+                runtime.keep_project_alive(index);
+            }
+        }
+        let queue = self.background.queue.take().unwrap_or_else(|| {
+            runtime
+                .overlays
+                .iter()
+                .filter(|overlay| overlay.workspace() == overlay.mirror_root())
+                .flat_map(|overlay| tsgo_overlay::component_projects(overlay.workspace()))
+                .collect()
+        });
+        let mut loaded = 0;
+        for spec in queue {
+            if self.tsgo.as_ref().is_some_and(|runtime| {
+                runtime
+                    .overlays
+                    .iter()
+                    .any(|overlay| overlay.is_project(&spec) && overlay.is_loaded())
+            }) {
+                continue;
+            }
+            match background::load(&spec, tsgo_overlay::MAX_PROJECTION_THREADS) {
+                Ok(project) => {
+                    if self
+                        .install_project(&spec, project.overlay, project.events)
+                        .is_some()
+                    {
+                        loaded += 1;
+                    }
+                }
+                Err(error) => log::warn(format_args!(
+                    "could not load tsgo project {}: {error}",
+                    spec.config
+                        .as_deref()
+                        .unwrap_or(&spec.mirror_root)
+                        .display()
+                )),
+            }
+        }
+        self.background.queue = Some(VecDeque::new());
+        self.background.complete = true;
+        log::info(format_args!(
+            "loaded {loaded} more TypeScript projects for a workspace-wide request in {} ms",
+            started.elapsed().as_millis()
+        ));
     }
 
     /// Re-project, from their buffers, the editor's open components that
@@ -2927,6 +3440,10 @@ impl Server {
         let mut javascript_arrived = Vec::new();
         for (index, update) in updates {
             runtime.deliver_update(index, &update, &mut events);
+            if !update.closed.is_empty() {
+                // The component that kept the project may be gone.
+                runtime.keep_project_alive(index);
+            }
             if update
                 .opened_or_changed
                 .iter()
@@ -2951,6 +3468,11 @@ impl Server {
     }
 
     fn rebuild_tsgo_overlays(&mut self) {
+        if self.tsgo.is_none() {
+            return;
+        }
+        self.wait_for_background();
+        self.background.reset();
         let Some(runtime) = &mut self.tsgo else {
             return;
         };
@@ -2980,6 +3502,7 @@ impl Server {
         runtime.activated.clear();
         runtime.javascript_buffers.clear();
         runtime.document_imports.clear();
+        runtime.keep_alive.clear();
         // Every project is reloaded on demand: re-syncing the open documents
         // below loads theirs, and tsgo restarts afterwards.
         runtime.overlays = rebuilt;
@@ -3003,6 +3526,11 @@ impl Server {
         added: &[lsp_types::WorkspaceFolder],
         removed: &[lsp_types::WorkspaceFolder],
     ) {
+        if self.tsgo.is_none() {
+            return;
+        }
+        self.wait_for_background();
+        self.background.reset();
         let Some(runtime) = &mut self.tsgo else {
             return;
         };
@@ -3020,6 +3548,7 @@ impl Server {
             runtime.resolved_dirs.clear();
             for overlay in gone {
                 runtime.activated.remove(overlay.cache_dir());
+                runtime.keep_alive.remove(overlay.cache_dir());
                 for shadow in overlay.open_shadows() {
                     if runtime
                         .open_shadows
@@ -3121,7 +3650,13 @@ impl Server {
     fn preprocess_inputs(&mut self) -> Vec<PreprocessInput> {
         let mut inputs = HashMap::<PathBuf, PreprocessInput>::new();
         if let Some(runtime) = &self.tsgo {
-            for overlay in &runtime.overlays {
+            // A project loaded only for workspace-wide requests is not
+            // preprocessed until a document of it opens.
+            for overlay in runtime
+                .overlays
+                .iter()
+                .filter(|overlay| runtime.activated.contains(overlay.cache_dir()))
+            {
                 for shadow in overlay.eager_shadows() {
                     let filename = uri_to_path(shadow.source_uri.as_str());
                     if self
@@ -3683,6 +4218,7 @@ impl Server {
     }
 
     fn abort_tsgo_requests(&mut self, message: &str) {
+        self.background.warming = None;
         let stale_child_requests = self
             .outgoing
             .iter()
@@ -3745,6 +4281,10 @@ impl Server {
     fn on_tsgo_message(&mut self, message: Message) {
         match message {
             Message::Response(mut response) => {
+                if self.background.warming.as_ref() == Some(&response.id) {
+                    self.background.warming = None;
+                    return;
+                }
                 if self.on_component_query_response(response.clone()) {
                     return;
                 }
@@ -3815,6 +4355,17 @@ impl Server {
                             );
                         }
                         mapper.map_response(&method, result);
+                    }
+                    // The same component can sit in several projects (its
+                    // owner and the copies others keep for their imports),
+                    // and their answers map to the same source location.
+                    if matches!(
+                        method.as_str(),
+                        "workspace/symbol"
+                            | "textDocument/references"
+                            | "textDocument/implementation"
+                    ) {
+                        dedupe_array(result);
                     }
                     // The second half of upstream's inlay-hint filtering runs
                     // AFTER mapping (`InlayHintProvider.ts:84-88`), because the
@@ -4085,6 +4636,25 @@ impl Server {
                 self.respond(response);
             }
             Message::Notification(mut notification) => {
+                // A shadow open only to keep its project is no editor
+                // document: a client that takes pushed diagnostics must not
+                // get them for it.
+                if notification.method == "textDocument/publishDiagnostics"
+                    && let Some(runtime) = &self.tsgo
+                    && let Some((source, _)) = notification
+                        .params
+                        .get("uri")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|uri| {
+                            runtime
+                                .keep_alive
+                                .values()
+                                .find(|(_, shadow)| shadow.as_str() == uri)
+                        })
+                    && !self.is_editor_document(source)
+                {
+                    return;
+                }
                 if let Some(runtime) = &self.tsgo {
                     let mapper = TsgoResponseMapper::for_overlays(&runtime.overlays);
                     if !mapper.map_child_params(&notification.method, &mut notification.params) {
@@ -4825,6 +5395,15 @@ fn inside_element_body(text: &str, offset: usize, tag: &str) -> bool {
     let open = before.rfind(&format!("<{tag}"));
     let close = before.rfind(&format!("</{tag}"));
     open > close && open.is_some_and(|start| before[start..].contains('>'))
+}
+
+/// Drop repeated elements of an array result, keeping the first of each.
+fn dedupe_array(result: &mut serde_json::Value) {
+    let Some(items) = result.as_array_mut() else {
+        return;
+    };
+    let mut seen = HashSet::new();
+    items.retain(|item| seen.insert(item.to_string()));
 }
 
 /// The editor's open documents, by canonical path.

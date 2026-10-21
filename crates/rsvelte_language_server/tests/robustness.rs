@@ -40,10 +40,20 @@ struct Server {
     reader: Option<JoinHandle<()>>,
     buffered: HashMap<i64, Value>,
     next_id: i64,
+    /// What `workspace/configuration` answers for the `rsvelte` section.
+    rsvelte_settings: Value,
 }
 
 impl Server {
     fn start(root: Option<&Path>, environment: &[(&str, &Path)]) -> Self {
+        Self::start_with_settings(root, environment, Value::Null)
+    }
+
+    fn start_with_settings(
+        root: Option<&Path>,
+        environment: &[(&str, &Path)],
+        rsvelte_settings: Value,
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rsvelte-language-server"));
         command
             .stdin(Stdio::piped())
@@ -83,6 +93,7 @@ impl Server {
             reader: Some(reader),
             buffered: HashMap::new(),
             next_id: 0,
+            rsvelte_settings,
         };
         let root_uri = root.map(file_uri).map(Value::String).unwrap_or(Value::Null);
         let id = server.request(
@@ -168,7 +179,13 @@ impl Server {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .map(|_| Value::Null)
+                .map(|item| {
+                    if item["section"] == "rsvelte" {
+                        self.rsvelte_settings.clone()
+                    } else {
+                        Value::Null
+                    }
+                })
                 .collect();
             Value::Array(values)
         } else {
@@ -614,12 +631,13 @@ fn a_document_loads_only_its_own_project_and_the_rest_is_read_from_disk() {
     fs::write(root.join("a/Legacy.svelte"), "<p />").unwrap();
     fs::write(root.join("a/Unreached.svelte"), "<p />").unwrap();
     fs::write(root.join("b/Y.svelte"), source).unwrap();
-    let mut server = Server::start(
+    let mut server = Server::start_with_settings(
         Some(&root),
         &[
             ("TSGO_BIN", helper.as_path()),
             ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
         ],
+        json!({ "backgroundProjects": { "enable": false } }),
     );
     let opened = |log: &Path| {
         fs::read_to_string(log)
@@ -911,6 +929,131 @@ fn component_attribute_completion_asks_the_owning_project() {
             .all(|line| line.contains("/.svelte-rs/projects/b/")),
         "{completions:?}"
     );
+    server.shutdown();
+}
+
+/// A workspace with three projects that own components and one that owns
+/// none, for the background-loading tests.
+#[cfg(unix)]
+fn three_projects(dir: &Path) -> PathBuf {
+    let root = fs::canonicalize(dir).unwrap().join("ws");
+    for project in ["a", "b", "c", "tests"] {
+        fs::create_dir_all(root.join(project)).unwrap();
+        fs::write(root.join(project).join("tsconfig.json"), "{}").unwrap();
+    }
+    fs::write(root.join("package.json"), "{}").unwrap();
+    let component = "<script lang=\"ts\">\nlet answer = 42;\n</script>\n<p>{answer}</p>\n";
+    fs::write(root.join("a/X.svelte"), component).unwrap();
+    fs::write(root.join("b/Y.svelte"), component).unwrap();
+    fs::write(root.join("c/Z.svelte"), component).unwrap();
+    fs::write(root.join("tests/only.test.ts"), "export {};\n").unwrap();
+    root
+}
+
+/// Once the editor's first project is served and the editor is quiet, the
+/// other projects that own a component load in the background, and tsgo
+/// gets one buffer for each, which keeps the project, and a request that
+/// has it built now rather than at the editor's next request.
+#[cfg(unix)]
+#[test]
+fn the_other_projects_load_in_the_background_once_the_editor_is_quiet() {
+    let dir = TestDir::new("background-projects");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = three_projects(&dir.0);
+    let mut server = Server::start(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+        ],
+    );
+    let x = file_uri(&root.join("a/X.svelte"));
+    server.open(&x, &fs::read_to_string(root.join("a/X.svelte")).unwrap());
+    hover(&mut server, &x);
+    let kept = |project: &str, file: &str| {
+        file_uri(
+            &root
+                .join(".svelte-rs/projects")
+                .join(project)
+                .join("tsgo/svelte")
+                .join(project)
+                .join(format!("{file}.svelte.tsx")),
+        )
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let lines = traffic(&log);
+        let warmed = |uri: &str| {
+            lines.contains(&format!("textDocument/didOpen {uri}"))
+                && lines.contains(&format!("textDocument/documentSymbol {uri}"))
+        };
+        if warmed(&kept("b", "Y")) && warmed(&kept("c", "Z")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the other projects never loaded: {lines:?}"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        !root.join(".svelte-rs/projects/tests").exists(),
+        "a project that owns no component waits for a document of its own"
+    );
+    // The editor's own document still answers, and nothing else is open.
+    assert!(hover(&mut server, &x).to_string().contains("recorded"));
+    let opened = traffic(&log)
+        .into_iter()
+        .filter(|line| line.starts_with("textDocument/didOpen "))
+        .count();
+    assert_eq!(opened, 3, "the document and one buffer per other project");
+    server.shutdown();
+}
+
+/// With the background off, a workspace-wide request loads every project
+/// that owns a component before tsgo answers it.
+#[cfg(unix)]
+#[test]
+fn a_workspace_wide_request_loads_every_project_first() {
+    let dir = TestDir::new("on-demand-projects");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = three_projects(&dir.0);
+    let mut server = Server::start_with_settings(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+    );
+    let x = file_uri(&root.join("a/X.svelte"));
+    server.open(&x, &fs::read_to_string(root.join("a/X.svelte")).unwrap());
+    hover(&mut server, &x);
+    let id = server.request("workspace/symbol", json!({ "query": "answer" }));
+    let response = server.response(id, Duration::from_secs(10));
+    assert!(response.get("result").is_some(), "{response}");
+    let lines = traffic(&log);
+    let symbols = lines
+        .iter()
+        .position(|line| line.starts_with("workspace/symbol"))
+        .expect("forwarded");
+    for (project, file) in [("b", "Y"), ("c", "Z")] {
+        let kept = file_uri(
+            &root
+                .join(".svelte-rs/projects")
+                .join(project)
+                .join("tsgo/svelte")
+                .join(project)
+                .join(format!("{file}.svelte.tsx")),
+        );
+        let opened = lines
+            .iter()
+            .position(|line| line == &format!("textDocument/didOpen {kept}"))
+            .unwrap_or_else(|| panic!("{project} is not open in tsgo: {lines:?}"));
+        assert!(opened < symbols, "{project} loads before the request");
+    }
     server.shutdown();
 }
 

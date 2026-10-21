@@ -170,6 +170,11 @@ pub struct Settings {
     pub document_symbol_enable: bool,
     pub runes_legacy_mode_code_lens_enable: bool,
     pub preprocess_enable: bool,
+    /// Load, while the editor is idle, every TypeScript project that owns a
+    /// component, so workspace symbols, references and rename see them all
+    /// (`rsvelte.backgroundProjects.enable`). Off, they load at the first
+    /// such request instead.
+    pub background_projects_enable: bool,
     pub compiler_warnings: CompilerWarnings,
     pub format_config: FormatConfig,
     pub typescript: TypeScriptSettings,
@@ -194,6 +199,7 @@ impl Default for Settings {
             document_symbol_enable: true,
             runes_legacy_mode_code_lens_enable: true,
             preprocess_enable: true,
+            background_projects_enable: true,
             compiler_warnings: CompilerWarnings::default(),
             format_config: FormatConfig::from_json(None),
             typescript,
@@ -380,6 +386,10 @@ impl Settings {
             enabled(value, "runesLegacyModeCodeLens"),
         );
         override_bool(&mut self.preprocess_enable, enabled(value, "preprocess"));
+        override_bool(
+            &mut self.background_projects_enable,
+            enabled(value, "backgroundProjects"),
+        );
         if value.get("compilerWarnings").is_some() {
             self.compiler_warnings = compiler_warnings(value);
         }

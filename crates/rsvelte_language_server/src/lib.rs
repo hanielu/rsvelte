@@ -9,6 +9,7 @@
 //! [`worker`] thread, which is where the stack depth and panic isolation the
 //! Svelte compiler needs are provided.
 
+pub mod background;
 pub mod client;
 pub mod code_actions;
 pub mod code_lens;

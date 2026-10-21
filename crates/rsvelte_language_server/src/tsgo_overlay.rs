@@ -346,6 +346,32 @@ impl TsgoOverlay {
         )
     }
 
+    /// The project `spec` names, deferred: its workspace folder's own
+    /// overlay ([`Self::build_deferred`]) or a nested config's.
+    pub fn build_for(spec: &ProjectSpec) -> Result<Self, TsgoOverlayError> {
+        match spec.config.as_deref() {
+            Some(config) if !spec.is_folder() => Self::build_mirrored(
+                config.parent().unwrap_or(&spec.mirror_root),
+                Some(config),
+                server_svelte_root().as_deref(),
+                Some(&spec.mirror_root),
+                false,
+            ),
+            _ => Self::build_deferred(&spec.mirror_root, None),
+        }
+    }
+
+    /// Whether this is the project `spec` names.
+    #[must_use]
+    pub fn is_project(&self, spec: &ProjectSpec) -> bool {
+        self.mirror_root == spec.mirror_root
+            && if spec.is_folder() {
+                self.workspace == self.mirror_root
+            } else {
+                self.source_tsconfig == spec.config
+            }
+    }
+
     /// Whether the members have been discovered and projected.
     #[must_use]
     pub const fn is_loaded(&self) -> bool {
@@ -358,12 +384,18 @@ impl TsgoOverlay {
     /// loaded now; an overlay loads once. A member that cannot be read or
     /// projected is skipped, so one bad file never costs the whole project.
     pub fn load(&mut self) -> Result<bool, TsgoOverlayError> {
+        self.load_with_threads(MAX_PROJECTION_THREADS)
+    }
+
+    /// [`Self::load`] on at most `threads` projection threads: a load in the
+    /// background leaves the editor's work most of the machine.
+    pub fn load_with_threads(&mut self, threads: usize) -> Result<bool, TsgoOverlayError> {
         if self.loaded {
             return Ok(false);
         }
         self.loaded = true;
         let sources = self.discover_sources().into_iter().collect::<Vec<_>>();
-        for (path, state) in self.project_sources(&sources) {
+        for (path, state) in self.project_sources(&sources, threads) {
             match state {
                 Ok(state) => {
                     self.insert_state(state);
@@ -459,7 +491,11 @@ impl TsgoOverlay {
     /// back in `sources` order, so the overlay built from them does not
     /// depend on scheduling. A panic is one member's error, as it is for the
     /// analysis worker.
-    fn project_sources(&self, sources: &[PathBuf]) -> Vec<(PathBuf, Result<ShadowState, String>)> {
+    fn project_sources(
+        &self,
+        sources: &[PathBuf],
+        max_threads: usize,
+    ) -> Vec<(PathBuf, Result<ShadowState, String>)> {
         let project = |path: &PathBuf| {
             let state = fs::read_to_string(path)
                 .map_err(|error| error.to_string())
@@ -474,7 +510,7 @@ impl TsgoOverlay {
         };
         let threads = std::thread::available_parallelism()
             .map_or(1, std::num::NonZero::get)
-            .min(MAX_PROJECTION_THREADS)
+            .min(max_threads)
             .min(sources.len().div_ceil(MIN_SOURCES_PER_THREAD));
         if threads <= 1 {
             return sources.iter().map(project).collect();
@@ -2252,6 +2288,89 @@ impl TsgoOverlay {
     }
 }
 
+/// A project the language server can load: its config, or `None` for a
+/// workspace folder without one, and the workspace folder its shadows mirror.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProjectSpec {
+    pub config: Option<PathBuf>,
+    pub mirror_root: PathBuf,
+}
+
+impl ProjectSpec {
+    /// Whether this is the workspace folder's own project rather than a
+    /// nested config's.
+    #[must_use]
+    pub fn is_folder(&self) -> bool {
+        self.config
+            .as_deref()
+            .is_none_or(|config| config.parent() == Some(self.mirror_root.as_path()))
+    }
+
+    /// Whether both name the same project.
+    #[must_use]
+    pub fn same_project(&self, other: &Self) -> bool {
+        self.mirror_root == other.mirror_root
+            && if self.is_folder() {
+                other.is_folder()
+            } else {
+                self.config == other.config
+            }
+    }
+}
+
+/// Every project in the workspace folder `root` (canonical) that owns a
+/// component: the nearest `tsconfig.json`, then `jsconfig.json`, of each
+/// `.svelte` file, or the folder's own project for a file with none — one
+/// walk that skips `node_modules`, hidden directories and symlinks, as
+/// discovery does. These are the projects the eager design loaded; one that
+/// owns no component (tests that import the app through an alias) loads when
+/// a document it owns opens.
+#[must_use]
+pub fn component_projects(root: &Path) -> Vec<ProjectSpec> {
+    fn walk(directory: &Path, config: Option<&Path>, found: &mut BTreeSet<Option<PathBuf>>) {
+        let own = ["tsconfig.json", "jsconfig.json"]
+            .into_iter()
+            .map(|name| directory.join(name))
+            .find(|path| path.is_file());
+        let config = own.as_deref().or(config);
+        let Ok(entries) = fs::read_dir(directory) else {
+            return;
+        };
+        let mut owns_component = false;
+        let mut subdirectories = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "node_modules" {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                subdirectories.push(entry.path());
+            } else if file_type.is_file() && name.ends_with(".svelte") {
+                owns_component = true;
+            }
+        }
+        if owns_component {
+            found.insert(config.map(Path::to_path_buf));
+        }
+        for subdirectory in subdirectories {
+            walk(&subdirectory, config, found);
+        }
+    }
+    let mut found = BTreeSet::new();
+    walk(root, None, &mut found);
+    found
+        .into_iter()
+        .map(|config| ProjectSpec {
+            config,
+            mirror_root: root.to_path_buf(),
+        })
+        .collect()
+}
+
 /// Where `require.resolve('svelte/package.json', { paths: [__dirname] })`
 /// looks from: the directory holding the running server
 /// (`importPackage.ts:32`). `@rsvelte/language-server` declares `svelte` for
@@ -3187,7 +3306,7 @@ fn write_cache_gitignore(cache_root: &Path) {
 }
 
 /// Most threads a project load projects its members on.
-const MAX_PROJECTION_THREADS: usize = 8;
+pub(crate) const MAX_PROJECTION_THREADS: usize = 8;
 /// Fewer members than this per thread are projected on one thread.
 const MIN_SOURCES_PER_THREAD: usize = 8;
 /// svelte2tsx recurses over the markup. Address space, not resident memory,
@@ -5487,6 +5606,43 @@ mod tests {
             "transitively, plus what a module re-exports; not Unreached"
         );
         assert_eq!(names(overlay.reachable_javascript([])), ["Exported.svelte"]);
+    }
+
+    #[test]
+    fn the_projects_that_own_components_are_found_in_one_walk() {
+        let workspace = TestWorkspace::new("component-projects");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        write(&root.join("App.svelte"), "<p />");
+        write(&root.join("app/tsconfig.json"), "{}");
+        write(&root.join("app/src/deep/Page.svelte"), "<p />");
+        write(&root.join("tools/jsconfig.json"), "{}");
+        write(&root.join("tools/Tool.svelte"), "<p />");
+        write(&root.join("tests/tsconfig.json"), "{}");
+        write(&root.join("tests/only.test.ts"), "export {};");
+        write(&root.join("node_modules/pkg/tsconfig.json"), "{}");
+        write(&root.join("node_modules/pkg/Lib.svelte"), "<p />");
+        write(&root.join(".hidden/tsconfig.json"), "{}");
+        write(&root.join(".hidden/Secret.svelte"), "<p />");
+        let projects = component_projects(&root);
+        let spec = |config: Option<&str>| ProjectSpec {
+            config: config.map(|config| root.join(config)),
+            mirror_root: root.clone(),
+        };
+        assert_eq!(
+            projects,
+            vec![
+                spec(None),
+                spec(Some("app/tsconfig.json")),
+                spec(Some("tools/jsconfig.json")),
+            ]
+        );
+        let folder = TsgoOverlay::build_for(&projects[0]).unwrap();
+        assert!(folder.is_project(&projects[0]));
+        assert!(!folder.is_project(&projects[1]));
+        let app = TsgoOverlay::build_for(&projects[1]).unwrap();
+        assert!(app.is_project(&projects[1]));
+        assert!(!app.is_loaded(), "built deferred");
+        assert_eq!(app.workspace(), root.join("app"));
     }
 
     #[test]
