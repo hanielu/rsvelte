@@ -4364,6 +4364,8 @@ impl Server {
                         "workspace/symbol"
                             | "textDocument/references"
                             | "textDocument/implementation"
+                            | "textDocument/definition"
+                            | "textDocument/typeDefinition"
                     ) {
                         dedupe_array(result);
                     }

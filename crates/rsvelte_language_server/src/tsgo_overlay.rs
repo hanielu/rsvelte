@@ -1742,6 +1742,37 @@ impl TsgoOverlay {
         Some(ordered_range(start, end))
     }
 
+    /// [`Self::map_generated_range`] for a definition's location, as
+    /// `convertToLocationForReferenceOrDefinition` (`utils.ts:108-128`) does
+    /// it: a location in a component's shadow whose start maps back to
+    /// nothing — the generated default export a component tag or its import
+    /// resolves to, the empty range at the top of the file a module
+    /// specifier resolves to — lands at the start of the component's file
+    /// (line 0, character 1, as upstream's `mapUnmappedToTheStartOfFile`).
+    /// One that starts in generated code (`isInGeneratedCode`, an `Ωignore`
+    /// region) is still dropped, as upstream drops it.
+    #[must_use]
+    pub fn map_definition_range(&self, shadow_path: &Path, range: Range) -> Option<Range> {
+        if let Some(mapped) = self.map_generated_range(shadow_path, range) {
+            return Some(mapped);
+        }
+        if !self.is_projected_shadow(shadow_path)
+            || self
+                .map_generated_position(shadow_path, range.start)
+                .is_some()
+        {
+            return None;
+        }
+        let text = self.shadow_text(shadow_path)?;
+        let start = utf8_offset(text, range.start);
+        let end = utf8_offset(text, range.end).max(start);
+        if is_in_generated_code(text, start, end) {
+            return None;
+        }
+        let start = Position::new(0, 1);
+        Some(Range::new(start, start))
+    }
+
     /// Whether a tsgo position falls inside an `Ωignore` generated-code region.
     #[must_use]
     pub fn is_generated_position(&self, shadow_path: &Path, position: Position) -> bool {

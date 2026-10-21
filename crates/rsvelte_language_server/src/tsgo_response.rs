@@ -60,6 +60,11 @@ pub struct TsgoResponseMapper<'a> {
     /// to fail the request. Upstream does this for inlay hints only
     /// (`InlayHintProvider.ts:104-113`).
     clamp_request_ranges: bool,
+    /// Whether a location in a component's shadow that maps back to nothing
+    /// lands at the start of the component's file instead of being dropped,
+    /// as upstream does for definitions (see
+    /// [`TsgoOverlay::map_definition_range`]).
+    definition_locations: bool,
 }
 
 impl<'a> TsgoResponseMapper<'a> {
@@ -70,6 +75,7 @@ impl<'a> TsgoResponseMapper<'a> {
             default_document: None,
             aliases: Vec::new(),
             clamp_request_ranges: false,
+            definition_locations: false,
         }
     }
 
@@ -81,6 +87,7 @@ impl<'a> TsgoResponseMapper<'a> {
             default_document: None,
             aliases: Vec::new(),
             clamp_request_ranges: false,
+            definition_locations: false,
         }
     }
 
@@ -95,6 +102,7 @@ impl<'a> TsgoResponseMapper<'a> {
             default_document: document,
             aliases: Vec::new(),
             clamp_request_ranges: false,
+            definition_locations: false,
         }
     }
 
@@ -109,6 +117,7 @@ impl<'a> TsgoResponseMapper<'a> {
             default_document: document,
             aliases: Vec::new(),
             clamp_request_ranges: false,
+            definition_locations: false,
         }
     }
 
@@ -123,6 +132,7 @@ impl<'a> TsgoResponseMapper<'a> {
             default_document,
             aliases: Vec::new(),
             clamp_request_ranges: false,
+            definition_locations: false,
         }
     }
 
@@ -136,6 +146,7 @@ impl<'a> TsgoResponseMapper<'a> {
             default_document,
             aliases: Vec::new(),
             clamp_request_ranges: false,
+            definition_locations: false,
         }
     }
 
@@ -203,6 +214,7 @@ impl<'a> TsgoResponseMapper<'a> {
                 default_document: self.default_document.clone(),
                 aliases: self.aliases.clone(),
                 clamp_request_ranges: true,
+                definition_locations: false,
             };
             return clamping.map_transactional(method, params, Direction::SourceToShadow);
         }
@@ -220,6 +232,23 @@ impl<'a> TsgoResponseMapper<'a> {
                 *result = Value::Null;
             }
             return mapped;
+        }
+        if !self.definition_locations
+            && matches!(
+                method,
+                "textDocument/definition"
+                    | "textDocument/typeDefinition"
+                    | "textDocument/implementation"
+            )
+        {
+            let definitions = Self {
+                overlays: self.overlays,
+                default_document: self.default_document.clone(),
+                aliases: self.aliases.clone(),
+                clamp_request_ranges: self.clamp_request_ranges,
+                definition_locations: true,
+            };
+            return definitions.map_response(method, result);
         }
 
         let mut mapped = result.clone();
@@ -591,6 +620,9 @@ impl<'a> TsgoResponseMapper<'a> {
                 }
                 let mapped = overlay.map_source_range(&context.source_path, range)?;
                 (!overlay.touches_generated_range(&context.shadow_path, mapped)).then_some(mapped)
+            }
+            Direction::ShadowToSource if self.definition_locations => {
+                overlay.map_definition_range(&context.shadow_path, range)
             }
             Direction::ShadowToSource => overlay.map_generated_range(&context.shadow_path, range),
         }
@@ -2012,6 +2044,54 @@ mod tests {
                 &owner_shadow
             );
         }
+    }
+
+    #[test]
+    fn a_definition_of_the_component_itself_lands_at_the_start_of_its_file() {
+        // tsgo resolves a component tag and its import binding to the
+        // generated default export, and a module specifier to the empty range
+        // at the top of the shadow: no source maps there, and upstream answers
+        // with the component file's start (`mapUnmappedToTheStartOfFile`).
+        let source = "<script lang=\"ts\">\n\tlet { label }: { label: string } = $props();\n</script>\n<p>{label}</p>\n";
+        let (_workspace, path, overlay) = overlay(source);
+        let shadow = overlay.shadow_for_source(&path).unwrap();
+        let shadow_path = uri_to_path(shadow.shadow_uri.as_str());
+        let index = crate::text::LineIndex::new(&shadow.text);
+        let at = |needle: &str| {
+            let start = shadow
+                .text
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle}"));
+            Range::new(
+                index.position(&shadow.text, start),
+                index.position(&shadow.text, start + needle.len()),
+            )
+        };
+        let export = at("App__SvelteComponent_ = ");
+        let alias = at("type App__SvelteComponent_");
+        let top = Range::new(Position::new(0, 0), Position::new(0, 0));
+        assert_eq!(overlay.map_generated_range(&shadow_path, export), None);
+
+        let mut result = json!([
+            { "uri": shadow.shadow_uri.as_str(), "range": json_range(export) },
+            { "uri": shadow.shadow_uri.as_str(), "range": json_range(alias) },
+            { "uri": shadow.shadow_uri.as_str(), "range": json_range(top) },
+        ]);
+        let mut references = result.clone();
+        let mapper = TsgoResponseMapper::new(&overlay);
+        assert!(mapper.map_response("textDocument/definition", &mut result));
+        let start = Range::new(Position::new(0, 1), Position::new(0, 1));
+        assert_eq!(
+            result,
+            json!([
+                { "uri": shadow.source_uri.as_str(), "range": json_range(start) },
+                { "uri": shadow.source_uri.as_str(), "range": json_range(start) },
+            ]),
+            "the alias is generated code (an Ωignore region) and stays dropped"
+        );
+        // Only definitions: a reference there is still generated code.
+        assert!(mapper.map_response("textDocument/references", &mut references));
+        assert_eq!(references, json!([]));
     }
 
     #[test]
