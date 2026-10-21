@@ -1,6 +1,6 @@
 //! The LSP message loop.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -387,9 +387,10 @@ struct TsgoRuntime {
     client: TsgoClient,
     overlays: Vec<TsgoOverlay>,
     generation: Option<u64>,
-    /// Directories whose owning project has already been resolved. The walk is
-    /// a handful of `stat`s and `sync_tsgo_document` runs on every keystroke.
-    resolved_dirs: HashSet<PathBuf>,
+    /// The overlay that owns each directory's documents, once resolved. The
+    /// walk is a handful of `stat`s and `sync_tsgo_document` runs on every
+    /// keystroke. Cleared whenever `overlays` is reordered or rebuilt.
+    resolved_dirs: HashMap<PathBuf, usize>,
     /// Shadows tsgo holds as in-memory buffers: editor documents, and the
     /// JavaScript components of an activated project. tsgo reads every other
     /// component from the body the overlay keeps on disk.
@@ -403,71 +404,101 @@ struct TsgoRuntime {
 /// TSX and lose its JSDoc types to, so those stay open as buffers.
 const JAVASCRIPT_SHADOW: &str = "javascriptreact";
 
-/// The overlay that hands `source` to tsgo when an editor opens it: the one
-/// with the deepest workspace containing it.
+/// The overlay that serves `source` (canonical): the project that owns it,
+/// else the one with the deepest workspace containing it. A project can hold
+/// a copy of another project's component, as deep as the owner's or deeper,
+/// so depth alone could pick the copy.
 fn serving_index(overlays: &[TsgoOverlay], source: &Path) -> Option<usize> {
     overlays
         .iter()
         .enumerate()
         .filter(|(_, overlay)| source.starts_with(overlay.workspace()))
-        .max_by_key(|(_, overlay)| overlay.workspace().components().count())
+        .max_by_key(|(_, overlay)| {
+            (
+                overlay.owns(source),
+                overlay.workspace().components().count(),
+            )
+        })
         .map(|(index, _)| index)
 }
 
-/// Whether `overlay` serves `source` to tsgo. A workspace without a config of
-/// its own has no project upstream would put a nested project's documents in
-/// (`service.ts:172-201` keys services by the nearest config), so its copy of
-/// them is never handed to tsgo rather than loaded as a second program.
-fn serves(overlays: &[TsgoOverlay], overlay: &TsgoOverlay, source: &Path) -> bool {
-    overlay.source_tsconfig().is_some()
-        || serving_index(overlays, source)
-            .is_none_or(|index| overlays[index].workspace() == overlay.workspace())
+/// Where the project that owns `source` (canonical) comes from.
+#[derive(Debug, PartialEq, Eq)]
+enum ProjectLocation {
+    /// `overlays[index]` is the project; it may still need loading.
+    Existing(usize),
+    /// A nested config owns the document and has no overlay yet.
+    Nested {
+        config: PathBuf,
+        mirror_root: PathBuf,
+    },
 }
 
-/// Write the body of every component `overlays[index]` (or every overlay)
-/// serves and sweep the bodies it no longer does. Returns the watched-file
-/// changes, which only matter once tsgo has loaded the project.
-fn persist_served_bodies(
-    overlays: &[TsgoOverlay],
-    only: Option<usize>,
-) -> Vec<(Uri, lsp_types::FileChangeType)> {
+/// The project that owns `source`: its nearest config within the workspace
+/// folder containing it (`findTsConfigPath`, `utils.ts:146-167`), or the
+/// folder's own configless project when it has none. `None` outside every
+/// workspace folder.
+fn locate_project(overlays: &[TsgoOverlay], source: &Path) -> Option<ProjectLocation> {
+    let mirror_root = overlays
+        .iter()
+        .filter(|overlay| {
+            overlay.mirror_root() == overlay.workspace() && source.starts_with(overlay.workspace())
+        })
+        .max_by_key(|overlay| overlay.workspace().components().count())?
+        .mirror_root()
+        .to_path_buf();
+    match tsgo_overlay::nearest_tsconfig(source, &mirror_root) {
+        Some(config) => Some(
+            overlays
+                .iter()
+                .position(|overlay| {
+                    overlay.mirror_root() == mirror_root
+                        && overlay.source_tsconfig() == Some(config.as_path())
+                })
+                .map_or(
+                    ProjectLocation::Nested {
+                        config,
+                        mirror_root: mirror_root.clone(),
+                    },
+                    ProjectLocation::Existing,
+                ),
+        ),
+        None => overlays
+            .iter()
+            .position(|overlay| {
+                overlay.workspace() == mirror_root && overlay.source_tsconfig().is_none()
+            })
+            .map(ProjectLocation::Existing),
+    }
+}
+
+/// Write the body of every component a loaded overlay holds and sweep the
+/// bodies it no longer does. Returns the watched-file changes, which only
+/// matter once tsgo has loaded the project.
+fn persist_bodies(overlay: &TsgoOverlay) -> Vec<(Uri, lsp_types::FileChangeType)> {
     let mut events = Vec::new();
-    for (index, overlay) in overlays.iter().enumerate() {
-        if only.is_some_and(|only| only != index) {
-            continue;
+    for shadow in overlay.component_shadows() {
+        let source = uri_to_path(shadow.source_uri.as_str());
+        match overlay.persist_body(&source) {
+            Ok(Some(change)) => events.push((shadow.shadow_uri.clone(), change)),
+            Ok(None) => {}
+            Err(error) => log::warn(format_args!(
+                "could not persist tsgo shadow for {}: {error}",
+                source.display()
+            )),
         }
-        for shadow in overlay.component_shadows() {
-            let source = uri_to_path(shadow.source_uri.as_str());
-            if !serves(overlays, overlay, &source) {
-                continue;
-            }
-            match overlay.persist_body(&source) {
-                Ok(Some(change)) => events.push((shadow.shadow_uri.clone(), change)),
-                Ok(None) => {}
-                Err(error) => log::warn(format_args!(
-                    "could not persist tsgo shadow for {}: {error}",
-                    source.display()
-                )),
-            }
+    }
+    for removed in overlay.sweep_bodies(|_| true) {
+        if let Some(uri) = path_to_uri(&removed) {
+            events.push((uri, lsp_types::FileChangeType::DELETED));
         }
-        for removed in overlay.sweep_bodies(|shadow| {
-            overlay
-                .source_for_shadow(shadow)
-                .is_some_and(|source| serves(overlays, overlay, source))
-        }) {
-            if let Some(uri) = path_to_uri(&removed) {
-                events.push((uri, lsp_types::FileChangeType::DELETED));
-            }
-        }
-        for route in overlay.unresolved_shadow_routes() {
-            if serves(overlays, overlay, &route.source_path) {
-                log::warn(format_args!(
-                    "tsgo shadow is not resolvable: {} -> {}",
-                    route.source_path.display(),
-                    route.shadow_path.display()
-                ));
-            }
-        }
+    }
+    for route in overlay.unresolved_shadow_routes() {
+        log::warn(format_args!(
+            "tsgo shadow is not resolvable: {} -> {}",
+            route.source_path.display(),
+            route.shadow_path.display()
+        ));
     }
     events
 }
@@ -494,55 +525,6 @@ fn open_shadow(
 fn close_shadow(client: &TsgoClient, open: &mut HashMap<String, Uri>, uri: Uri) {
     open.remove(uri.as_str());
     let _ = client.close_buffer(uri);
-}
-
-/// Every config nearer to one of an overlay's `.svelte` documents than the
-/// config the overlay was built from, with the directory its shadows mirror.
-fn nested_project_configs(overlays: &[TsgoOverlay]) -> BTreeSet<(PathBuf, PathBuf)> {
-    let mut configs = BTreeSet::new();
-    for overlay in overlays {
-        for shadow in overlay.eager_shadows() {
-            let source = uri_to_path(shadow.source_uri.as_str());
-            let Some(owner) = tsgo_overlay::nearest_tsconfig(&source, overlay.workspace()) else {
-                continue;
-            };
-            if overlay.source_tsconfig() != Some(owner.as_path()) {
-                configs.insert((owner, overlay.mirror_root().to_path_buf()));
-            }
-        }
-    }
-    configs
-}
-
-fn add_nested_overlays(overlays: &mut Vec<TsgoOverlay>) {
-    for (owner, mirror_root) in nested_project_configs(overlays) {
-        let Some(root) = owner.parent() else {
-            continue;
-        };
-        if overlays.iter().any(|overlay| overlay.workspace() == root) {
-            continue;
-        }
-        match TsgoOverlay::build_nested(root, &owner, &mirror_root) {
-            Ok(overlay) => overlays.push(overlay),
-            Err(error) => log::warn(format_args!(
-                "could not prepare tsgo overlay for {}: {error}",
-                root.display()
-            )),
-        }
-    }
-}
-
-/// The shadows tsgo can see, through their bodies on disk (see [`serves`]).
-#[cfg(test)]
-fn replayed_shadows(overlays: &[TsgoOverlay]) -> Vec<&tsgo_overlay::ShadowDocument> {
-    overlays
-        .iter()
-        .flat_map(|overlay| {
-            overlay.eager_shadows().into_iter().filter(move |shadow| {
-                serves(overlays, overlay, &uri_to_path(shadow.source_uri.as_str()))
-            })
-        })
-        .collect()
 }
 
 struct PreprocessRuntime {
@@ -574,9 +556,14 @@ impl TsgoRuntime {
         roots.dedup();
         let primary = roots.first()?.clone();
 
+        // Nothing is discovered or projected here: a project is loaded when the
+        // first document it owns reaches tsgo (`ensure_project_for`). Its
+        // config and shadow tree live in its own cache directory, which no
+        // other project's include reaches, so a later load never changes
+        // another project's answer.
         let mut overlays = Vec::new();
         for root in &roots {
-            match TsgoOverlay::build(root, None) {
+            match TsgoOverlay::build_deferred(root, None) {
                 Ok(overlay) => overlays.push(overlay),
                 Err(error) => log::warn(format_args!(
                     "could not prepare tsgo overlay for {}: {error}",
@@ -587,16 +574,6 @@ impl TsgoRuntime {
         if overlays.is_empty() {
             return None;
         }
-        // The projects nested configs own are built here, before tsgo starts,
-        // rather than when their first document opens: building one writes its
-        // config into the enclosing workspace, and tsgo reloads that workspace's
-        // project on the file event, so a lazy build changes the answer for
-        // documents that have nothing to do with the nested config depending on
-        // which request reaches tsgo first.
-        add_nested_overlays(&mut overlays);
-        // tsgo has not loaded a project yet, so it needs no change events: it
-        // reads every body it finds when a request first needs the project.
-        let _ = persist_served_bodies(&overlays, None);
 
         let binary = match rsvelte_check::tsgo::find_compiler(&primary, true) {
             Ok(binary) => binary,
@@ -624,71 +601,68 @@ impl TsgoRuntime {
             client,
             overlays,
             generation: None,
-            resolved_dirs: HashSet::new(),
+            resolved_dirs: HashMap::new(),
             open_shadows: HashMap::new(),
             activated: HashSet::new(),
         })
     }
 
-    /// Make sure the project that owns `source` exists before one is picked for
-    /// it. `svelte-language-server` keys a service by tsconfig path and resolves
-    /// one **per document** (`plugins/typescript/service.ts:172-201`), so a
-    /// subdirectory carrying its own config — `paths`, `types`, `strict` — is a
-    /// project of its own; a single workspace-root project makes every option
-    /// those configs declare invisible. Built on demand, as upstream does, so a
-    /// repository with hundreds of configs only pays for the ones it opens.
-    fn ensure_overlay_for(&mut self, source: &Path) -> bool {
+    /// Make sure the project that owns `source` is built and loaded, and
+    /// return its index with whether it loaded now. `svelte-language-server`
+    /// keys a service by tsconfig path and resolves one **per document**
+    /// (`plugins/typescript/service.ts:172-201`), so a subdirectory carrying
+    /// its own config — `paths`, `types`, `strict` — is a project of its own,
+    /// created on demand, so a repository with hundreds of configs only pays
+    /// for the ones it opens. Loading writes the project's bodies before any
+    /// of its documents reaches tsgo.
+    fn ensure_project_for(&mut self, source: &Path) -> (Option<usize>, bool) {
+        let source = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
         let Some(dir) = source.parent() else {
-            return false;
+            return (None, false);
         };
-        if self.resolved_dirs.contains(dir) {
-            return false;
+        if let Some(&index) = self.resolved_dirs.get(dir) {
+            return (Some(index), false);
         }
-        // Only cache once a workspace answers: before `initialize` has built
-        // one, "no project" is a state, not the answer for this directory.
-        let Some((boundary, mirror_root, serving_config)) =
-            self.overlay_for_source(source).map(|serving| {
-                (
-                    serving.workspace().to_path_buf(),
-                    serving.mirror_root().to_path_buf(),
-                    serving.source_tsconfig().map(Path::to_path_buf),
-                )
-            })
-        else {
-            return false;
-        };
-        self.resolved_dirs.insert(dir.to_path_buf());
-        let Some(owner) = tsgo_overlay::nearest_tsconfig(source, &boundary) else {
-            return false;
-        };
-        if serving_config.as_deref() == Some(owner.as_path()) {
-            return false;
-        }
-        let Some(root) = owner.parent().map(Path::to_path_buf) else {
-            return false;
-        };
-        if self
-            .overlays
-            .iter()
-            .any(|overlay| overlay.workspace() == root)
-        {
-            return false;
-        }
-        match TsgoOverlay::build_nested(&root, &owner, &mirror_root) {
-            Ok(overlay) => {
-                self.overlays.push(overlay);
-                let events = persist_served_bodies(&self.overlays, Some(self.overlays.len() - 1));
-                let _ = self.client.notify_watched_files(events);
-                true
+        let (index, loaded) = match locate_project(&self.overlays, &source) {
+            None => return (None, false),
+            Some(ProjectLocation::Existing(index)) => match self.overlays[index].load() {
+                Ok(loaded) => (index, loaded),
+                Err(error) => {
+                    log::warn(format_args!(
+                        "could not load tsgo project {}: {error}",
+                        self.overlays[index].workspace().display()
+                    ));
+                    (index, false)
+                }
+            },
+            Some(ProjectLocation::Nested {
+                config,
+                mirror_root,
+            }) => {
+                let Some(root) = config.parent() else {
+                    return (None, false);
+                };
+                match TsgoOverlay::build_nested(root, &config, &mirror_root) {
+                    Ok(overlay) => {
+                        self.overlays.push(overlay);
+                        (self.overlays.len() - 1, true)
+                    }
+                    Err(error) => {
+                        log::warn(format_args!(
+                            "could not prepare tsgo overlay for {}: {error}",
+                            root.display()
+                        ));
+                        return (None, false);
+                    }
+                }
             }
-            Err(error) => {
-                log::warn(format_args!(
-                    "could not prepare tsgo overlay for {}: {error}",
-                    root.display()
-                ));
-                false
-            }
+        };
+        if loaded {
+            let events = persist_bodies(&self.overlays[index]);
+            let _ = self.client.notify_watched_files(events);
         }
+        self.resolved_dirs.insert(dir.to_path_buf(), index);
+        (Some(index), loaded)
     }
 
     fn overlay_for_source_mut(&mut self, source: &Path) -> Option<&mut TsgoOverlay> {
@@ -705,29 +679,38 @@ impl TsgoRuntime {
         serving_index(&self.overlays, &source)
     }
 
-    /// Open the JavaScript components of the project `source` is served from,
-    /// once, before its first editor document reaches tsgo (see
-    /// [`JAVASCRIPT_SHADOW`]). Their bodies are on disk too, so each open is a
-    /// content change for tsgo rather than a new root file.
-    fn activate_project_for(&mut self, source: &Path) {
-        let Some(index) = self.overlay_index_for_source(source) else {
-            return;
-        };
+    /// Every loaded overlay other than `owner` that holds a copy of `source`.
+    fn copies_of(&self, owner: usize, source: &Path) -> Vec<usize> {
+        self.overlays
+            .iter()
+            .enumerate()
+            .filter(|(index, overlay)| {
+                *index != owner
+                    && overlay.is_loaded()
+                    && overlay.shadow_for_source(source).is_some()
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// The shadow of `source` in the project that serves it.
+    fn owner_shadow(&self, source: &Path) -> Option<&tsgo_overlay::ShadowDocument> {
+        self.overlay_for_source(source)?.shadow_for_source(source)
+    }
+
+    /// Open the JavaScript components of `overlays[index]`, once, before its
+    /// first editor document reaches tsgo (see [`JAVASCRIPT_SHADOW`]). Their
+    /// bodies are on disk too, so each open is a content change for tsgo
+    /// rather than a new root file.
+    fn activate_project(&mut self, index: usize) {
         let overlay = &self.overlays[index];
-        if !self.activated.insert(overlay.cache_dir().to_path_buf()) {
+        if !overlay.is_loaded() || !self.activated.insert(overlay.cache_dir().to_path_buf()) {
             return;
         }
         let shadows = overlay
             .component_shadows()
             .into_iter()
-            .filter(|shadow| {
-                shadow.language_id == JAVASCRIPT_SHADOW
-                    && serves(
-                        &self.overlays,
-                        overlay,
-                        &uri_to_path(shadow.source_uri.as_str()),
-                    )
-            })
+            .filter(|shadow| shadow.language_id == JAVASCRIPT_SHADOW)
             .cloned()
             .collect::<Vec<_>>();
         for shadow in &shadows {
@@ -736,8 +719,7 @@ impl TsgoRuntime {
     }
 
     /// Hand tsgo a shadow `overlays[index]` projected from the file on disk:
-    /// persist its body when the overlay serves the source, and refresh the
-    /// buffer when tsgo holds one.
+    /// persist its body, and refresh the buffer when tsgo holds one.
     fn deliver_disk_shadow(
         &mut self,
         index: usize,
@@ -746,20 +728,16 @@ impl TsgoRuntime {
     ) {
         let source = uri_to_path(shadow.source_uri.as_str());
         let overlay = &self.overlays[index];
-        let served = serves(&self.overlays, overlay, &source);
-        if served {
-            match overlay.persist_body(&source) {
-                Ok(Some(change)) => events.push((shadow.shadow_uri.clone(), change)),
-                Ok(None) => {}
-                Err(error) => log::warn(format_args!(
-                    "could not persist tsgo shadow for {}: {error}",
-                    source.display()
-                )),
-            }
+        match overlay.persist_body(&source) {
+            Ok(Some(change)) => events.push((shadow.shadow_uri.clone(), change)),
+            Ok(None) => {}
+            Err(error) => log::warn(format_args!(
+                "could not persist tsgo shadow for {}: {error}",
+                source.display()
+            )),
         }
-        let javascript = served
-            && shadow.language_id == JAVASCRIPT_SHADOW
-            && self.activated.contains(overlay.cache_dir());
+        let javascript =
+            shadow.language_id == JAVASCRIPT_SHADOW && self.activated.contains(overlay.cache_dir());
         if javascript || self.open_shadows.contains_key(shadow.shadow_uri.as_str()) {
             open_shadow(&self.client, &mut self.open_shadows, shadow);
         }
@@ -1359,6 +1337,9 @@ impl Server {
             return;
         };
         let source_path = uri_to_path(source_uri.as_str());
+        if let Some(runtime) = &mut self.tsgo {
+            runtime.ensure_project_for(&source_path);
+        }
         let Some(runtime) = &self.tsgo else {
             self.respond(Response::new_ok(
                 request.id,
@@ -1366,11 +1347,7 @@ impl Server {
             ));
             return;
         };
-        let Some(shadow) = runtime
-            .overlays
-            .iter()
-            .find_map(|overlay| overlay.shadow_for_source(&source_path))
-        else {
+        let Some(shadow) = runtime.owner_shadow(&source_path) else {
             self.respond(Response::new_ok(
                 request.id,
                 Vec::<lsp_types::Location>::new(),
@@ -1442,17 +1419,22 @@ impl Server {
             self.respond_nothing(request.id);
             return;
         };
+        let old_path = uri_to_path(old_uri.as_str());
+        let new_path = uri_to_path(new_uri.as_str());
+        if let Some(runtime) = &mut self.tsgo {
+            runtime.ensure_project_for(&old_path);
+        }
         let Some(runtime) = &self.tsgo else {
             self.respond_nothing(request.id);
             return;
         };
-        let old_path = uri_to_path(old_uri.as_str());
-        let new_path = uri_to_path(new_uri.as_str());
-        let Some((old_shadow, new_shadow)) = runtime.overlays.iter().find_map(|overlay| {
-            let old_shadow = overlay.shadow_for_source(&old_path)?.shadow_uri.clone();
-            let new_shadow = overlay.prospective_shadow_uri(&new_path).ok()?;
-            Some((old_shadow, new_shadow))
-        }) else {
+        let Some((old_shadow, new_shadow)) =
+            runtime.overlay_for_source(&old_path).and_then(|overlay| {
+                let old_shadow = overlay.shadow_for_source(&old_path)?.shadow_uri.clone();
+                let new_shadow = overlay.prospective_shadow_uri(&new_path).ok()?;
+                Some((old_shadow, new_shadow))
+            })
+        else {
             self.forward_tsgo_request(Request::new(
                 request.id,
                 "workspace/willRenameFiles".to_string(),
@@ -1752,11 +1734,7 @@ impl Server {
             params["context"] = serde_json::json!({ "includeDeclaration": false });
         }
         if component_lens {
-            let Some(shadow) = runtime
-                .overlays
-                .iter()
-                .find_map(|overlay| overlay.shadow_for_source(&source_path))
-            else {
+            let Some(shadow) = runtime.owner_shadow(&source_path) else {
                 self.respond(Response::new_ok(id, lens));
                 return;
             };
@@ -2276,6 +2254,22 @@ impl Server {
         }
         let component_site = self.component_completion_site(&request);
         let code_action_diagnostic_codes = code_action_diagnostic_codes(&request);
+        // A component the editor has not opened belongs to a project that may
+        // not be loaded yet; load it so the request can be mapped.
+        if let Some(runtime) = &mut self.tsgo
+            && let Some(uri) = text_document_request_uri(&request)
+            && uri.as_str().ends_with(".svelte")
+        {
+            let path = uri_to_path(uri.as_str());
+            if runtime
+                .overlays
+                .iter()
+                .all(|overlay| overlay.shadow_for_source(&path).is_none())
+                && path.is_file()
+            {
+                runtime.ensure_project_for(&path);
+            }
+        }
         let Some(runtime) = &self.tsgo else {
             self.respond(Response::new_ok(
                 request.id,
@@ -2571,37 +2565,36 @@ impl Server {
         let text = document.text().to_string();
         let path = uri_to_path(uri.as_str());
         let path = fs::canonicalize(&path).unwrap_or(path);
-        let Some(runtime) = &mut self.tsgo else {
-            return;
-        };
-        if runtime.ensure_overlay_for(&path) {
-            self.preprocess_known_empty = false;
-        }
-        let Some(runtime) = &mut self.tsgo else {
-            return;
-        };
         let svelte = is_svelte_document(&language_id, &path);
-        if svelte || is_typescript_or_javascript(&language_id, &path) {
-            runtime.activate_project_for(&path);
+        let script = !svelte && is_typescript_or_javascript(&language_id, &path);
+        if !svelte && !script {
+            return;
         }
+        let Some(runtime) = &mut self.tsgo else {
+            return;
+        };
+        let (Some(owner), loaded) = runtime.ensure_project_for(&path) else {
+            return;
+        };
+        runtime.activate_project(owner);
         if svelte {
-            let Some(overlay) = runtime.overlay_for_source_mut(&path) else {
-                return;
-            };
-            match overlay.open_or_update(&path, &text, version) {
-                Ok(shadow) => {
-                    open_shadow(&runtime.client, &mut runtime.open_shadows, &shadow);
+            // The owner first, then every copy another loaded project keeps for
+            // its imports, so no program sees a stale component: upstream's
+            // snapshots are shared by every service.
+            let copies = runtime.copies_of(owner, &path);
+            for index in std::iter::once(owner).chain(copies) {
+                match runtime.overlays[index].open_or_update(&path, &text, version) {
+                    Ok(shadow) => {
+                        open_shadow(&runtime.client, &mut runtime.open_shadows, &shadow);
+                    }
+                    Err(error) => log::warn(format_args!(
+                        "could not update tsgo shadow for {}: {error}",
+                        path.display()
+                    )),
                 }
-                Err(error) => log::warn(format_args!(
-                    "could not update tsgo shadow for {}: {error}",
-                    path.display()
-                )),
             }
-        } else if is_typescript_or_javascript(&language_id, &path) {
-            let Some(overlay) = runtime.overlay_for_source_mut(&path) else {
-                return;
-            };
-            match overlay.open_plain(&path, &text, version, &language_id) {
+        } else {
+            match runtime.overlays[owner].open_plain(&path, &text, version, &language_id) {
                 Ok(shadow) => {
                     open_shadow(&runtime.client, &mut runtime.open_shadows, &shadow);
                 }
@@ -2609,6 +2602,41 @@ impl Server {
                     "could not route TypeScript buffer {}: {error}",
                     path.display()
                 )),
+            }
+        }
+        if loaded {
+            self.preprocess_loaded_project(owner);
+        }
+    }
+
+    /// A project that loaded after the sidecar started still needs its
+    /// members preprocessed, as the members of every loaded project are when
+    /// the sidecar starts.
+    fn preprocess_loaded_project(&mut self, index: usize) {
+        self.preprocess_known_empty = false;
+        if self.preprocess.is_none() {
+            self.ensure_preprocess_runtime();
+            return;
+        }
+        let members = self
+            .tsgo
+            .as_ref()
+            .and_then(|runtime| runtime.overlays.get(index))
+            .map(|overlay| {
+                overlay
+                    .eager_shadows()
+                    .into_iter()
+                    .filter_map(|shadow| {
+                        let filename = uri_to_path(shadow.source_uri.as_str());
+                        let text = overlay.source_text(&filename)?.to_string();
+                        Some((filename, shadow.version, text))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (filename, version, text) in members {
+            if !self.is_editor_document(&filename) {
+                let _ = self.queue_preprocess_path(filename, version, text);
             }
         }
     }
@@ -2623,61 +2651,57 @@ impl Server {
         if is_svelte_document(&language_id, &path) {
             let mut closed_source = None;
             if let Some(runtime) = &mut self.tsgo
-                && let Some(index) = runtime.overlay_index_for_source(&path)
+                && let Some(owner) = runtime.overlay_index_for_source(&path)
             {
-                let overlay = &mut runtime.overlays[index];
-                let shadow_uri = overlay
-                    .shadow_for_source(&path)
-                    .map(|shadow| shadow.shadow_uri.clone());
-                match overlay.close(&path) {
-                    Ok(Some(shadow)) => {
-                        closed_source = overlay
-                            .source_text(&path)
-                            .map(|text| (shadow.version, text.to_string()));
-                        // The disk projection reaches tsgo as the body on disk,
-                        // written before the buffer closes so the close never
-                        // exposes a stale one.
-                        let mut events = Vec::new();
-                        runtime.open_shadows.remove(shadow.shadow_uri.as_str());
-                        runtime.deliver_disk_shadow(index, &shadow, &mut events);
-                        let overlay = &runtime.overlays[index];
-                        if !runtime
-                            .open_shadows
-                            .contains_key(shadow.shadow_uri.as_str())
-                            && serves(&runtime.overlays, overlay, &path)
-                        {
-                            close_shadow(
-                                &runtime.client,
-                                &mut runtime.open_shadows,
-                                shadow.shadow_uri,
-                            );
-                        } else if !runtime
-                            .open_shadows
-                            .contains_key(shadow.shadow_uri.as_str())
-                        {
-                            // A route tsgo cannot read from disk stays a buffer.
-                            open_shadow(&runtime.client, &mut runtime.open_shadows, &shadow);
+                let copies = runtime.copies_of(owner, &path);
+                let mut events = Vec::new();
+                for index in std::iter::once(owner).chain(copies) {
+                    let overlay = &mut runtime.overlays[index];
+                    let shadow_uri = overlay
+                        .shadow_for_source(&path)
+                        .map(|shadow| shadow.shadow_uri.clone());
+                    match overlay.close(&path) {
+                        Ok(Some(shadow)) => {
+                            if index == owner {
+                                closed_source = overlay
+                                    .source_text(&path)
+                                    .map(|text| (shadow.version, text.to_string()));
+                            }
+                            // The disk projection reaches tsgo as the body on
+                            // disk, written before the buffer closes so the
+                            // close never exposes a stale one. A JavaScript
+                            // component stays a buffer (see
+                            // `JAVASCRIPT_SHADOW`).
+                            runtime.open_shadows.remove(shadow.shadow_uri.as_str());
+                            runtime.deliver_disk_shadow(index, &shadow, &mut events);
+                            if !runtime
+                                .open_shadows
+                                .contains_key(shadow.shadow_uri.as_str())
+                            {
+                                close_shadow(
+                                    &runtime.client,
+                                    &mut runtime.open_shadows,
+                                    shadow.shadow_uri,
+                                );
+                            }
                         }
-                        let _ = runtime.client.notify_watched_files(events);
-                    }
-                    Ok(None) => {
-                        if let Some(shadow_uri) = shadow_uri {
-                            close_shadow(
-                                &runtime.client,
-                                &mut runtime.open_shadows,
-                                shadow_uri.clone(),
-                            );
-                            let _ = runtime.client.notify_watched_files(vec![(
-                                shadow_uri,
-                                lsp_types::FileChangeType::DELETED,
-                            )]);
+                        Ok(None) => {
+                            if let Some(shadow_uri) = shadow_uri {
+                                close_shadow(
+                                    &runtime.client,
+                                    &mut runtime.open_shadows,
+                                    shadow_uri.clone(),
+                                );
+                                events.push((shadow_uri, lsp_types::FileChangeType::DELETED));
+                            }
                         }
+                        Err(error) => log::warn(format_args!(
+                            "could not close tsgo shadow for {}: {error}",
+                            path.display()
+                        )),
                     }
-                    Err(error) => log::warn(format_args!(
-                        "could not close tsgo shadow for {}: {error}",
-                        path.display()
-                    )),
                 }
+                let _ = runtime.client.notify_watched_files(events);
             }
             self.preprocess_failures.remove(&path);
             self.preprocess_documents.remove(&path);
@@ -2720,7 +2744,14 @@ impl Server {
             return;
         };
         let mut updates = Vec::new();
-        for (index, overlay) in runtime.overlays.iter_mut().enumerate() {
+        // A deferred project has no members to reconcile, and refreshing one
+        // would load it.
+        for (index, overlay) in runtime
+            .overlays
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, overlay)| overlay.is_loaded())
+        {
             match overlay.refresh_except(|source| editor_open.contains(source)) {
                 Ok(update) => updates.push((index, update)),
                 Err(error) => log::warn(format_args!(
@@ -2765,7 +2796,7 @@ impl Server {
             .collect::<Vec<_>>();
         let mut rebuilt = Vec::with_capacity(roots.len());
         for root in roots {
-            match TsgoOverlay::build(&root, None) {
+            match TsgoOverlay::build_deferred(&root, None) {
                 Ok(overlay) => rebuilt.push(overlay),
                 Err(error) => log::warn(format_args!(
                     "could not rebuild tsgo overlay for {}: {error}",
@@ -2776,15 +2807,14 @@ impl Server {
         if rebuilt.is_empty() {
             return;
         }
-        add_nested_overlays(&mut rebuilt);
         runtime.resolved_dirs.clear();
         for uri in std::mem::take(&mut runtime.open_shadows).into_values() {
             let _ = runtime.client.close_buffer(uri);
         }
         runtime.activated.clear();
+        // Every project is reloaded on demand: re-syncing the open documents
+        // below loads theirs, and tsgo restarts afterwards.
         runtime.overlays = rebuilt;
-        // tsgo restarts below and reads the bodies afresh.
-        let _ = persist_served_bodies(&runtime.overlays, None);
         let open = self
             .documents
             .iter()
@@ -2811,13 +2841,16 @@ impl Server {
         for folder in removed {
             let path = uri_to_path(folder.uri.as_str());
             let path = fs::canonicalize(&path).unwrap_or(path);
-            if let Some(index) = runtime
-                .overlays
-                .iter()
-                .position(|overlay| overlay.workspace() == path)
-            {
-                let overlay = runtime.overlays.remove(index);
-                runtime.resolved_dirs.clear();
+            // The folder's own project and every project nested in it.
+            let (gone, kept) = std::mem::take(&mut runtime.overlays)
+                .into_iter()
+                .partition::<Vec<_>, _>(|overlay| overlay.mirror_root() == path);
+            runtime.overlays = kept;
+            if gone.is_empty() {
+                continue;
+            }
+            runtime.resolved_dirs.clear();
+            for overlay in gone {
                 runtime.activated.remove(overlay.cache_dir());
                 for shadow in overlay.open_shadows() {
                     if runtime
@@ -2843,12 +2876,10 @@ impl Server {
             {
                 continue;
             }
-            match TsgoOverlay::build(&path, None) {
+            match TsgoOverlay::build_deferred(&path, None) {
                 Ok(overlay) => {
+                    runtime.resolved_dirs.clear();
                     runtime.overlays.push(overlay);
-                    let events =
-                        persist_served_bodies(&runtime.overlays, Some(runtime.overlays.len() - 1));
-                    let _ = runtime.client.notify_watched_files(events);
                 }
                 Err(error) => log::warn(format_args!(
                     "could not prepare tsgo overlay for {}: {error}",
@@ -3194,25 +3225,34 @@ impl Server {
                 let mut projection_error = None;
                 let editor_open = self.is_editor_document(&filename);
                 if let Some(runtime) = &mut self.tsgo
-                    && let Some(index) = runtime.overlay_index_for_source(&filename)
+                    && let Some(owner) = runtime.overlay_index_for_source(&filename)
                 {
-                    match runtime.overlays[index].open_or_update_preprocessed(
-                        &filename,
-                        &original,
-                        &output.code,
-                        output.map.as_deref(),
-                        output.version,
-                    ) {
-                        Ok(shadow) if editor_open => {
-                            open_shadow(&runtime.client, &mut runtime.open_shadows, &shadow);
+                    // The owner's projection decides; the copies other projects
+                    // keep for their imports follow it.
+                    let copies = runtime.copies_of(owner, &filename);
+                    let mut events = Vec::new();
+                    for index in std::iter::once(owner).chain(copies) {
+                        match runtime.overlays[index].open_or_update_preprocessed(
+                            &filename,
+                            &original,
+                            &output.code,
+                            output.map.as_deref(),
+                            output.version,
+                        ) {
+                            Ok(shadow) if editor_open => {
+                                open_shadow(&runtime.client, &mut runtime.open_shadows, &shadow);
+                            }
+                            Ok(shadow) => {
+                                runtime.deliver_disk_shadow(index, &shadow, &mut events);
+                            }
+                            Err(error) if index == owner => {
+                                projection_error = Some(error.to_string());
+                                break;
+                            }
+                            Err(_) => {}
                         }
-                        Ok(shadow) => {
-                            let mut events = Vec::new();
-                            runtime.deliver_disk_shadow(index, &shadow, &mut events);
-                            let _ = runtime.client.notify_watched_files(events);
-                        }
-                        Err(error) => projection_error = Some(error.to_string()),
                     }
+                    let _ = runtime.client.notify_watched_files(events);
                 }
                 let open_key = self
                     .documents
@@ -5456,155 +5496,150 @@ mod inlay_hint_preference_tests {
 
 #[cfg(test)]
 mod nested_project_tests {
-    use super::{
-        add_nested_overlays, nested_project_configs, persist_served_bodies, replayed_shadows,
-    };
-    use crate::tsgo_overlay::TsgoOverlay;
-    use crate::uri::uri_to_path;
+    use super::{ProjectLocation, locate_project, persist_bodies, serving_index};
+    use crate::tsgo_overlay::{CACHE_DIRECTORY, TsgoOverlay};
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn write(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
     }
 
-    #[test]
-    fn only_configs_that_own_a_component_become_projects() {
-        let dir =
-            std::env::temp_dir().join(format!("rsvelte-nested-configs-{}", std::process::id()));
+    fn workspace(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rsvelte-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        write(&dir.join("tsconfig.json"), "{}");
-        write(&dir.join("src/App.svelte"), "<p />");
-        write(&dir.join("docs/tsconfig.json"), "{}");
-        write(&dir.join("docs/src/Page.svelte"), "<p />");
-        write(&dir.join("tools/tsconfig.json"), "{}");
-        write(&dir.join("tools/build.ts"), "export {};");
-        let root = fs::canonicalize(&dir).unwrap();
-
-        let overlay = TsgoOverlay::build_with(&root, None, None).unwrap();
-        let configs = nested_project_configs(std::slice::from_ref(&overlay));
-        assert_eq!(
-            configs.into_iter().collect::<Vec<_>>(),
-            vec![(root.join("docs/tsconfig.json"), root.clone())],
-            "the root's own config is not nested, and `tools` owns no component"
-        );
-        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::canonicalize(&dir).unwrap()
     }
 
-    fn replayed(dir: &Path) -> Vec<(String, String)> {
-        let root = fs::canonicalize(dir).unwrap();
-        let mut overlays = vec![TsgoOverlay::build_with(&root, None, None).unwrap()];
-        add_nested_overlays(&mut overlays);
-        let mut replayed = replayed_shadows(&overlays)
-            .into_iter()
-            .map(|shadow| {
-                let source = uri_to_path(shadow.source_uri.as_str());
-                let shadow = uri_to_path(shadow.shadow_uri.as_str());
-                let nested = root
-                    .join(crate::tsgo_overlay::CACHE_DIRECTORY)
-                    .join("projects/docs");
-                let project = if shadow.starts_with(nested) {
-                    "docs"
-                } else {
-                    "root"
-                };
-                (
-                    source.strip_prefix(&root).unwrap().display().to_string(),
-                    project.to_string(),
-                )
+    #[test]
+    fn a_document_belongs_to_its_nearest_configs_project() {
+        let root = workspace("locate-nearest");
+        write(&root.join("src/App.svelte"), "<p />");
+        write(&root.join("docs/tsconfig.json"), "{}");
+        write(&root.join("docs/src/Page.svelte"), "<p />");
+        let mut overlays = vec![TsgoOverlay::build_deferred(&root, None).unwrap()];
+        assert!(!overlays[0].is_loaded(), "nothing is projected up front");
+        assert!(overlays[0].eager_shadows().is_empty());
+
+        assert_eq!(
+            locate_project(&overlays, &root.join("src/App.svelte")),
+            Some(ProjectLocation::Existing(0))
+        );
+        assert_eq!(
+            locate_project(&overlays, &root.join("docs/src/Page.svelte")),
+            Some(ProjectLocation::Nested {
+                config: root.join("docs/tsconfig.json"),
+                mirror_root: root.clone(),
             })
-            .collect::<Vec<_>>();
-        replayed.sort();
-        replayed
+        );
+        assert_eq!(
+            locate_project(&overlays, Path::new("/elsewhere/App.svelte")),
+            None
+        );
+
+        overlays.push(
+            TsgoOverlay::build_nested(&root.join("docs"), &root.join("docs/tsconfig.json"), &root)
+                .unwrap(),
+        );
+        assert_eq!(
+            locate_project(&overlays, &root.join("docs/src/Page.svelte")),
+            Some(ProjectLocation::Existing(1))
+        );
+        assert!(overlays[1].owns(&root.join("docs/src/Page.svelte")));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn a_root_without_a_config_leaves_a_nested_projects_documents_to_it() {
-        let dir =
-            std::env::temp_dir().join(format!("rsvelte-nested-replay-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        write(&dir.join("src/App.svelte"), "<p />");
-        write(&dir.join("docs/tsconfig.json"), "{}");
-        write(&dir.join("docs/src/Page.svelte"), "<p />");
-        assert_eq!(
-            replayed(&dir),
-            vec![
-                ("docs/src/Page.svelte".into(), "docs".into()),
-                ("src/App.svelte".into(), "root".into()),
-            ]
+    fn a_root_config_never_takes_a_nested_projects_documents() {
+        // monorepo/admin: a Node-only root config, the components under `src`.
+        let root = workspace("locate-admin");
+        write(
+            &root.join("tsconfig.json"),
+            r#"{ "include": ["vite.config.ts"] }"#,
         );
-
-        write(&dir.join("tsconfig.json"), "{}");
+        write(&root.join("vite.config.ts"), "export default {};");
+        write(&root.join("src/tsconfig.json"), "{}");
+        write(&root.join("src/App.svelte"), "<p />");
+        let mut overlays = vec![TsgoOverlay::build_deferred(&root, None).unwrap()];
         assert_eq!(
-            replayed(&dir),
-            vec![
-                ("docs/src/Page.svelte".into(), "docs".into()),
-                ("docs/src/Page.svelte".into(), "root".into()),
-                ("src/App.svelte".into(), "root".into()),
-            ],
-            "a root config's own project still includes the nested documents"
+            locate_project(&overlays, &root.join("vite.config.ts")),
+            Some(ProjectLocation::Existing(0))
         );
-        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            locate_project(&overlays, &root.join("src/App.svelte")),
+            Some(ProjectLocation::Nested {
+                config: root.join("src/tsconfig.json"),
+                mirror_root: root.clone(),
+            })
+        );
+        assert!(overlays[0].load().unwrap());
+        assert!(
+            overlays[0].eager_shadows().is_empty(),
+            "the root project owns no component"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn only_the_serving_project_writes_a_body_and_stale_ones_are_swept() {
-        let dir =
-            std::env::temp_dir().join(format!("rsvelte-nested-bodies-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        write(&dir.join("src/App.svelte"), "<p />");
-        write(&dir.join("docs/tsconfig.json"), "{}");
-        write(&dir.join("docs/src/Page.svelte"), "<p />");
-        let root = fs::canonicalize(&dir).unwrap();
-        let cache = root.join(crate::tsgo_overlay::CACHE_DIRECTORY);
-        // A body the root overlay wrote before `docs` had a config.
+    fn the_serving_project_is_the_owner_not_a_copy() {
+        let root = workspace("serving-owner");
+        write(&root.join("a/tsconfig.json"), "{}");
+        write(&root.join("a/X.svelte"), "<p />");
+        write(&root.join("b/tsconfig.json"), "{}");
+        write(
+            &root.join("b/Y.svelte"),
+            "<script>import X from '../a/X.svelte';</script>",
+        );
+        let copy = TsgoOverlay::build_nested(&root.join("b"), &root.join("b/tsconfig.json"), &root)
+            .unwrap();
+        let owner =
+            TsgoOverlay::build_nested(&root.join("a"), &root.join("a/tsconfig.json"), &root)
+                .unwrap();
+        let overlays = [copy, owner];
+        assert!(
+            overlays[0]
+                .shadow_for_source(&root.join("a/X.svelte"))
+                .is_some()
+        );
+        assert_eq!(serving_index(&overlays, &root.join("a/X.svelte")), Some(1));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_loaded_project_writes_its_bodies_and_sweeps_stale_ones() {
+        let root = workspace("nested-bodies");
+        write(&root.join("src/App.svelte"), "<p />");
+        write(&root.join("docs/tsconfig.json"), "{}");
+        write(&root.join("docs/src/Page.svelte"), "<p />");
+        let cache = root.join(CACHE_DIRECTORY);
+        // A body the root project wrote before `docs` had a config, and a
+        // torn write.
         let stale = cache.join("tsgo/svelte/docs/src/Page.svelte.tsx");
         write(&stale, "stale");
         write(&cache.join("tsgo/svelte/src/.App.svelte.tsx.1.tmp"), "torn");
 
-        let mut overlays = vec![TsgoOverlay::build_with(&root, None, None).unwrap()];
-        add_nested_overlays(&mut overlays);
-        let events = persist_served_bodies(&overlays, None);
-
-        let root_body = cache.join("tsgo/svelte/src/App.svelte.tsx");
-        let docs_body = cache.join("projects/docs/tsgo/svelte/docs/src/Page.svelte.tsx");
-        assert!(
-            root_body.is_file(),
-            "the configless root serves its own component"
-        );
-        assert!(
-            docs_body.is_file(),
-            "the nested project serves its own component"
-        );
-        assert!(
-            !stale.exists(),
-            "the root's copy of a nested document is swept"
-        );
-        assert!(!cache.join("tsgo/svelte/src/.App.svelte.tsx.1.tmp").exists());
+        let mut overlay = TsgoOverlay::build_with(&root, None, None).unwrap();
+        assert!(!overlay.load().unwrap(), "built loaded");
+        let events = persist_bodies(&overlay);
+        let body = cache.join("tsgo/svelte/src/App.svelte.tsx");
+        assert!(body.is_file());
         assert_eq!(
-            fs::read_to_string(&docs_body).unwrap(),
-            overlays[1]
-                .shadow_for_source(&root.join("docs/src/Page.svelte"))
+            fs::read_to_string(&body).unwrap(),
+            overlay
+                .shadow_for_source(&root.join("src/App.svelte"))
                 .unwrap()
                 .text
         );
+        assert!(!stale.exists(), "a component the project no longer has");
+        assert!(!cache.join("tsgo/svelte/src/.App.svelte.tsx.1.tmp").exists());
         assert!(events.iter().any(|(uri, change)| {
-            uri_to_path(uri.as_str()) == stale && *change == lsp_types::FileChangeType::DELETED
+            crate::uri::uri_to_path(uri.as_str()) == stale
+                && *change == lsp_types::FileChangeType::DELETED
         }));
-        assert!(
-            persist_served_bodies(&overlays, None).is_empty(),
-            "an unchanged body is not rewritten"
-        );
-        for overlay in &overlays {
-            for route in overlay.unresolved_shadow_routes() {
-                assert!(
-                    route.source_path.starts_with(root.join("docs"))
-                        && overlay.source_tsconfig().is_none(),
-                    "only the root's unserved copy lacks a body: {route:?}"
-                );
-            }
-        }
-        let _ = fs::remove_dir_all(&dir);
+        assert!(persist_bodies(&overlay).is_empty(), "nothing changed");
+        assert!(overlay.unresolved_shadow_routes().is_empty());
+        let _ = fs::remove_dir_all(&root);
     }
 }

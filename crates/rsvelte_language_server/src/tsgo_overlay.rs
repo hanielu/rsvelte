@@ -237,6 +237,14 @@ pub struct TsgoOverlay {
     namespace: Svelte2TsxNamespace,
     entries: BTreeMap<PathBuf, ShadowState>,
     by_shadow: BTreeMap<PathBuf, PathBuf>,
+    /// Whether the members have been discovered and projected. A deferred
+    /// overlay ([`Self::build_deferred`]) has written its config and shims
+    /// only, and projects nothing until a document it owns needs it.
+    loaded: bool,
+    /// The members whose nearest config is this project's own. Every other
+    /// member is a copy of a component another project owns, there only so an
+    /// import of it resolves inside this project's shadow tree.
+    owned: BTreeSet<PathBuf>,
 }
 
 impl fmt::Debug for TsgoOverlay {
@@ -245,13 +253,15 @@ impl fmt::Debug for TsgoOverlay {
             .field("workspace", &self.workspace)
             .field("cache_dir", &self.cache_dir)
             .field("tsconfig_path", &self.tsconfig_path)
+            .field("loaded", &self.loaded)
             .field("entries", &self.entries.len())
             .finish_non_exhaustive()
     }
 }
 
 impl TsgoOverlay {
-    /// Build the workspace overlay and project every `.svelte` source eagerly.
+    /// Build the workspace overlay and project its members (see
+    /// [`Self::load`]) at once.
     ///
     /// `tsconfig` defaults to `tsconfig.json`, then `jsconfig.json`, when one
     /// exists at the workspace root.
@@ -266,7 +276,70 @@ impl TsgoOverlay {
         tsconfig: Option<&Path>,
         svelte_fallback_root: Option<&Path>,
     ) -> Result<Self, TsgoOverlayError> {
-        Self::build_mirrored(workspace, tsconfig, svelte_fallback_root, None)
+        Self::build_mirrored(workspace, tsconfig, svelte_fallback_root, None, true)
+    }
+
+    /// Prepare the workspace overlay — cache, shims, config — without
+    /// discovering or projecting a single member; [`Self::load`] does that
+    /// when the first document it owns is opened. A repository with many
+    /// projects then only pays for the ones the editor touches.
+    pub fn build_deferred(
+        workspace: &Path,
+        tsconfig: Option<&Path>,
+    ) -> Result<Self, TsgoOverlayError> {
+        Self::build_mirrored(
+            workspace,
+            tsconfig,
+            server_svelte_root().as_deref(),
+            None,
+            false,
+        )
+    }
+
+    /// Whether the members have been discovered and projected.
+    #[must_use]
+    pub const fn is_loaded(&self) -> bool {
+        self.loaded
+    }
+
+    /// Discover and project the members of a deferred overlay: every
+    /// component this project owns, plus a copy of every component they reach
+    /// through an import (see [`Self::discover_sources`]). Returns whether it
+    /// loaded now; an overlay loads once. A member that cannot be read or
+    /// projected is skipped, so one bad file never costs the whole project.
+    pub fn load(&mut self) -> Result<bool, TsgoOverlayError> {
+        if self.loaded {
+            return Ok(false);
+        }
+        self.loaded = true;
+        for path in self.discover_sources() {
+            let text = match fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    crate::log::warn(format_args!(
+                        "could not read {} for tsgo: {error}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
+            if let Err(error) = self.open_or_update(&path, &text, 0) {
+                crate::log::warn(format_args!(
+                    "could not project {} for tsgo: {error}",
+                    path.display()
+                ));
+            }
+        }
+        self.write_tsconfig()?;
+        Ok(true)
+    }
+
+    /// Whether `source_path` is one of this project's own members — its
+    /// nearest config is this overlay's — rather than a copy of another
+    /// project's component.
+    #[must_use]
+    pub fn owns(&self, source_path: &Path) -> bool {
+        self.owned.contains(&self.lookup_source_path(source_path))
     }
 
     /// Build the project a nested `tsconfig` owns, rooted at `workspace` but
@@ -282,6 +355,7 @@ impl TsgoOverlay {
             Some(tsconfig),
             server_svelte_root().as_deref(),
             Some(mirror_root),
+            true,
         )
     }
 
@@ -290,6 +364,7 @@ impl TsgoOverlay {
         tsconfig: Option<&Path>,
         svelte_fallback_root: Option<&Path>,
         mirror_root: Option<&Path>,
+        load: bool,
     ) -> Result<Self, TsgoOverlayError> {
         let workspace = absolute_normalized(workspace);
         let workspace = fs::canonicalize(&workspace)?;
@@ -343,14 +418,13 @@ impl TsgoOverlay {
             namespace: compiler.projection_namespace(),
             entries: BTreeMap::new(),
             by_shadow: BTreeMap::new(),
+            loaded: false,
+            owned: BTreeSet::new(),
         };
         overlay.materialize_support_files()?;
-
-        for path in overlay.discover_sources() {
-            let text = fs::read_to_string(&path)?;
-            overlay.open_or_update(&path, &text, 0)?;
+        if load {
+            overlay.load()?;
         }
-        overlay.write_tsconfig()?;
         Ok(overlay)
     }
 
@@ -757,39 +831,93 @@ impl TsgoOverlay {
         Ok(update)
     }
 
-    /// Every `.svelte` source this overlay shadows eagerly: the ones under the
-    /// project directory, plus — for a nested project — each one outside it
-    /// that a shadowed source reaches through a relative import, transitively.
-    fn discover_sources(&self) -> BTreeSet<PathBuf> {
-        let mut discovered = rsvelte_check::find_svelte_files(&self.workspace, &[])
+    /// Every `.svelte` source this project needs: the ones it owns — its
+    /// config is their nearest one, so a subdirectory with a config of its own
+    /// is left to that project, as upstream keys a service by each document's
+    /// nearest config (`service.ts:172-201`) — plus every component an owned
+    /// component or owned plain module reaches through a relative or
+    /// `paths`-aliased `.svelte` specifier, transitively, wherever it lives in
+    /// the mirror root. tsgo resolves an import only inside this project's own
+    /// shadow tree, so each of those needs a copy here.
+    fn discover_sources(&mut self) -> BTreeSet<PathBuf> {
+        let mut owned_components = Vec::new();
+        let mut owned_modules = Vec::new();
+        walk_owned_files(&self.workspace, &mut owned_components, &mut owned_modules);
+        let mut discovered = owned_components
             .into_iter()
             .map(|path| fs::canonicalize(&path).unwrap_or(path))
             .collect::<BTreeSet<_>>();
-        if self.mirror_root == self.workspace {
-            return discovered;
-        }
+        self.owned = discovered.clone();
+        let aliases = self.alias_patterns();
         let mut pending = discovered.iter().cloned().collect::<Vec<_>>();
+        pending.extend(owned_modules);
         while let Some(path) = pending.pop() {
             let Ok(text) = fs::read_to_string(&path) else {
                 continue;
             };
+            if !text.contains(".svelte") {
+                continue;
+            }
             let Some(directory) = path.parent() else {
                 continue;
             };
-            for specifier in relative_svelte_specifiers(&text) {
-                let target = absolute_normalized(&directory.join(specifier));
-                let Ok(target) = fs::canonicalize(&target) else {
-                    continue;
-                };
-                if target.starts_with(&self.mirror_root)
-                    && target.is_file()
-                    && discovered.insert(target.clone())
-                {
-                    pending.push(target);
+            for specifier in svelte_specifiers(&text) {
+                for target in resolve_svelte_specifier(directory, specifier, &aliases) {
+                    let Ok(target) = fs::canonicalize(&target) else {
+                        continue;
+                    };
+                    if target.starts_with(&self.mirror_root)
+                        && target.is_file()
+                        && discovered.insert(target.clone())
+                    {
+                        pending.push(target);
+                    }
                 }
             }
         }
         discovered
+    }
+
+    /// The project's `paths` patterns, with each target absolute, plus the
+    /// `*` pattern the overlay synthesizes from `baseUrl` (see
+    /// [`Self::overlay_paths`]).
+    fn alias_patterns(&self) -> Vec<AliasPattern> {
+        let mut patterns = Vec::new();
+        let Some(source) = self.source_tsconfig.as_deref() else {
+            return patterns;
+        };
+        let config_dir = source.parent().unwrap_or_else(|| Path::new("."));
+        if let Some((value, base)) = resolve_config_value_with_base(source, "paths") {
+            for (pattern, targets) in value.as_object().into_iter().flatten() {
+                let targets = targets
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(|target| rebase_config_spec(target, &base, config_dir))
+                    .collect::<Vec<_>>();
+                patterns.push(match pattern.split_once('*') {
+                    Some((prefix, suffix)) => AliasPattern {
+                        prefix: prefix.to_string(),
+                        suffix: Some(suffix.to_string()),
+                        targets,
+                    },
+                    None => AliasPattern {
+                        prefix: pattern.clone(),
+                        suffix: None,
+                        targets,
+                    },
+                });
+            }
+        }
+        if let Some(base_url) = self.overlay_base_url() {
+            patterns.push(AliasPattern {
+                prefix: String::new(),
+                suffix: Some(String::new()),
+                targets: vec![format!("{base_url}/*")],
+            });
+        }
+        patterns
     }
 
     /// Resolve a source path to its virtual shadow document.
@@ -2067,18 +2195,97 @@ fn shadow_language_id(source: &str) -> &'static str {
     }
 }
 
-/// The relative `.svelte` module specifiers in `source`, found the same way
+/// The `.svelte` module specifiers in `source`, found the same way
 /// [`rewrite_plain_svelte_imports`] finds the ones it suffixes.
-fn relative_svelte_specifiers(source: &str) -> Vec<&str> {
+fn svelte_specifiers(source: &str) -> Vec<&str> {
     let (_, insertions) = rewrite_plain_svelte_imports(source);
     insertions
         .into_iter()
         .filter_map(|(end, _)| {
             let start = source[..end].rfind(['\'', '"', '`'])? + 1;
-            let specifier = &source[start..end];
-            (specifier.starts_with("./") || specifier.starts_with("../")).then_some(specifier)
+            Some(&source[start..end])
         })
         .collect()
+}
+
+/// One `paths` pattern: `prefix*suffix` maps onto each target with the `*`
+/// replaced; an exact pattern (no `*`) has no suffix.
+#[derive(Debug)]
+struct AliasPattern {
+    prefix: String,
+    suffix: Option<String>,
+    targets: Vec<String>,
+}
+
+/// The files one `.svelte` specifier may name: relative to `directory`, or
+/// through the project's `paths` patterns.
+fn resolve_svelte_specifier(
+    directory: &Path,
+    specifier: &str,
+    aliases: &[AliasPattern],
+) -> Vec<PathBuf> {
+    if specifier.starts_with("./") || specifier.starts_with("../") {
+        return vec![absolute_normalized(&directory.join(specifier))];
+    }
+    let mut candidates = Vec::new();
+    for alias in aliases {
+        let star = match &alias.suffix {
+            None if specifier == alias.prefix => "",
+            Some(suffix)
+                if specifier.len() >= alias.prefix.len() + suffix.len()
+                    && specifier.starts_with(alias.prefix.as_str())
+                    && specifier.ends_with(suffix.as_str()) =>
+            {
+                &specifier[alias.prefix.len()..specifier.len() - suffix.len()]
+            }
+            _ => continue,
+        };
+        for target in &alias.targets {
+            candidates.push(absolute_normalized(Path::new(
+                &target.replacen('*', star, 1),
+            )));
+        }
+    }
+    candidates
+}
+
+/// The files a project at `dir` owns: subdirectories carrying their own
+/// `tsconfig.json` / `jsconfig.json` belong to that project, and
+/// `node_modules` and hidden entries are skipped as the workspace walker
+/// (`rsvelte_check::find_svelte_files`) skips them. Symlinks are not
+/// followed. Components and script modules (not `.d.ts`) are collected
+/// separately.
+fn walk_owned_files(dir: &Path, components: &mut Vec<PathBuf>, modules: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name == "node_modules" {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            if path.join("tsconfig.json").is_file() || path.join("jsconfig.json").is_file() {
+                continue;
+            }
+            walk_owned_files(&path, components, modules);
+        } else if file_type.is_file() {
+            if name.ends_with(".svelte") {
+                components.push(path);
+            } else if !name.ends_with(".d.ts")
+                && [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
+                    .iter()
+                    .any(|extension| name.ends_with(extension))
+            {
+                modules.push(path);
+            }
+        }
+    }
 }
 
 fn rewrite_plain_svelte_imports(source: &str) -> (String, Vec<(usize, std::ops::Range<usize>)>) {
@@ -4102,12 +4309,134 @@ mod tests {
     }
 
     #[test]
-    fn relative_svelte_specifiers_are_the_ones_the_import_rewrite_finds() {
+    fn a_project_owns_only_documents_whose_nearest_config_it_is() {
+        let workspace = TestWorkspace::new("ownership");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        write(&root.join("tsconfig.json"), "{}");
+        write(&root.join("src/App.svelte"), "<p />");
+        write(&root.join("docs/tsconfig.json"), "{}");
+        write(&root.join("docs/src/Page.svelte"), "<p />");
+        write(&root.join("tools/jsconfig.json"), "{}");
+        write(&root.join("tools/Tool.svelte"), "<p />");
+
+        let overlay = build_overlay(&root).unwrap();
+        assert!(overlay.owns(&root.join("src/App.svelte")));
+        for foreign in ["docs/src/Page.svelte", "tools/Tool.svelte"] {
+            assert!(!overlay.owns(&root.join(foreign)), "{foreign}");
+            assert!(
+                overlay.shadow_for_source(&root.join(foreign)).is_none(),
+                "{foreign} is another project's, and nothing here imports it"
+            );
+        }
+        assert_eq!(
+            nearest_tsconfig(&root.join("docs/src/Page.svelte"), &root),
+            Some(root.join("docs/tsconfig.json")),
+            "ownership agrees with the per-document config lookup"
+        );
+    }
+
+    #[test]
+    fn a_configless_root_owns_only_documents_without_any_config() {
+        let workspace = TestWorkspace::new("ownership-configless");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        write(&root.join("App.svelte"), "<p />");
+        write(&root.join("lib/Button.svelte"), "<p />");
+        write(&root.join("app/tsconfig.json"), "{}");
+        write(&root.join("app/Page.svelte"), "<p />");
+        let overlay = build_overlay(&root).unwrap();
+        assert!(overlay.owns(&root.join("App.svelte")));
+        assert!(overlay.owns(&root.join("lib/Button.svelte")));
+        assert!(!overlay.owns(&root.join("app/Page.svelte")));
+        assert_eq!(overlay.eager_shadows().len(), 2);
+    }
+
+    #[test]
+    fn a_deferred_overlay_projects_nothing_until_loaded() {
+        let workspace = TestWorkspace::new("deferred");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        write(&root.join("src/App.svelte"), "<p />");
+        let mut overlay = TsgoOverlay::build_mirrored(&root, None, None, None, false).unwrap();
+        assert!(!overlay.is_loaded());
+        assert!(overlay.eager_shadows().is_empty());
+        assert!(
+            overlay.tsconfig_path().is_file(),
+            "the config is written up front"
+        );
+        assert!(overlay.cache_dir().join(SHIM_SHIMS_V4_NAME).is_file());
+
+        assert!(overlay.load().unwrap());
+        assert!(!overlay.load().unwrap(), "loads once");
+        assert_eq!(overlay.eager_shadows().len(), 1);
+        assert!(overlay.owns(&root.join("src/App.svelte")));
+    }
+
+    #[test]
+    fn the_import_closure_follows_paths_aliases_from_owned_plain_modules() {
+        // monorepo/admin/tests: a project with no component of its own, whose
+        // tests import the app's components through an alias.
+        let workspace = TestWorkspace::new("alias-closure");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        write(&root.join("src/tsconfig.json"), "{}");
+        write(
+            &root.join("src/app/Error.svelte"),
+            "<script lang=\"ts\">import Icon from '../lib/Icon.svelte';</script><Icon />",
+        );
+        write(&root.join("src/lib/Icon.svelte"), "<svg />");
+        write(&root.join("src/lib/Unused.svelte"), "<p />");
+        write(
+            &root.join("tests/tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@app/*": ["../src/*"] } } }"#,
+        );
+        write(
+            &root.join("tests/browser/router.test.ts"),
+            "import Error from '@app/app/Error.svelte';\nexport { Error };\n",
+        );
+
+        let mut tests = TsgoOverlay::build_nested(
+            &root.join("tests"),
+            &root.join("tests/tsconfig.json"),
+            &root,
+        )
+        .unwrap();
+        let error = root.join("src/app/Error.svelte");
+        assert!(tests.shadow_for_source(&error).is_some(), "aliased import");
+        assert!(
+            tests
+                .shadow_for_source(&root.join("src/lib/Icon.svelte"))
+                .is_some(),
+            "followed transitively"
+        );
+        assert!(
+            tests
+                .shadow_for_source(&root.join("src/lib/Unused.svelte"))
+                .is_none()
+        );
+        assert!(!tests.owns(&error), "a copy, not a member the project owns");
+        assert_eq!(
+            tests.shadow_for_source(&error).unwrap().shadow_uri,
+            path_to_uri(&tests.shadow_dir.join("src/app/Error.svelte.tsx")).unwrap(),
+            "where the alias's shadow-tree twin points"
+        );
+        for shadow in tests.component_shadows() {
+            tests
+                .persist_body(&uri_to_path_for_test(&shadow.source_uri))
+                .unwrap();
+        }
+        assert!(tests.unresolved_shadow_routes().is_empty());
+        assert!(!tests.load().unwrap());
+    }
+
+    fn uri_to_path_for_test(uri: &Uri) -> PathBuf {
+        crate::uri::uri_to_path(uri.as_str())
+    }
+
+    #[test]
+    fn svelte_specifiers_are_the_ones_the_import_rewrite_finds() {
         let source = "import A from './A.svelte';\nimport B from '../b/B.svelte';\n\
                       import C from 'pkg/C.svelte';\nconst s = './not-an-import.svelte';";
         assert_eq!(
-            relative_svelte_specifiers(source),
-            vec!["./A.svelte", "../b/B.svelte"]
+            svelte_specifiers(source),
+            vec!["./A.svelte", "../b/B.svelte", "pkg/C.svelte"]
         );
     }
 

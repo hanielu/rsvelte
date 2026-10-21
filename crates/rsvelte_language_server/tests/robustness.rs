@@ -570,6 +570,182 @@ fn json_id(message: &str) -> &str {
 }
 "###;
 
+/// Projects load when a document they own is opened, and tsgo only receives
+/// that document as a buffer: every other component is a body on disk, under
+/// the project's own cache directory.
+#[cfg(unix)]
+#[test]
+fn a_document_loads_only_its_own_project_and_the_rest_is_read_from_disk() {
+    let dir = TestDir::new("lazy-projects");
+    let helper_source = dir.0.join("fake_tsgo.rs");
+    let helper = dir.0.join("fake-tsgo");
+    let log = dir.0.join("tsgo.log");
+    fs::write(&helper_source, FAKE_TSGO_RECORDER).expect("write fake tsgo source");
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    assert!(
+        Command::new(rustc)
+            .arg("--edition=2024")
+            .arg(&helper_source)
+            .arg("-o")
+            .arg(&helper)
+            .status()
+            .expect("run rustc")
+            .success(),
+        "compile fake tsgo"
+    );
+    let root = fs::canonicalize(&dir.0).unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    for project in ["a", "b"] {
+        fs::create_dir_all(root.join(project)).unwrap();
+        fs::write(root.join(project).join("tsconfig.json"), "{}").unwrap();
+    }
+    let source = "<script lang=\"ts\">\nlet answer = 42;\n</script>\n<p>{answer}</p>\n";
+    fs::write(root.join("a/X.svelte"), source).unwrap();
+    fs::write(
+        root.join("a/Sibling.svelte"),
+        "<script lang=\"ts\"></script><p />",
+    )
+    .unwrap();
+    // A JavaScript component is the exception: its script kind comes from
+    // the buffer's language id, so its project opens it before the document.
+    fs::write(root.join("a/Legacy.svelte"), "<p />").unwrap();
+    fs::write(root.join("b/Y.svelte"), source).unwrap();
+    let mut server = Server::start(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+        ],
+    );
+    let opened = |log: &Path| {
+        fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.strip_prefix("didOpen "))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let shadow = |project: &str, file: &str| {
+        root.join(".svelte-rs/projects")
+            .join(project)
+            .join("tsgo/svelte")
+            .join(project)
+            .join(format!("{file}.svelte.tsx"))
+    };
+    let hover = |server: &mut Server, uri: &str| {
+        let id = server.request(
+            "textDocument/hover",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 1, "character": 5 } }),
+        );
+        server.response(id, Duration::from_secs(5))
+    };
+
+    let x = file_uri(&root.join("a/X.svelte"));
+    server.open(&x, source);
+    assert!(hover(&mut server, &x).to_string().contains("recorded"));
+    assert_eq!(
+        opened(&log),
+        vec![
+            file_uri(&shadow("a", "Legacy")),
+            file_uri(&shadow("a", "X"))
+        ],
+        "only the editor's document (and a JavaScript component) is a tsgo buffer"
+    );
+    assert!(
+        shadow("a", "Sibling").is_file(),
+        "the project's other component is on disk"
+    );
+    assert!(
+        !shadow("b", "Y").exists(),
+        "an unopened project is not loaded"
+    );
+
+    let y = file_uri(&root.join("b/Y.svelte"));
+    server.open(&y, source);
+    assert!(hover(&mut server, &y).to_string().contains("recorded"));
+    assert_eq!(
+        opened(&log),
+        vec![
+            file_uri(&shadow("a", "Legacy")),
+            file_uri(&shadow("a", "X")),
+            file_uri(&shadow("b", "Y"))
+        ]
+    );
+    server.shutdown();
+}
+
+#[cfg(unix)]
+const FAKE_TSGO_RECORDER: &str = r###"
+use std::fs::OpenOptions;
+use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
+
+fn main() {
+    let log = PathBuf::from(std::env::var_os("RSVELTE_TEST_TSGO_LOG").unwrap());
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    loop {
+        let Some(message) = read_message(&mut input).unwrap() else { return };
+        if message.contains(r#""method":"initialize""#) {
+            let id = json_id(&message);
+            write_message(&mut output, &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"capabilities":{{"positionEncoding":"utf-8","hoverProvider":true}}}}}}"#
+            )).unwrap();
+        } else if message.contains(r#""method":"textDocument/didOpen""#) {
+            let uri = message.split_once(r#""uri":""#).unwrap().1.split('"').next().unwrap().to_string();
+            let mut file = OpenOptions::new().create(true).append(true).open(&log).unwrap();
+            writeln!(file, "didOpen {uri}").unwrap();
+        } else if message.contains(r#""method":"textDocument/hover""#) {
+            let id = json_id(&message);
+            write_message(&mut output, &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"contents":{{"kind":"plaintext","value":"recorded"}}}}}}"#
+            )).unwrap();
+        } else if message.contains(r#""method":"shutdown""#) {
+            let id = json_id(&message);
+            write_message(&mut output, &format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#)).unwrap();
+        } else if message.contains(r#""method":"exit""#) {
+            return;
+        } else if message.contains(r#""method":""#) && message.contains(r#""id":"#) {
+            let id = json_id(&message);
+            write_message(&mut output, &format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#)).unwrap();
+        }
+    }
+}
+
+fn read_message(reader: &mut impl BufRead) -> io::Result<Option<String>> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 { return Ok(None) }
+        if line == "\r\n" { break }
+        if let Some(value) = line.strip_prefix("Content-Length:") {
+            content_length = Some(value.trim().parse::<usize>().unwrap());
+        }
+    }
+    let mut body = vec![0; content_length.unwrap()];
+    reader.read_exact(&mut body)?;
+    Ok(Some(String::from_utf8(body).unwrap()))
+}
+
+fn write_message(writer: &mut impl Write, body: &str) -> io::Result<()> {
+    write!(writer, "Content-Length: {}\r\n\r\n{body}", body.len())?;
+    writer.flush()
+}
+
+fn json_id(message: &str) -> &str {
+    let rest = message.split_once(r#""id":"#).unwrap().1;
+    if let Some(rest) = rest.strip_prefix('"') {
+        let end = rest.find('"').unwrap();
+        &message[message.len() - rest.len() - 1..message.len() - rest.len() + end + 1]
+    } else {
+        let end = rest.find(|character: char| !character.is_ascii_digit() && character != '-').unwrap_or(rest.len());
+        &rest[..end]
+    }
+}
+"###;
+
 /// `drop_degenerate_folding_ranges` is called on the tsgo half of
 /// `textDocument/foldingRange`, and the unit test beside it calls the function
 /// directly — so removing the call site leaves that suite green. A range whose

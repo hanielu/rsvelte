@@ -1179,7 +1179,14 @@ fn document_context_for_uri_in(
                 .shadow_for_source(&path)
                 .map(|shadow| (overlay, shadow))
         })
-        .max_by_key(|(overlay, _)| overlay.workspace().components().count())
+        // The owner over a copy another project keeps for its imports, which
+        // can sit as deep: only the owner's shadow is the editor's document.
+        .max_by_key(|(overlay, _)| {
+            (
+                overlay.owns(&path),
+                overlay.workspace().components().count(),
+            )
+        })
     {
         return Some(RequestDocumentContext {
             source_uri: shadow.source_uri.clone(),
@@ -1961,6 +1968,50 @@ mod tests {
         );
         assert!(mapper.map_request("textDocument/hover", &mut params));
         assert_eq!(params["textDocument"]["uri"], nested_shadow_uri.as_str());
+    }
+
+    #[test]
+    fn the_owner_wins_over_a_copy_at_equal_depth() {
+        let workspace = Workspace::new();
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        for (path, text) in [
+            ("a/tsconfig.json", "{}"),
+            ("a/X.svelte", "<script lang=\"ts\">let value = 1;</script>"),
+            ("b/tsconfig.json", "{}"),
+            (
+                "b/Y.svelte",
+                "<script lang=\"ts\">import X from '../a/X.svelte';</script><X />",
+            ),
+        ] {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        let owner =
+            TsgoOverlay::build_nested(&root.join("a"), &root.join("a/tsconfig.json"), &root)
+                .unwrap();
+        let copy = TsgoOverlay::build_nested(&root.join("b"), &root.join("b/tsconfig.json"), &root)
+            .unwrap();
+        let path = root.join("a/X.svelte");
+        assert!(copy.shadow_for_source(&path).is_some() && !copy.owns(&path));
+        let owner_shadow = owner.shadow_for_source(&path).unwrap().shadow_uri.clone();
+        let source_uri = owner.shadow_for_source(&path).unwrap().source_uri.clone();
+        for overlays in [[owner, copy], {
+            let owner =
+                TsgoOverlay::build_nested(&root.join("a"), &root.join("a/tsconfig.json"), &root)
+                    .unwrap();
+            let copy =
+                TsgoOverlay::build_nested(&root.join("b"), &root.join("b/tsconfig.json"), &root)
+                    .unwrap();
+            [copy, owner]
+        }] {
+            let params = json!({ "textDocument": { "uri": source_uri.as_str() } });
+            let mapper = TsgoResponseMapper::for_overlays_request(&overlays, &params);
+            assert_eq!(
+                mapper.default_document().unwrap().shadow_uri(),
+                &owner_shadow
+            );
+        }
     }
 
     #[test]
