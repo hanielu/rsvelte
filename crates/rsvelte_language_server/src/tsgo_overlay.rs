@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::io;
+use std::ops::Bound;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
@@ -1054,8 +1055,11 @@ impl TsgoOverlay {
         // Decided before anything changes, so the fallback never drops an
         // update this pass already made.
         // A hidden or `node_modules` path holds no member (`walk_owned_files`).
+        // A removed directory is gone, so the members beneath it are what tell
+        // it from a file: its name can have a dot (`ui.v1`), and a client
+        // reports a folder deletion as one event for the folder.
         let unplaceable = |path: &Path| {
-            (path.is_dir() || path.extension().is_none())
+            (path.is_dir() || path.extension().is_none() || self.holds_members_under(path))
                 && !path
                     .strip_prefix(&self.mirror_root)
                     .unwrap_or(path)
@@ -1155,6 +1159,15 @@ impl TsgoOverlay {
             self.link_node_modules();
         }
         Ok(Some(update))
+    }
+
+    /// Whether any member lives below `path` (not at it). Members are keyed
+    /// by path, which orders a directory's descendants right after it.
+    fn holds_members_under(&self, path: &Path) -> bool {
+        self.entries
+            .range::<Path, _>((Bound::Excluded(path), Bound::Unbounded))
+            .next()
+            .is_some_and(|(member, _)| member.starts_with(path))
     }
 
     /// Project, as copies, the components `sources` import that this
@@ -5239,6 +5252,48 @@ mod tests {
                 .unwrap();
         a.open_or_update(&fresh, "<p />", 1).unwrap();
         assert!(!a.owns(&fresh));
+    }
+
+    #[test]
+    fn deleting_a_directory_with_a_dot_in_its_name_removes_its_members() {
+        use lsp_types::FileChangeType;
+        let workspace = TestWorkspace::new("dotted-directory");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        write(&root.join("tsconfig.json"), "{}");
+        write(&root.join("src/ui.v1/Button.svelte"), "<p />");
+        write(&root.join("src/ui.v1.svelte"), "<p />");
+        write(&root.join("src/Card.svelte"), "<p />");
+        let mut overlay = build_overlay(&root).unwrap();
+        let button = root.join("src/ui.v1/Button.svelte");
+        overlay.persist_body(&button).unwrap();
+        let body = overlay.shadow_dir.join("src/ui.v1/Button.svelte.tsx");
+        assert!(body.is_file());
+        // A file whose name extends the directory's sorts after the directory's
+        // members, and is no member of it.
+        assert!(!overlay.holds_members_under(&root.join("src/ui.v1.svelte")));
+        assert!(overlay.holds_members_under(&root.join("src/ui.v1")));
+
+        fs::remove_dir_all(root.join("src/ui.v1")).unwrap();
+        let editor = EditorBuffers::default();
+        assert!(
+            overlay
+                .apply_file_changes(
+                    &[(root.join("src/ui.v1"), FileChangeType::DELETED)],
+                    &editor
+                )
+                .unwrap()
+                .is_none(),
+            "a removed directory is not a file event"
+        );
+        let update = overlay.refresh_except(&editor).unwrap();
+        assert_eq!(update.closed.len(), 1);
+        assert!(overlay.shadow_for_source(&button).is_none());
+        assert!(!body.exists());
+        assert!(
+            overlay
+                .shadow_for_source(&root.join("src/ui.v1.svelte"))
+                .is_some()
+        );
     }
 
     #[test]
