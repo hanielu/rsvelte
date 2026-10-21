@@ -943,6 +943,10 @@ impl TsgoOverlay {
                 .open_or_update(&source_path, &text, next_version)
                 .map(Some),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // As for a deletion event: the file may come back.
+                if self.entries.contains_key(&source_path) {
+                    self.missing.insert(source_path.clone());
+                }
                 self.remove_source(&source_path)?;
                 Ok(None)
             }
@@ -1084,6 +1088,9 @@ impl TsgoOverlay {
                     if let Some(entry) = self.entries.get(&path) {
                         update.closed.push(entry.document.shadow_uri.clone());
                     }
+                    // Still wanted: an import names it, so it is a copy again
+                    // as soon as it comes back (an undo, a branch switch).
+                    self.missing.insert(path.clone());
                     self.owned.remove(&path);
                     self.remove_source(&path)?;
                 }
@@ -5202,6 +5209,51 @@ mod tests {
             Some(saved),
             "the buffer is left alone"
         );
+    }
+
+    #[test]
+    fn a_deleted_copy_comes_back_with_its_file() {
+        use lsp_types::FileChangeType;
+        let workspace = TestWorkspace::new("deleted-copy");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        write(&root.join("a/tsconfig.json"), "{}");
+        write(
+            &root.join("a/Parent.svelte"),
+            "<script lang=\"ts\">import Child from '../b/Child.svelte';</script><Child />",
+        );
+        write(&root.join("b/tsconfig.json"), "{}");
+        write(&root.join("b/Child.svelte"), "<p />");
+        let child = root.join("b/Child.svelte");
+        let none = EditorBuffers::default();
+        let mut a =
+            TsgoOverlay::build_nested(&root.join("a"), &root.join("a/tsconfig.json"), &root)
+                .unwrap();
+        assert!(a.shadow_for_source(&child).is_some());
+
+        fs::remove_file(&child).unwrap();
+        let update = a
+            .apply_file_changes(&[(child.clone(), FileChangeType::DELETED)], &none)
+            .unwrap()
+            .expect("placeable");
+        assert_eq!(update.closed.len(), 1);
+        assert!(a.shadow_for_source(&child).is_none());
+
+        write(&child, "<p />");
+        let update = a
+            .apply_file_changes(&[(child.clone(), FileChangeType::CREATED)], &none)
+            .unwrap()
+            .expect("placeable");
+        assert_eq!(update.opened_or_changed.len(), 1, "restored");
+        assert!(a.shadow_for_source(&child).is_some());
+        assert!(!a.owns(&child), "still a copy");
+
+        // The same when the deletion is noticed by closing the open child.
+        fs::remove_file(&child).unwrap();
+        assert!(a.close(&child).unwrap().is_none());
+        write(&child, "<p />");
+        a.apply_file_changes(&[(child.clone(), FileChangeType::CREATED)], &none)
+            .unwrap();
+        assert!(a.shadow_for_source(&child).is_some());
     }
 
     #[test]
