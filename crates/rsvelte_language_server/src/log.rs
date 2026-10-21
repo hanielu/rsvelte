@@ -9,3 +9,8 @@ use std::fmt::Display;
 pub fn warn(message: impl Display) {
     eprintln!("rsvelte-language-server: {message}");
 }
+
+/// An operational note, such as a project load and what it cost.
+pub fn info(message: impl Display) {
+    eprintln!("rsvelte-language-server: {message}");
+}

@@ -312,26 +312,72 @@ impl TsgoOverlay {
             return Ok(false);
         }
         self.loaded = true;
-        for path in self.discover_sources() {
-            let text = match fs::read_to_string(&path) {
-                Ok(text) => text,
-                Err(error) => {
-                    crate::log::warn(format_args!(
-                        "could not read {} for tsgo: {error}",
-                        path.display()
-                    ));
-                    continue;
+        let sources = self.discover_sources().into_iter().collect::<Vec<_>>();
+        for (path, state) in self.project_sources(&sources) {
+            match state {
+                Ok(state) => {
+                    self.insert_state(state);
                 }
-            };
-            if let Err(error) = self.open_or_update(&path, &text, 0) {
-                crate::log::warn(format_args!(
+                Err(error) => crate::log::warn(format_args!(
                     "could not project {} for tsgo: {error}",
                     path.display()
-                ));
+                )),
             }
         }
         self.write_tsconfig()?;
         Ok(true)
+    }
+
+    /// Read and project `sources` from disk, on up to
+    /// [`MAX_PROJECTION_THREADS`] threads: a project's first document waits
+    /// for every member, and svelte2tsx is pure per file. The results come
+    /// back in `sources` order, so the overlay built from them does not
+    /// depend on scheduling. A panic is one member's error, as it is for the
+    /// analysis worker.
+    fn project_sources(&self, sources: &[PathBuf]) -> Vec<(PathBuf, Result<ShadowState, String>)> {
+        let project = |path: &PathBuf| {
+            let state = fs::read_to_string(path)
+                .map_err(|error| error.to_string())
+                .and_then(|text| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.project_state(path, &text, &text, None, 0)
+                    }))
+                    .map_err(|_| "svelte2tsx panicked".to_string())?
+                    .map_err(|error| error.to_string())
+                });
+            (path.clone(), state)
+        };
+        let threads = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(MAX_PROJECTION_THREADS)
+            .min(sources.len().div_ceil(MIN_SOURCES_PER_THREAD));
+        if threads <= 1 {
+            return sources.iter().map(project).collect();
+        }
+        let chunk = sources.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            let parts = sources
+                .chunks(chunk)
+                .map(|part| {
+                    let handle = std::thread::Builder::new()
+                        .name("rsvelte-projection".to_string())
+                        .stack_size(PROJECTION_STACK_SIZE)
+                        .spawn_scoped(scope, move || part.iter().map(project).collect::<Vec<_>>())
+                        .ok();
+                    (part, handle)
+                })
+                .collect::<Vec<_>>();
+            parts
+                .into_iter()
+                .flat_map(|(part, handle)| {
+                    // A thread that could not start (or died) leaves its part
+                    // to this one.
+                    handle
+                        .and_then(|handle| handle.join().ok())
+                        .unwrap_or_else(|| part.iter().map(project).collect())
+                })
+                .collect()
+        })
     }
 
     /// Whether `source_path` is one of this project's own members — its
@@ -483,6 +529,38 @@ impl TsgoOverlay {
         preprocess_map: Option<&str>,
         version: i32,
     ) -> Result<ShadowDocument, TsgoOverlayError> {
+        let state = self.project_state(
+            source_path,
+            original_text,
+            preprocessed_text,
+            preprocess_map,
+            version,
+        )?;
+        Ok(self.insert_state(state))
+    }
+
+    /// Install a projection, replacing the source's previous one.
+    fn insert_state(&mut self, state: ShadowState) -> ShadowDocument {
+        let document = state.document.clone();
+        let source_path = state.source_path.clone();
+        let shadow_path = state.shadow_path.clone();
+        if let Some(old) = self.entries.insert(source_path.clone(), state) {
+            self.by_shadow.remove(&old.shadow_path);
+        }
+        self.by_shadow.insert(shadow_path, source_path);
+        document
+    }
+
+    /// [`Self::open_or_update_preprocessed`]'s projection, without touching
+    /// the overlay's routes, so members can be projected in parallel.
+    fn project_state(
+        &self,
+        source_path: &Path,
+        original_text: &str,
+        preprocessed_text: &str,
+        preprocess_map: Option<&str>,
+        version: i32,
+    ) -> Result<ShadowState, TsgoOverlayError> {
         let source_path = self.confined_source(source_path)?;
         let shadow_path = self.shadow_path_for(&source_path)?;
         self.ensure_shadow_parent(&shadow_path)?;
@@ -509,7 +587,7 @@ impl TsgoOverlay {
             // `DocumentSnapshot.ts:275-291`: a rejected document still gets a
             // snapshot, over its extracted script, so TypeScript keeps answering.
             Err(error) => {
-                return self.open_parser_error_fallback(
+                return self.parser_error_state(
                     &source_path,
                     &shadow_path,
                     original_text,
@@ -596,27 +674,23 @@ impl TsgoOverlay {
             plain_insertions: Vec::new(),
             fragment_offset: 0,
             parser_error: None,
-            document: document.clone(),
+            document,
         };
-        if let Some(old) = self.entries.insert(source_path.clone(), state) {
-            self.by_shadow.remove(&old.shadow_path);
-        }
-        self.by_shadow.insert(shadow_path, source_path);
-        Ok(document)
+        Ok(state)
     }
 
     /// The snapshot upstream keeps when svelte2tsx rejects a document: the
     /// instance script's body (else the module script's, else nothing) mapped
     /// back by a constant shift, so TypeScript still answers and every caller
     /// can see that the projection failed.
-    fn open_parser_error_fallback(
-        &mut self,
+    fn parser_error_state(
+        &self,
         source_path: &Path,
         shadow_path: &Path,
         original_text: &str,
         version: i32,
         message: String,
-    ) -> Result<ShadowDocument, TsgoOverlayError> {
+    ) -> Result<ShadowState, TsgoOverlayError> {
         let fragment = crate::context::fallback_script_body(original_text);
         let fragment_offset = fragment.as_ref().map_or(0, |body| body.start);
         let generated_text = fragment
@@ -650,14 +724,9 @@ impl TsgoOverlay {
             plain_insertions: Vec::new(),
             fragment_offset,
             parser_error: Some(message),
-            document: document.clone(),
+            document,
         };
-        if let Some(old) = self.entries.insert(source_path.to_path_buf(), state) {
-            self.by_shadow.remove(&old.shadow_path);
-        }
-        self.by_shadow
-            .insert(shadow_path.to_path_buf(), source_path.to_path_buf());
-        Ok(document)
+        Ok(state)
     }
 
     /// svelte2tsx's message for a document whose projection failed.
@@ -2577,6 +2646,14 @@ fn write_cache_gitignore(cache_root: &Path) {
     let _ = write_if_changed(&path, CACHE_GITIGNORE);
 }
 
+/// Most threads a project load projects its members on.
+const MAX_PROJECTION_THREADS: usize = 8;
+/// Fewer members than this per thread are projected on one thread.
+const MIN_SOURCES_PER_THREAD: usize = 8;
+/// svelte2tsx recurses over the markup. Address space, not resident memory,
+/// as for the analysis worker.
+const PROJECTION_STACK_SIZE: usize = 64 * 1024 * 1024;
+
 /// Suffix of the temporary file a body is written to before the rename. The
 /// name also starts with a dot, so neither tsgo's include wildcards nor the
 /// sweep's `.svelte.tsx` match ever sees it as a component.
@@ -4348,6 +4425,40 @@ mod tests {
         assert!(overlay.owns(&root.join("lib/Button.svelte")));
         assert!(!overlay.owns(&root.join("app/Page.svelte")));
         assert_eq!(overlay.eager_shadows().len(), 2);
+    }
+
+    #[test]
+    fn a_parallel_load_projects_exactly_what_one_thread_does() {
+        let workspace = TestWorkspace::new("parallel-load");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        for index in 0..40 {
+            write(
+                &root.join(format!("src/c{}/C{index}.svelte", index % 5)),
+                &format!(
+                    "<script lang=\"ts\">\n\tlet {{ n = {index} }}: {{ n?: number }} = $props();\n</script>\n<p>{{n}}</p>\n"
+                ),
+            );
+        }
+        write(
+            &root.join("src/Broken.svelte"),
+            "<script lang=\"ts\">let a = 1;</script>{#if}",
+        );
+        let parallel = build_overlay(&root).unwrap();
+        assert_eq!(parallel.component_shadows().len(), 41);
+        let mut sequential = TsgoOverlay::build_mirrored(&root, None, None, None, false).unwrap();
+        for shadow in parallel.component_shadows() {
+            let path = crate::uri::uri_to_path(shadow.source_uri.as_str());
+            let text = fs::read_to_string(&path).unwrap();
+            let expected = sequential.open_or_update(&path, &text, 0).unwrap();
+            assert_eq!(&expected, shadow, "{}", path.display());
+            assert_eq!(sequential.source_map(&path), parallel.source_map(&path));
+            assert_eq!(sequential.parser_error(&path), parallel.parser_error(&path));
+        }
+        assert!(
+            parallel
+                .parser_error(&root.join("src/Broken.svelte"))
+                .is_some()
+        );
     }
 
     #[test]

@@ -623,6 +623,7 @@ impl TsgoRuntime {
         if let Some(&index) = self.resolved_dirs.get(dir) {
             return (Some(index), false);
         }
+        let started = Instant::now();
         let (index, loaded) = match locate_project(&self.overlays, &source) {
             None => return (None, false),
             Some(ProjectLocation::Existing(index)) => match self.overlays[index].load() {
@@ -658,7 +659,17 @@ impl TsgoRuntime {
             }
         };
         if loaded {
-            let events = persist_bodies(&self.overlays[index]);
+            let overlay = &self.overlays[index];
+            let events = persist_bodies(overlay);
+            log::info(format_args!(
+                "loaded TypeScript project {} ({} components) in {} ms",
+                overlay
+                    .source_tsconfig()
+                    .unwrap_or_else(|| overlay.workspace())
+                    .display(),
+                overlay.component_shadows().len(),
+                started.elapsed().as_millis()
+            ));
             let _ = self.client.notify_watched_files(events);
         }
         self.resolved_dirs.insert(dir.to_path_buf(), index);
