@@ -65,7 +65,7 @@ use crate::tsgo_custom::{
     component_probe_position, component_reference_code_lens, filter_component_references,
     prepare_code_lenses, resolve_code_lens, rewrite_will_rename_params, rewrite_will_rename_result,
 };
-use crate::tsgo_overlay::{self, TsgoOverlay};
+use crate::tsgo_overlay::{self, EditorBuffers, TsgoOverlay};
 use crate::tsgo_rename::{
     PrepareRenamePlan, RenameDocument, merge_workspace_edits, prepare_rename_plan,
     rewrite_prepare_response, rewrite_workspace_edit,
@@ -2746,15 +2746,22 @@ impl Server {
         }
     }
 
+    /// The editor's open documents, as the overlays must see them.
+    fn editor_buffers(&self) -> EditorBuffers {
+        let mut buffers = EditorBuffers::default();
+        for document in self.documents.iter() {
+            let path = uri_to_path(document.uri.as_str());
+            buffers.insert(
+                fs::canonicalize(&path).unwrap_or(path),
+                document.shared_text(),
+                document.version,
+            );
+        }
+        buffers
+    }
+
     fn refresh_tsgo_overlays(&mut self, changes: &[(PathBuf, lsp_types::FileChangeType)]) {
-        let editor_open = self
-            .documents
-            .iter()
-            .map(|document| {
-                let path = uri_to_path(document.uri.as_str());
-                fs::canonicalize(&path).unwrap_or(path)
-            })
-            .collect::<HashSet<_>>();
+        let editor = self.editor_buffers();
         let Some(runtime) = &mut self.tsgo else {
             return;
         };
@@ -2767,10 +2774,9 @@ impl Server {
             .enumerate()
             .filter(|(_, overlay)| overlay.is_loaded())
         {
-            let editor_open = |source: &Path| editor_open.contains(source);
-            let update = match overlay.apply_file_changes(changes, editor_open) {
+            let update = match overlay.apply_file_changes(changes, &editor) {
                 Ok(Some(update)) => Ok(update),
-                Ok(None) => overlay.refresh_except(editor_open),
+                Ok(None) => overlay.refresh_except(&editor),
                 Err(error) => Err(error),
             };
             match update {
@@ -2781,10 +2787,9 @@ impl Server {
                 )),
             }
         }
-        if updates
-            .iter()
-            .any(|(_, update)| !update.opened_or_changed.is_empty())
-        {
+        if updates.iter().any(|(_, update)| {
+            !update.opened_or_changed.is_empty() || !update.buffers.is_empty()
+        }) {
             self.preprocess_known_empty = false;
         }
         let Some(runtime) = &mut self.tsgo else {
@@ -2794,6 +2799,9 @@ impl Server {
         for (index, update) in updates {
             for shadow in &update.opened_or_changed {
                 runtime.deliver_disk_shadow(index, shadow, &mut events);
+            }
+            for shadow in &update.buffers {
+                open_shadow(&runtime.client, &mut runtime.open_shadows, shadow);
             }
             for uri in update.closed {
                 if runtime.open_shadows.contains_key(uri.as_str()) {

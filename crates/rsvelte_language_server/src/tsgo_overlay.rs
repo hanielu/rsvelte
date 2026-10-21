@@ -13,12 +13,13 @@
 //! each `didOpen` a file *creation* for tsgo, so it rebuilds the whole program
 //! once per component before it can answer the first request.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Arc, OnceLock};
 
 use lsp_types::{Position, Range, Uri};
 use rsvelte_check::overlay::{
@@ -102,10 +103,42 @@ impl ShadowResolutionInfo {
 /// Changes found while reconciling the eager project set with disk.
 #[derive(Debug, Default, Clone)]
 pub struct OverlayUpdate {
-    /// New or changed shadow buffers to send with `didOpen` / `didChange`.
+    /// New or changed shadows projected from disk: their bodies are persisted.
     pub opened_or_changed: Vec<ShadowDocument>,
+    /// New copies projected from an editor buffer. tsgo holds them as
+    /// buffers, like the document they copy; they never reach disk.
+    pub buffers: Vec<ShadowDocument>,
     /// Shadow URIs removed because their sources no longer exist.
     pub closed: Vec<Uri>,
+}
+
+/// One document the editor has open, as tsgo must see it instead of the file.
+#[derive(Debug, Clone)]
+pub struct EditorBuffer {
+    pub text: Arc<String>,
+    pub version: i32,
+}
+
+/// The documents the editor has open, by canonical path. A file the editor
+/// holds is the editor's to report: a change on disk never replaces its
+/// shadow, and a project that needs a copy of it projects the buffer.
+#[derive(Debug, Default, Clone)]
+pub struct EditorBuffers(HashMap<PathBuf, EditorBuffer>);
+
+impl EditorBuffers {
+    pub fn insert(&mut self, path: PathBuf, text: Arc<String>, version: i32) {
+        self.0.insert(path, EditorBuffer { text, version });
+    }
+
+    #[must_use]
+    pub fn get(&self, path: &Path) -> Option<&EditorBuffer> {
+        self.0.get(path)
+    }
+
+    #[must_use]
+    pub fn contains(&self, path: &Path) -> bool {
+        self.0.contains_key(path)
+    }
 }
 
 /// Failure to prepare or update an overlay.
@@ -245,9 +278,13 @@ pub struct TsgoOverlay {
     /// member is a copy of a component another project owns, there only so an
     /// import of it resolves inside this project's shadow tree.
     owned: BTreeSet<PathBuf>,
-    /// Components an import names that do not exist (yet): creating one
-    /// makes it a copy (see [`Self::apply_file_changes`]).
+    /// Components an import names that do not exist (yet), or that existed
+    /// and were deleted: creating one makes it a copy again (see
+    /// [`Self::apply_file_changes`]).
     missing: BTreeSet<PathBuf>,
+    /// The `paths` patterns imports are followed through, read once: a
+    /// config change rebuilds the overlay.
+    aliases: OnceLock<Vec<AliasPattern>>,
 }
 
 impl fmt::Debug for TsgoOverlay {
@@ -533,6 +570,7 @@ impl TsgoOverlay {
             loaded: false,
             owned: BTreeSet::new(),
             missing: BTreeSet::new(),
+            aliases: OnceLock::new(),
         };
         overlay.materialize_support_files()?;
         if load {
@@ -915,16 +953,17 @@ impl TsgoOverlay {
     /// Reconcile eager shadows with the current workspace tree. A removed
     /// source's body is deleted; the caller persists new and changed ones.
     pub fn refresh(&mut self) -> Result<OverlayUpdate, TsgoOverlayError> {
-        self.refresh_except(|_| false)
+        self.refresh_except(&EditorBuffers::default())
     }
 
-    /// [`Self::refresh`], leaving alone every source `editor_open` names: its
-    /// shadow is the editor's buffer, which a change on disk does not replace
-    /// (the editor reports its own edits), so re-projecting the file would
-    /// hand tsgo stale text until the next keystroke.
+    /// [`Self::refresh`], leaving every source the editor has open to its
+    /// buffer: a change on disk does not replace it (the editor reports its
+    /// own edits), so re-projecting the file would hand tsgo stale text until
+    /// the next keystroke. An open document this project did not hold yet
+    /// joins it from the buffer (in [`OverlayUpdate::buffers`]).
     pub fn refresh_except(
         &mut self,
-        editor_open: impl Fn(&Path) -> bool,
+        editor: &EditorBuffers,
     ) -> Result<OverlayUpdate, TsgoOverlayError> {
         let discovered = self.discover_sources();
         let known = self
@@ -936,7 +975,7 @@ impl TsgoOverlay {
         let mut update = OverlayUpdate::default();
 
         for removed in known.difference(&discovered) {
-            if editor_open(removed) {
+            if editor.contains(removed) {
                 continue;
             }
             if let Some(entry) = self.entries.get(removed) {
@@ -945,7 +984,14 @@ impl TsgoOverlay {
             self.remove_source(removed)?;
         }
         for path in &discovered {
-            if editor_open(path) {
+            if let Some(buffer) = editor.get(path) {
+                if !self.entries.contains_key(path) {
+                    update.buffers.push(self.open_or_update(
+                        path,
+                        &buffer.text,
+                        buffer.version,
+                    )?);
+                }
                 continue;
             }
             let text = fs::read_to_string(path)?;
@@ -964,7 +1010,14 @@ impl TsgoOverlay {
                 .opened_or_changed
                 .push(self.open_or_update(path, &text, version)?);
         }
-        if !update.opened_or_changed.is_empty() {
+        // Discovery read the files; an unsaved import is only in the buffer.
+        let open = self
+            .entries
+            .keys()
+            .filter_map(|path| Some((path.clone(), editor.get(path)?.text.to_string())))
+            .collect::<Vec<_>>();
+        self.follow_imports(open, editor, &mut update)?;
+        if !update.opened_or_changed.is_empty() || !update.buffers.is_empty() {
             self.link_node_modules();
         }
         Ok(update)
@@ -981,7 +1034,7 @@ impl TsgoOverlay {
     pub fn apply_file_changes(
         &mut self,
         changes: &[(PathBuf, lsp_types::FileChangeType)],
-        editor_open: impl Fn(&Path) -> bool,
+        editor: &EditorBuffers,
     ) -> Result<Option<OverlayUpdate>, TsgoOverlayError> {
         let changes = changes
             .iter()
@@ -1008,7 +1061,7 @@ impl TsgoOverlay {
         let mut update = OverlayUpdate::default();
         let mut scan = Vec::new();
         for (path, change) in changes {
-            if editor_open(&path) {
+            if editor.contains(&path) {
                 continue;
             }
             let Some(name) = path
@@ -1070,42 +1123,50 @@ impl TsgoOverlay {
                 scan.push((path, text));
             }
         }
-        self.follow_imports(scan, &editor_open, &mut update)?;
-        if !update.opened_or_changed.is_empty() {
+        self.follow_imports(scan, editor, &mut update)?;
+        if !update.opened_or_changed.is_empty() || !update.buffers.is_empty() {
             self.link_node_modules();
         }
         Ok(Some(update))
     }
 
     /// Project, as copies, the components `sources` import that this
-    /// project does not hold yet, transitively.
+    /// project does not hold yet, transitively. A component the editor has
+    /// open is copied from its buffer, which tsgo then holds as a buffer here
+    /// too ([`OverlayUpdate::buffers`]); the rest are read from disk.
     fn follow_imports(
         &mut self,
         mut pending: Vec<(PathBuf, String)>,
-        editor_open: &impl Fn(&Path) -> bool,
+        editor: &EditorBuffers,
         update: &mut OverlayUpdate,
     ) -> Result<(), TsgoOverlayError> {
         if pending.is_empty() {
             return Ok(());
         }
-        let aliases = self.alias_patterns();
+        let aliases = self.alias_patterns().to_vec();
         while let Some((path, text)) = pending.pop() {
             let Some(directory) = path.parent() else {
                 continue;
             };
             for specifier in svelte_specifiers(&text) {
                 for target in resolve_svelte_specifier(directory, specifier, &aliases) {
-                    let Ok(target) = fs::canonicalize(&target) else {
-                        if target.starts_with(&self.mirror_root) {
-                            self.missing.insert(target);
-                        }
-                        continue;
-                    };
-                    if !target.starts_with(&self.mirror_root)
-                        || !target.is_file()
-                        || self.entries.contains_key(&target)
-                        || editor_open(&target)
+                    let target = fs::canonicalize(&target).unwrap_or(target);
+                    if !target.starts_with(&self.mirror_root) || self.entries.contains_key(&target)
                     {
+                        continue;
+                    }
+                    if let Some(buffer) = editor.get(&target) {
+                        self.missing.remove(&target);
+                        update.buffers.push(self.open_or_update(
+                            &target,
+                            &buffer.text,
+                            buffer.version,
+                        )?);
+                        pending.push((target, buffer.text.to_string()));
+                        continue;
+                    }
+                    if !target.is_file() {
+                        self.missing.insert(target);
                         continue;
                     }
                     let Ok(text) = fs::read_to_string(&target) else {
@@ -1202,8 +1263,12 @@ impl TsgoOverlay {
 
     /// The project's `paths` patterns, with each target absolute, plus the
     /// `*` pattern the overlay synthesizes from `baseUrl` (see
-    /// [`Self::overlay_paths`]).
-    fn alias_patterns(&self) -> Vec<AliasPattern> {
+    /// [`Self::overlay_paths`]). Read once per overlay.
+    fn alias_patterns(&self) -> &[AliasPattern] {
+        self.aliases.get_or_init(|| self.read_alias_patterns())
+    }
+
+    fn read_alias_patterns(&self) -> Vec<AliasPattern> {
         let mut patterns = Vec::new();
         let Some(source) = self.source_tsconfig.as_deref() else {
             return patterns;
@@ -2532,7 +2597,7 @@ fn svelte_specifiers(source: &str) -> Vec<&str> {
 
 /// One `paths` pattern: `prefix*suffix` maps onto each target with the `*`
 /// replaced; an exact pattern (no `*`) has no suffix.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AliasPattern {
     prefix: String,
     suffix: Option<String>,
@@ -3879,18 +3944,16 @@ mod tests {
         overlay.open_or_update(&app, "<p>buffer</p>", 3).unwrap();
         write(&other, "<p>changed</p>");
         let app_path = fs::canonicalize(&app).unwrap();
+        let mut editor = EditorBuffers::default();
+        editor.insert(app_path.clone(), Arc::new("<p>buffer</p>".to_string()), 3);
 
-        let update = overlay
-            .refresh_except(|source| source == app_path.as_path())
-            .unwrap();
+        let update = overlay.refresh_except(&editor).unwrap();
         assert_eq!(update.opened_or_changed.len(), 1, "only the closed file");
         assert_eq!(overlay.source_text(&app), Some("<p>buffer</p>"));
         assert_eq!(overlay.source_text(&other), Some("<p>changed</p>"));
 
         fs::remove_file(&app).unwrap();
-        let update = overlay
-            .refresh_except(|source| source == app_path.as_path())
-            .unwrap();
+        let update = overlay.refresh_except(&editor).unwrap();
         assert!(
             update.closed.is_empty(),
             "an unsaved buffer outlives its file"
@@ -4774,10 +4837,10 @@ mod tests {
         let mut overlay =
             TsgoOverlay::build_nested(&root.join("app"), &root.join("app/tsconfig.json"), &root)
                 .unwrap();
-        let none = |_: &Path| false;
+        let none = EditorBuffers::default();
         let changed = |overlay: &mut TsgoOverlay, path: &Path, change| {
             overlay
-                .apply_file_changes(&[(path.to_path_buf(), change)], none)
+                .apply_file_changes(&[(path.to_path_buf(), change)], &none)
                 .unwrap()
                 .expect("placeable")
         };
@@ -4870,8 +4933,10 @@ mod tests {
 
         write(&root.join("app/A.svelte"), "<p>a3</p>");
         let a = root.join("app/A.svelte");
+        let mut editor = EditorBuffers::default();
+        editor.insert(a.clone(), Arc::new("<p>a2</p>".to_string()), 2);
         let skipped = overlay
-            .apply_file_changes(&[(a.clone(), FileChangeType::CHANGED)], |path| path == a)
+            .apply_file_changes(&[(a.clone(), FileChangeType::CHANGED)], &editor)
             .unwrap()
             .unwrap();
         assert!(
@@ -4881,7 +4946,7 @@ mod tests {
 
         assert!(
             overlay
-                .apply_file_changes(&[(root.join("app"), FileChangeType::CHANGED)], none)
+                .apply_file_changes(&[(root.join("app"), FileChangeType::CHANGED)], &none)
                 .unwrap()
                 .is_none(),
             "a directory needs a full refresh"
@@ -4890,7 +4955,7 @@ mod tests {
             overlay
                 .apply_file_changes(
                     &[(root.join("app/node_modules/x"), FileChangeType::CREATED)],
-                    none
+                    &none
                 )
                 .unwrap()
                 .is_some(),
@@ -5025,6 +5090,51 @@ mod tests {
 
     fn uri_to_path_for_test(uri: &Uri) -> PathBuf {
         crate::uri::uri_to_path(uri.as_str())
+    }
+
+    #[test]
+    fn a_new_import_of_an_editor_open_component_copies_its_buffer() {
+        use lsp_types::FileChangeType;
+        let workspace = TestWorkspace::new("open-target");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        write(&root.join("a/tsconfig.json"), "{}");
+        write(&root.join("a/Plain.svelte"), "<p />");
+        write(&root.join("b/tsconfig.json"), "{}");
+        write(&root.join("b/New.svelte"), "<p>disk</p>");
+        let target = root.join("b/New.svelte");
+        let mut editor = EditorBuffers::default();
+        editor.insert(target.clone(), Arc::new("<p>buffer</p>".to_string()), 7);
+        let import = "<script lang=\"ts\">import New from '../b/New.svelte';</script><New />";
+
+        // A file event: the importer changed on disk while the target is open.
+        let mut a =
+            TsgoOverlay::build_nested(&root.join("a"), &root.join("a/tsconfig.json"), &root)
+                .unwrap();
+        write(&root.join("a/Plain.svelte"), import);
+        let update = a
+            .apply_file_changes(
+                &[(root.join("a/Plain.svelte"), FileChangeType::CHANGED)],
+                &editor,
+            )
+            .unwrap()
+            .expect("placeable");
+        assert_eq!(update.opened_or_changed.len(), 1, "the importer, from disk");
+        assert_eq!(update.buffers.len(), 1, "the open target, from its buffer");
+        assert_eq!(update.buffers[0].version, 7);
+        assert_eq!(a.source_text(&target), Some("<p>buffer</p>"));
+
+        // A full refresh finds the same copy.
+        write(&root.join("a/Plain.svelte"), "<p />");
+        let mut a =
+            TsgoOverlay::build_nested(&root.join("a"), &root.join("a/tsconfig.json"), &root)
+                .unwrap();
+        write(&root.join("a/Plain.svelte"), import);
+        let update = a.refresh_except(&editor).unwrap();
+        assert_eq!(update.buffers.len(), 1);
+        assert_eq!(a.source_text(&target), Some("<p>buffer</p>"));
+        // Once the target closes, the copy follows the file like any other.
+        assert!(a.close(&target).unwrap().is_some());
+        assert_eq!(a.source_text(&target), Some("<p>disk</p>"));
     }
 
     #[test]
