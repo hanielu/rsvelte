@@ -986,11 +986,9 @@ impl TsgoOverlay {
         for path in &discovered {
             if let Some(buffer) = editor.get(path) {
                 if !self.entries.contains_key(path) {
-                    update.buffers.push(self.open_or_update(
-                        path,
-                        &buffer.text,
-                        buffer.version,
-                    )?);
+                    update
+                        .buffers
+                        .push(self.open_or_update(path, &buffer.text, buffer.version)?);
                 }
                 continue;
             }
@@ -1061,9 +1059,6 @@ impl TsgoOverlay {
         let mut update = OverlayUpdate::default();
         let mut scan = Vec::new();
         for (path, change) in changes {
-            if editor.contains(&path) {
-                continue;
-            }
             let Some(name) = path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -1074,8 +1069,13 @@ impl TsgoOverlay {
             if !component && !is_script_module(&name) {
                 continue;
             }
+            // The editor reports its own documents' edits, so a change on disk
+            // never replaces one's shadow. Its imports and its ownership are
+            // still this event's to update, from the buffer.
+            let buffer = editor.get(&path);
             if change == lsp_types::FileChangeType::DELETED {
-                if component
+                if buffer.is_none()
+                    && component
                     && self
                         .entries
                         .get(&path)
@@ -1089,8 +1089,12 @@ impl TsgoOverlay {
                 }
                 continue;
             }
-            let Ok(text) = fs::read_to_string(&path) else {
-                continue;
+            let text = match buffer {
+                Some(buffer) => buffer.text.to_string(),
+                None => match fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(_) => continue,
+                },
             };
             if component {
                 let held = self
@@ -1105,7 +1109,15 @@ impl TsgoOverlay {
                 if owned {
                     self.owned.insert(path.clone());
                 }
-                if self
+                if let Some(buffer) = buffer {
+                    if !held {
+                        update.buffers.push(self.open_or_update(
+                            &path,
+                            &buffer.text,
+                            buffer.version,
+                        )?);
+                    }
+                } else if self
                     .entries
                     .get(&path)
                     .is_none_or(|entry| entry.source_text != text)
@@ -1180,6 +1192,58 @@ impl TsgoOverlay {
             }
         }
         Ok(())
+    }
+
+    /// Whether an editor document's text imports a component this loaded
+    /// project does not hold yet but could: one on disk, or one `is_open`
+    /// names. One lookup per `.svelte` specifier, so it can run on every
+    /// keystroke; [`Self::follow_buffer_imports`] does the work.
+    pub fn has_new_imports(
+        &self,
+        source_path: &Path,
+        text: &str,
+        is_open: impl Fn(&Path) -> bool,
+    ) -> bool {
+        if !self.loaded || !text.contains(".svelte") {
+            return false;
+        }
+        let Some(directory) = source_path.parent() else {
+            return false;
+        };
+        svelte_specifiers(text).into_iter().any(|specifier| {
+            resolve_svelte_specifier(directory, specifier, self.alias_patterns())
+                .iter()
+                .any(|target| {
+                    target.starts_with(&self.mirror_root)
+                        && !self.entries.contains_key(target)
+                        && (target.is_file() || is_open(target))
+                        && fs::canonicalize(target)
+                            .map_or(true, |canonical| !self.entries.contains_key(&canonical))
+                })
+        })
+    }
+
+    /// Copy the components an editor document's buffer imports that this
+    /// project does not hold yet, transitively, as a saved file's imports are
+    /// followed ([`Self::apply_file_changes`]): a new import resolves before
+    /// the file is saved, as it does upstream, where module resolution reads
+    /// the open documents.
+    pub fn follow_buffer_imports(
+        &mut self,
+        source_path: &Path,
+        text: &str,
+        editor: &EditorBuffers,
+    ) -> Result<OverlayUpdate, TsgoOverlayError> {
+        let mut update = OverlayUpdate::default();
+        self.follow_imports(
+            vec![(source_path.to_path_buf(), text.to_string())],
+            editor,
+            &mut update,
+        )?;
+        if !update.opened_or_changed.is_empty() || !update.buffers.is_empty() {
+            self.link_node_modules();
+        }
+        Ok(update)
     }
 
     /// Whether this project owns a file at `path` (canonical): inside its
@@ -5090,6 +5154,54 @@ mod tests {
 
     fn uri_to_path_for_test(uri: &Uri) -> PathBuf {
         crate::uri::uri_to_path(uri.as_str())
+    }
+
+    #[test]
+    fn an_editor_documents_new_import_is_followed_before_and_after_a_save() {
+        use lsp_types::FileChangeType;
+        let workspace = TestWorkspace::new("open-importer");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        write(&root.join("a/tsconfig.json"), "{}");
+        write(&root.join("a/Plain.svelte"), "<p />");
+        write(&root.join("b/tsconfig.json"), "{}");
+        write(&root.join("b/New.svelte"), "<p />");
+        write(&root.join("b/Other.svelte"), "<p />");
+        let plain = root.join("a/Plain.svelte");
+        let mut a =
+            TsgoOverlay::build_nested(&root.join("a"), &root.join("a/tsconfig.json"), &root)
+                .unwrap();
+        let edited = "<script lang=\"ts\">import New from '../b/New.svelte';</script><New />";
+        a.open_or_update(&plain, edited, 2).unwrap();
+        let mut editor = EditorBuffers::default();
+        editor.insert(plain.clone(), Arc::new(edited.to_string()), 2);
+
+        // Typed, not saved: the keystroke path copies the import's target.
+        assert!(a.has_new_imports(&plain, edited, |_| false));
+        let update = a.follow_buffer_imports(&plain, edited, &editor).unwrap();
+        assert_eq!(update.opened_or_changed.len(), 1, "b/New.svelte, from disk");
+        assert!(a.shadow_for_source(&root.join("b/New.svelte")).is_some());
+        assert!(
+            !a.has_new_imports(&plain, edited, |_| false),
+            "nothing left to follow"
+        );
+
+        // Saved with another new import: the event for the open document still
+        // follows its imports (from the buffer), without re-projecting it.
+        let saved = "<script lang=\"ts\">import New from '../b/New.svelte';\nimport Other from '../b/Other.svelte';</script><New /><Other />";
+        a.open_or_update(&plain, saved, 3).unwrap();
+        editor.insert(plain.clone(), Arc::new(saved.to_string()), 3);
+        write(&plain, saved);
+        let update = a
+            .apply_file_changes(&[(plain.clone(), FileChangeType::CHANGED)], &editor)
+            .unwrap()
+            .expect("placeable");
+        assert_eq!(update.opened_or_changed.len(), 1, "only the new copy");
+        assert!(a.shadow_for_source(&root.join("b/Other.svelte")).is_some());
+        assert_eq!(
+            a.source_text(&plain),
+            Some(saved),
+            "the buffer is left alone"
+        );
     }
 
     #[test]

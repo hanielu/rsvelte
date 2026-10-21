@@ -754,6 +754,30 @@ impl TsgoRuntime {
         }
     }
 
+    /// Hand tsgo what an update of `overlays[index]` changed: shadows
+    /// projected from disk are persisted, copies of editor buffers become
+    /// buffers, and removed shadows are closed. The body changes are added
+    /// to `events`, which the caller announces in one batch.
+    fn deliver_update(
+        &mut self,
+        index: usize,
+        update: &tsgo_overlay::OverlayUpdate,
+        events: &mut Vec<(Uri, lsp_types::FileChangeType)>,
+    ) {
+        for shadow in &update.opened_or_changed {
+            self.deliver_disk_shadow(index, shadow, events);
+        }
+        for shadow in &update.buffers {
+            open_shadow(&self.client, &mut self.open_shadows, shadow);
+        }
+        for uri in &update.closed {
+            if self.open_shadows.contains_key(uri.as_str()) {
+                close_shadow(&self.client, &mut self.open_shadows, uri.clone());
+            }
+            events.push((uri.clone(), lsp_types::FileChangeType::DELETED));
+        }
+    }
+
     fn completion_document_context(
         &self,
         params: &serde_json::Value,
@@ -2592,12 +2616,14 @@ impl Server {
             return;
         };
         runtime.activate_project(owner);
-        if svelte {
+        let updated = if svelte {
             // The owner first, then every copy another loaded project keeps for
             // its imports, so no program sees a stale component: upstream's
             // snapshots are shared by every service.
-            let copies = runtime.copies_of(owner, &path);
-            for index in std::iter::once(owner).chain(copies) {
+            let updated = std::iter::once(owner)
+                .chain(runtime.copies_of(owner, &path))
+                .collect::<Vec<_>>();
+            for &index in &updated {
                 match runtime.overlays[index].open_or_update(&path, &text, version) {
                     Ok(shadow) => {
                         open_shadow(&runtime.client, &mut runtime.open_shadows, &shadow);
@@ -2608,6 +2634,7 @@ impl Server {
                     )),
                 }
             }
+            updated
         } else {
             match runtime.overlays[owner].open_plain(&path, &text, version, &language_id) {
                 Ok(shadow) => {
@@ -2618,6 +2645,30 @@ impl Server {
                     path.display()
                 )),
             }
+            vec![owner]
+        };
+        // A new import in the buffer gets its copy now, not when it is saved.
+        let documents = &self.documents;
+        let is_open =
+            |target: &Path| path_to_uri(target).is_some_and(|uri| documents.get(&uri).is_some());
+        let following = updated
+            .into_iter()
+            .filter(|&index| runtime.overlays[index].has_new_imports(&path, &text, is_open))
+            .collect::<Vec<_>>();
+        if !following.is_empty() {
+            let editor = editor_buffers(documents);
+            let mut events = Vec::new();
+            for index in following {
+                match runtime.overlays[index].follow_buffer_imports(&path, &text, &editor) {
+                    Ok(update) => runtime.deliver_update(index, &update, &mut events),
+                    Err(error) => log::warn(format_args!(
+                        "could not follow the imports of {}: {error}",
+                        path.display()
+                    )),
+                }
+            }
+            let _ = runtime.client.notify_watched_files(events);
+            self.preprocess_known_empty = false;
         }
         if loaded {
             self.preprocess_loaded_project(owner);
@@ -2748,16 +2799,7 @@ impl Server {
 
     /// The editor's open documents, as the overlays must see them.
     fn editor_buffers(&self) -> EditorBuffers {
-        let mut buffers = EditorBuffers::default();
-        for document in self.documents.iter() {
-            let path = uri_to_path(document.uri.as_str());
-            buffers.insert(
-                fs::canonicalize(&path).unwrap_or(path),
-                document.shared_text(),
-                document.version,
-            );
-        }
-        buffers
+        editor_buffers(&self.documents)
     }
 
     fn refresh_tsgo_overlays(&mut self, changes: &[(PathBuf, lsp_types::FileChangeType)]) {
@@ -2787,9 +2829,10 @@ impl Server {
                 )),
             }
         }
-        if updates.iter().any(|(_, update)| {
-            !update.opened_or_changed.is_empty() || !update.buffers.is_empty()
-        }) {
+        if updates
+            .iter()
+            .any(|(_, update)| !update.opened_or_changed.is_empty() || !update.buffers.is_empty())
+        {
             self.preprocess_known_empty = false;
         }
         let Some(runtime) = &mut self.tsgo else {
@@ -2797,18 +2840,7 @@ impl Server {
         };
         let mut events = Vec::new();
         for (index, update) in updates {
-            for shadow in &update.opened_or_changed {
-                runtime.deliver_disk_shadow(index, shadow, &mut events);
-            }
-            for shadow in &update.buffers {
-                open_shadow(&runtime.client, &mut runtime.open_shadows, shadow);
-            }
-            for uri in update.closed {
-                if runtime.open_shadows.contains_key(uri.as_str()) {
-                    close_shadow(&runtime.client, &mut runtime.open_shadows, uri.clone());
-                }
-                events.push((uri, lsp_types::FileChangeType::DELETED));
-            }
+            runtime.deliver_update(index, &update, &mut events);
         }
         let _ = runtime.client.notify_watched_files(events);
     }
@@ -4686,6 +4718,20 @@ fn inside_element_body(text: &str, offset: usize, tag: &str) -> bool {
     let open = before.rfind(&format!("<{tag}"));
     let close = before.rfind(&format!("</{tag}"));
     open > close && open.is_some_and(|start| before[start..].contains('>'))
+}
+
+/// The editor's open documents, by canonical path.
+fn editor_buffers(documents: &DocumentStore) -> EditorBuffers {
+    let mut buffers = EditorBuffers::default();
+    for document in documents.iter() {
+        let path = uri_to_path(document.uri.as_str());
+        buffers.insert(
+            fs::canonicalize(&path).unwrap_or(path),
+            document.shared_text(),
+            document.version,
+        );
+    }
+    buffers
 }
 
 fn rename_documents(overlays: &[TsgoOverlay]) -> Vec<RenameDocument<'_>> {
