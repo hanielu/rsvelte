@@ -746,6 +746,182 @@ fn json_id(message: &str) -> &str {
 }
 "###;
 
+/// Compile a fake tsgo that logs every buffer message and request it gets.
+#[cfg(unix)]
+fn traffic_recorder(dir: &Path) -> PathBuf {
+    let source = dir.join("fake_tsgo_traffic.rs");
+    let helper = dir.join("fake-tsgo-traffic");
+    fs::write(&source, FAKE_TSGO_TRAFFIC).expect("write fake tsgo source");
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    assert!(
+        Command::new(rustc)
+            .arg("--edition=2024")
+            .arg(&source)
+            .arg("-o")
+            .arg(&helper)
+            .status()
+            .expect("run rustc")
+            .success(),
+        "compile fake tsgo"
+    );
+    helper
+}
+
+/// The recorded traffic: one `<method> <uri>[ marked]` line per message, where
+/// `marked` says the text carried `RSVELTE_TEST_MARKER`.
+#[cfg(unix)]
+fn traffic(log: &Path) -> Vec<String> {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(unix)]
+fn hover(server: &mut Server, uri: &str) -> Value {
+    let id = server.request(
+        "textDocument/hover",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 1, "character": 5 } }),
+    );
+    server.response(id, Duration::from_secs(5))
+}
+
+/// A project that loads after an editor buffer changed holds a copy of that
+/// component: the copy must carry the buffer, not the file (review s1).
+#[cfg(unix)]
+#[test]
+fn a_project_loaded_later_gets_the_unsaved_buffers_it_copies() {
+    let dir = TestDir::new("late-copy");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = fs::canonicalize(&dir.0).unwrap().join("ws");
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir_all(root.join("b")).unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    fs::write(root.join("a/tsconfig.json"), "{}").unwrap();
+    fs::write(root.join("b/tsconfig.json"), "{}").unwrap();
+    let parent = "<script lang=\"ts\">\nimport Child from '../b/Child.svelte';\n</script>\n<Child count={1} />\n";
+    let child = |kind: &str| {
+        format!(
+            "<script lang=\"ts\">\nlet {{ count }}: {{ count: {kind} }} = $props();\n</script>\n<p>{{count}}</p>\n"
+        )
+    };
+    fs::write(root.join("a/Parent.svelte"), parent).unwrap();
+    fs::write(root.join("b/Child.svelte"), child("number")).unwrap();
+    let mut server = Server::start(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            ("RSVELTE_TEST_MARKER", Path::new("UnsavedMarker")),
+        ],
+    );
+    let child_uri = file_uri(&root.join("b/Child.svelte"));
+    server.open(&child_uri, &child("number"));
+    server.change(&child_uri, 2, &child("UnsavedMarker"));
+    hover(&mut server, &child_uri);
+    let copy = file_uri(&root.join(".svelte-rs/projects/a/tsgo/svelte/b/Child.svelte.tsx"));
+    assert!(
+        !traffic(&log).iter().any(|line| line.contains(&copy)),
+        "project a is not loaded yet"
+    );
+
+    let parent_uri = file_uri(&root.join("a/Parent.svelte"));
+    server.open(&parent_uri, parent);
+    hover(&mut server, &parent_uri);
+    let copied = traffic(&log)
+        .into_iter()
+        .filter(|line| line.contains(&copy))
+        .collect::<Vec<_>>();
+    assert!(
+        copied.iter().any(|line| line.ends_with(" marked")),
+        "a's copy of the child is the unsaved buffer: {copied:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(unix)]
+const FAKE_TSGO_TRAFFIC: &str = r###"
+use std::fs::OpenOptions;
+use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
+
+fn main() {
+    let log = PathBuf::from(std::env::var_os("RSVELTE_TEST_TSGO_LOG").unwrap());
+    let marker = std::env::var("RSVELTE_TEST_MARKER").unwrap_or_else(|_| "\u{0}".to_string());
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    loop {
+        let Some(message) = read_message(&mut input).unwrap() else { return };
+        let method = message
+            .split_once(r#""method":""#)
+            .and_then(|(_, rest)| rest.split('"').next())
+            .unwrap_or("")
+            .to_string();
+        let uri = message
+            .split_once(r#""uri":""#)
+            .and_then(|(_, rest)| rest.split('"').next())
+            .unwrap_or("")
+            .to_string();
+        if !method.is_empty() && method != "initialize" && method != "initialized" {
+            let mut file = OpenOptions::new().create(true).append(true).open(&log).unwrap();
+            let marked = if message.contains(&marker) { " marked" } else { "" };
+            writeln!(file, "{method} {uri}{marked}").unwrap();
+        }
+        if method == "initialize" {
+            let id = json_id(&message);
+            write_message(&mut output, &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"capabilities":{{"positionEncoding":"utf-8","hoverProvider":true,"workspaceSymbolProvider":true,"documentSymbolProvider":true,"referencesProvider":true}}}}}}"#
+            )).unwrap();
+        } else if method == "textDocument/hover" {
+            let id = json_id(&message);
+            write_message(&mut output, &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"contents":{{"kind":"plaintext","value":"recorded"}}}}}}"#
+            )).unwrap();
+        } else if method == "exit" {
+            return;
+        } else if !method.is_empty() && message.contains(r#""id":"#) {
+            let id = json_id(&message);
+            write_message(&mut output, &format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#)).unwrap();
+        }
+    }
+}
+
+fn read_message(reader: &mut impl BufRead) -> io::Result<Option<String>> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 { return Ok(None) }
+        if line == "\r\n" { break }
+        if let Some(value) = line.strip_prefix("Content-Length:") {
+            content_length = Some(value.trim().parse::<usize>().unwrap());
+        }
+    }
+    let mut body = vec![0; content_length.unwrap()];
+    reader.read_exact(&mut body)?;
+    Ok(Some(String::from_utf8(body).unwrap()))
+}
+
+fn write_message(writer: &mut impl Write, body: &str) -> io::Result<()> {
+    write!(writer, "Content-Length: {}\r\n\r\n{body}", body.len())?;
+    writer.flush()
+}
+
+fn json_id(message: &str) -> &str {
+    let rest = message.split_once(r#""id":"#).unwrap().1;
+    if let Some(rest) = rest.strip_prefix('"') {
+        let end = rest.find('"').unwrap();
+        &message[message.len() - rest.len() - 1..message.len() - rest.len() + end + 1]
+    } else {
+        let end = rest.find(|character: char| !character.is_ascii_digit() && character != '-').unwrap_or(rest.len());
+        &rest[..end]
+    }
+}
+"###;
+
 /// `drop_degenerate_folding_ranges` is called on the tsgo half of
 /// `textDocument/foldingRange`, and the unit test beside it calls the function
 /// directly — so removing the call site leaves that suite green. A range whose

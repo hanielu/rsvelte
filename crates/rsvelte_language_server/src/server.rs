@@ -712,10 +712,10 @@ impl TsgoRuntime {
     /// first editor document reaches tsgo (see [`JAVASCRIPT_SHADOW`]). Their
     /// bodies are on disk too, so each open is a content change for tsgo
     /// rather than a new root file.
-    fn activate_project(&mut self, index: usize) {
+    fn activate_project(&mut self, index: usize) -> bool {
         let overlay = &self.overlays[index];
         if !overlay.is_loaded() || !self.activated.insert(overlay.cache_dir().to_path_buf()) {
-            return;
+            return false;
         }
         let shadows = overlay
             .component_shadows()
@@ -726,6 +726,7 @@ impl TsgoRuntime {
         for shadow in &shadows {
             open_shadow(&self.client, &mut self.open_shadows, shadow);
         }
+        true
     }
 
     /// Hand tsgo a shadow `overlays[index]` projected from the file on disk:
@@ -1371,9 +1372,7 @@ impl Server {
             return;
         };
         let source_path = uri_to_path(source_uri.as_str());
-        if let Some(runtime) = &mut self.tsgo {
-            runtime.ensure_project_for(&source_path);
-        }
+        self.ensure_tsgo_project(&source_path);
         let Some(runtime) = &self.tsgo else {
             self.respond(Response::new_ok(
                 request.id,
@@ -1455,9 +1454,7 @@ impl Server {
         };
         let old_path = uri_to_path(old_uri.as_str());
         let new_path = uri_to_path(new_uri.as_str());
-        if let Some(runtime) = &mut self.tsgo {
-            runtime.ensure_project_for(&old_path);
-        }
+        self.ensure_tsgo_project(&old_path);
         let Some(runtime) = &self.tsgo else {
             self.respond_nothing(request.id);
             return;
@@ -2294,7 +2291,7 @@ impl Server {
         let code_action_diagnostic_codes = code_action_diagnostic_codes(&request);
         // A component the editor has not opened belongs to a project that may
         // not be loaded yet; load it so the request can be mapped.
-        if let Some(runtime) = &mut self.tsgo
+        if let Some(runtime) = &self.tsgo
             && let Some(uri) = text_document_request_uri(&request)
             && uri.as_str().ends_with(".svelte")
         {
@@ -2305,7 +2302,7 @@ impl Server {
                 .all(|overlay| overlay.shadow_for_source(&path).is_none())
                 && path.is_file()
             {
-                runtime.ensure_project_for(&path);
+                self.ensure_tsgo_project(&path);
             }
         }
         let Some(runtime) = &self.tsgo else {
@@ -2608,13 +2605,12 @@ impl Server {
         if !svelte && !script {
             return;
         }
+        let Some(owner) = self.ensure_tsgo_project(&path) else {
+            return;
+        };
         let Some(runtime) = &mut self.tsgo else {
             return;
         };
-        let (Some(owner), loaded) = runtime.ensure_project_for(&path) else {
-            return;
-        };
-        runtime.activate_project(owner);
         let updated = if svelte {
             // The owner first, then every copy another loaded project keeps for
             // its imports, so no program sees a stale component: upstream's
@@ -2669,8 +2665,55 @@ impl Server {
             let _ = runtime.client.notify_watched_files(events);
             self.preprocess_known_empty = false;
         }
+    }
+
+    /// Make sure the project that owns `path` is loaded and set up for the
+    /// editor — the one way every caller reaches a project. A project that
+    /// loads now reads its copy of every component from disk, so the open
+    /// editor documents it holds are mirrored into it at once: an unsaved
+    /// buffer must not lose to its file in whichever project loaded last
+    /// (upstream's snapshots are shared by every service). The first time a
+    /// project serves the editor, its JavaScript components open as buffers
+    /// and its members are queued for preprocessing.
+    fn ensure_tsgo_project(&mut self, path: &Path) -> Option<usize> {
+        let runtime = self.tsgo.as_mut()?;
+        let (owner, loaded) = runtime.ensure_project_for(path);
+        let owner = owner?;
         if loaded {
+            self.mirror_editor_buffers(owner);
+        }
+        let activated = self
+            .tsgo
+            .as_mut()
+            .is_some_and(|runtime| runtime.activate_project(owner));
+        if activated {
             self.preprocess_loaded_project(owner);
+        }
+        Some(owner)
+    }
+
+    /// Re-project, from their buffers, the editor's open components that
+    /// `overlays[index]` holds.
+    fn mirror_editor_buffers(&mut self, index: usize) {
+        let Some(runtime) = &mut self.tsgo else {
+            return;
+        };
+        for document in self.documents.iter() {
+            let path = uri_to_path(document.uri.as_str());
+            let path = fs::canonicalize(&path).unwrap_or(path);
+            let overlay = &mut runtime.overlays[index];
+            if !is_svelte_document(&document.language_id, &path)
+                || overlay.shadow_for_source(&path).is_none()
+            {
+                continue;
+            }
+            match overlay.open_or_update(&path, document.text(), document.version) {
+                Ok(shadow) => open_shadow(&runtime.client, &mut runtime.open_shadows, &shadow),
+                Err(error) => log::warn(format_args!(
+                    "could not update tsgo shadow for {}: {error}",
+                    path.display()
+                )),
+            }
         }
     }
 
