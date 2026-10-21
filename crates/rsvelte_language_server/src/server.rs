@@ -78,6 +78,7 @@ use crate::tsgo_response::{
     widen_hover_range_over_string_quotes,
 };
 use crate::uri::{path_to_uri, uri_to_path};
+use crate::watchers::TsgoWatchers;
 use crate::worker::{FileReferenceSource, Job, Outcome, PreprocessedAnalysis, Worker};
 
 pub const SERVER_NAME: &str = "rsvelte-language-server";
@@ -1034,6 +1035,9 @@ struct Server {
     preprocess_known_empty: bool,
     initialize_params: serde_json::Value,
     background: BackgroundProjects,
+    /// tsgo's watcher registrations, so the editor gets only those that add
+    /// an event.
+    tsgo_watchers: TsgoWatchers,
     shutdown_requested: bool,
     exiting: bool,
 }
@@ -1095,6 +1099,7 @@ impl Server {
             preprocess_known_empty: false,
             initialize_params,
             background: BackgroundProjects::new(),
+            tsgo_watchers: TsgoWatchers::default(),
             shutdown_requested: false,
             exiting: false,
         }
@@ -4264,6 +4269,10 @@ impl Server {
                 if let Some(runtime) = &mut self.tsgo {
                     runtime.generation = Some(generation);
                 }
+                // A restarted tsgo registers its watchers again.
+                if let Some(params) = self.tsgo_watchers.reset() {
+                    self.send_watcher_change("client/unregisterCapability", params);
+                }
             }
             TsgoEvent::Message {
                 generation,
@@ -4739,6 +4748,33 @@ impl Server {
                 self.send(notification);
             }
             Message::Request(mut request) => {
+                // A watcher the editor already has covers what tsgo asks
+                // for: answer here rather than register it again.
+                let watchers = match request.method.as_str() {
+                    "client/registerCapability" => {
+                        Some((self.tsgo_watchers.register(&request.params), None))
+                    }
+                    "client/unregisterCapability" => {
+                        Some(self.tsgo_watchers.unregister(&request.params))
+                    }
+                    _ => None,
+                };
+                if let Some((forward, register)) = watchers {
+                    if let Some(params) = register {
+                        self.send_watcher_change("client/registerCapability", params);
+                    }
+                    match forward {
+                        Some(params) => request.params = params,
+                        None => {
+                            if let Some(runtime) = &self.tsgo {
+                                let _ = runtime.client.forward(
+                                    Response::new_ok(request.id, serde_json::Value::Null).into(),
+                                );
+                            }
+                            return;
+                        }
+                    }
+                }
                 if let Some(runtime) = &self.tsgo {
                     let mapper = TsgoResponseMapper::for_overlays_request(
                         &runtime.overlays,
@@ -4765,6 +4801,19 @@ impl Server {
                 self.send(request);
             }
         }
+    }
+
+    /// Register or unregister, with the editor, tsgo watchers this server
+    /// holds for tsgo ([`TsgoWatchers`]); the editor's answer goes nowhere.
+    fn send_watcher_change(&mut self, method: &str, params: serde_json::Value) {
+        if !self.client.dynamic_watched_files {
+            return;
+        }
+        self.next_request_id += 1;
+        let id = RequestId::from(format!("rsvelte-tsgo-watchers-{}", self.next_request_id));
+        self.outgoing
+            .insert(id.clone(), Outgoing::WatchedFilesRegistration);
+        self.send(Request::new(id, method.to_string(), params));
     }
 
     fn start_component_query(

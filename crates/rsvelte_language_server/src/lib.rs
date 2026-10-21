@@ -50,6 +50,7 @@ pub mod tsgo_rename;
 pub mod tsgo_response;
 pub mod tsgo_symbols;
 pub mod uri;
+pub mod watchers;
 pub mod worker;
 
 pub use server::run_stdio;
