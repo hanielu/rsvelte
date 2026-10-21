@@ -428,6 +428,7 @@ impl TsgoOverlay {
     pub fn link_node_modules(&self) {
         let cache_root = self.mirror_root.join(CACHE_DIRECTORY);
         let mut links = BTreeMap::new();
+        let mut packages = Vec::new();
         let mut seen = BTreeSet::new();
         let redundant = self.shadow_dir.join("node_modules");
         if fs::symlink_metadata(&redundant).is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -443,11 +444,18 @@ impl TsgoOverlay {
                 {
                     break;
                 }
+                let Ok(relative) = current.strip_prefix(&self.mirror_root) else {
+                    break;
+                };
                 let target = current.join("node_modules");
-                if let Ok(relative) = current.strip_prefix(&self.mirror_root)
-                    && target.is_dir()
-                {
+                if target.is_dir() {
                     links.insert(self.shadow_dir.join(relative).join("node_modules"), target);
+                }
+                // The package scope: its `type` decides a shadow's module
+                // format, its `imports` a `#` specifier's targets.
+                let package = current.join("package.json");
+                if package.is_file() {
+                    packages.push((self.shadow_dir.join(relative).join("package.json"), package));
                 }
                 directory = current.parent();
             }
@@ -477,6 +485,16 @@ impl TsgoOverlay {
                 continue;
             }
             if let Err(error) = place_symlink(&link, &target, &cache_root) {
+                crate::log::warn(format_args!(
+                    "could not mirror {} for tsgo: {error}",
+                    target.display()
+                ));
+            }
+        }
+        for (link, target) in packages {
+            if fs::symlink_metadata(&link).is_err()
+                && let Err(error) = place_symlink(&link, &target, &cache_root)
+            {
                 crate::log::warn(format_args!(
                     "could not mirror {} for tsgo: {error}",
                     target.display()
@@ -2042,6 +2060,9 @@ impl TsgoOverlay {
         }) {
             mappings.insert(module.clone(), json!([path_for_tsconfig(target)]));
         }
+        for (pattern, targets) in self.package_import_paths() {
+            mappings.insert(pattern, serde_json::Value::Array(targets));
+        }
         let Some(source) = self.source_tsconfig.as_deref() else {
             return (!mappings.is_empty()).then_some(serde_json::Value::Object(mappings));
         };
@@ -2096,12 +2117,118 @@ impl TsgoOverlay {
         (!mappings.is_empty()).then(|| serde_json::Value::Object(mappings))
     }
 
+    /// `package.json` `imports` (`#lib/*`) as `paths`, so a `#` specifier
+    /// resolves from a shadow as it does from its source. TypeScript looks
+    /// the specifier up in the importing file's package scope, which for a
+    /// shadow in the cache is no package of the project's — and even with
+    /// the `package.json` mirrored into the shadow tree, a target resolves
+    /// in that tree, where only components have shadows, not the modules
+    /// (`#lib/utils.js`) beside them. A `paths` entry is tried before the
+    /// package scope, with the source target first and its shadow-tree twin
+    /// second, as for the project's own `paths`. The scopes are those of the
+    /// components the project holds and of the project itself; a pattern two
+    /// of them map differently keeps the project's own mapping, or none.
+    fn package_import_paths(&self) -> BTreeMap<String, Vec<serde_json::Value>> {
+        let package_scope = |directory: &Path| {
+            directory
+                .ancestors()
+                .take_while(|ancestor| ancestor.starts_with(&self.mirror_root))
+                .map(|ancestor| ancestor.join("package.json"))
+                .find(|package| package.is_file())
+        };
+        let own = package_scope(&self.workspace);
+        let mut scopes = self
+            .entries
+            .values()
+            .filter(|entry| entry.is_component())
+            .filter_map(|entry| package_scope(entry.source_path.parent()?))
+            .collect::<BTreeSet<_>>();
+        scopes.extend(own.clone());
+        let conditions = self
+            .source_tsconfig
+            .as_deref()
+            .and_then(|config| resolve_config_value(config, "customConditions"))
+            .and_then(|value| {
+                value.as_array().map(|conditions| {
+                    conditions
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        let mut mappings = BTreeMap::<String, (bool, Vec<serde_json::Value>)>::new();
+        let mut conflicted = BTreeSet::new();
+        for scope in scopes {
+            let Some(directory) = scope.parent() else {
+                continue;
+            };
+            let Some(imports) = fs::read_to_string(&scope)
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|package| package.get("imports").cloned())
+            else {
+                continue;
+            };
+            let is_own = own.as_deref() == Some(scope.as_path());
+            for (pattern, target) in imports.as_object().into_iter().flatten() {
+                let stars = pattern.matches('*').count();
+                if !pattern.starts_with('#') || stars > 1 || pattern.ends_with('/') {
+                    continue;
+                }
+                let mut targets = Vec::new();
+                for relative in import_targets(target, &conditions) {
+                    if !relative.starts_with("./") || relative.matches('*').count() != stars {
+                        continue;
+                    }
+                    let absolute =
+                        path_for_tsconfig(&absolute_normalized(&directory.join(relative)));
+                    if let Ok(inside) = Path::new(&absolute).strip_prefix(&self.mirror_root) {
+                        targets.push(json!(absolute));
+                        targets.push(json!(path_for_tsconfig(&self.shadow_dir.join(inside))));
+                    } else {
+                        targets.push(json!(absolute));
+                    }
+                }
+                if targets.is_empty() {
+                    continue;
+                }
+                match mappings.get(pattern) {
+                    Some((_, existing)) if *existing == targets => {}
+                    Some((true, _)) => {}
+                    Some((false, _)) if !is_own => {
+                        conflicted.insert(pattern.clone());
+                    }
+                    _ => {
+                        mappings.insert(pattern.clone(), (is_own, targets));
+                    }
+                }
+            }
+        }
+        mappings
+            .into_iter()
+            .filter(|(pattern, (own, _))| *own || !conflicted.contains(pattern))
+            .map(|(pattern, (_, targets))| (pattern, targets))
+            .collect()
+    }
+
     /// The project's `baseUrl` as an absolute path, when it declares one.
     fn overlay_base_url(&self) -> Option<String> {
         let source = self.source_tsconfig.as_deref()?;
         let config_dir = source.parent().unwrap_or_else(|| Path::new("."));
         let (value, base) = resolve_config_value_with_base(source, "baseUrl")?;
         Some(rebase_config_spec(value.as_str()?, &base, config_dir))
+    }
+
+    /// Rewrite the overlay config after a `package.json` changed: its
+    /// `imports` are part of `paths` ([`Self::package_import_paths`]).
+    /// Returns whether the config changed, which tsgo has to be told.
+    pub fn refresh_package_imports(&self) -> Result<bool, TsgoOverlayError> {
+        let before = fs::read_to_string(&self.tsconfig_path).ok();
+        self.write_tsconfig()?;
+        self.link_node_modules();
+        Ok(fs::read_to_string(&self.tsconfig_path).ok() != before)
     }
 
     fn write_tsconfig(&self) -> Result<(), TsgoOverlayError> {
@@ -2946,6 +3073,29 @@ fn svelte_specifiers(source: &str) -> Vec<&str> {
             Some(&source[start..end])
         })
         .collect()
+}
+
+/// The relative targets an `imports` entry can resolve to, in the order
+/// TypeScript tries them: a string, the branches of a conditions object
+/// whose condition it matches (`types`, `import`, `default`, and the
+/// project's `customConditions`), or each element of a fallback array.
+fn import_targets<'a>(target: &'a serde_json::Value, conditions: &[String]) -> Vec<&'a str> {
+    match target {
+        serde_json::Value::String(target) => vec![target.as_str()],
+        serde_json::Value::Array(targets) => targets
+            .iter()
+            .flat_map(|target| import_targets(target, conditions))
+            .collect(),
+        serde_json::Value::Object(branches) => branches
+            .iter()
+            .filter(|(condition, _)| {
+                matches!(condition.as_str(), "types" | "import" | "default")
+                    || conditions.iter().any(|custom| custom == *condition)
+            })
+            .flat_map(|(_, target)| import_targets(target, conditions))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// One `paths` pattern: `prefix*suffix` maps onto each target with the `*`
@@ -5402,6 +5552,112 @@ mod tests {
             !overlay.shadow_dir.join("lib/node_modules").is_symlink(),
             "a member keeps the directory real"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_imports_resolve_from_shadows_as_from_their_sources() {
+        let workspace = TestWorkspace::new("package-imports");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        write(&root.join("package.json"), r#"{ "name": "root" }"#);
+        write(
+            &root.join("ui/package.json"),
+            r##"{ "type": "module", "imports": {
+                "#lib": "./src/lib/index.js",
+                "#lib/*": "./src/lib/*",
+                "#cond": { "node": "./node.js", "types": "./types.d.ts", "default": "./default.js" },
+                "#dep": "some-package",
+                "#two/*/*": "./x/*/*"
+            } }"##,
+        );
+        write(&root.join("ui/tsconfig.json"), "{}");
+        write(
+            &root.join("ui/src/lib/Dialog.svelte"),
+            "<script lang=\"ts\">import Button from '#lib/Button.svelte';</script>",
+        );
+        write(&root.join("ui/src/lib/Button.svelte"), "<p />");
+        let overlay =
+            TsgoOverlay::build_nested(&root.join("ui"), &root.join("ui/tsconfig.json"), &root)
+                .unwrap();
+        let paths = overlay_config(&overlay)["compilerOptions"]["paths"].clone();
+        let twin = |relative: &str| path_for_tsconfig(&overlay.shadow_dir.join(relative));
+        let source = |relative: &str| path_for_tsconfig(&root.join(relative));
+        assert_eq!(
+            paths["#lib/*"],
+            json!([source("ui/src/lib/*"), twin("ui/src/lib/*")]),
+            "the source first, its shadow-tree twin second"
+        );
+        assert_eq!(
+            paths["#lib"],
+            json!([source("ui/src/lib/index.js"), twin("ui/src/lib/index.js")])
+        );
+        assert_eq!(
+            paths["#cond"],
+            json!([
+                source("ui/types.d.ts"),
+                twin("ui/types.d.ts"),
+                source("ui/default.js"),
+                twin("ui/default.js")
+            ]),
+            "only the conditions TypeScript matches, in order"
+        );
+        assert!(
+            paths.get("#dep").is_none(),
+            "a package target is left to TypeScript"
+        );
+        assert!(paths.get("#two/*/*").is_none(), "paths take one wildcard");
+        assert_eq!(
+            fs::read_link(overlay.shadow_dir.join("ui/package.json")).ok(),
+            Some(root.join("ui/package.json")),
+            "the package scope is mirrored too"
+        );
+        assert!(
+            fs::symlink_metadata(overlay.shadow_dir.join("package.json")).is_err(),
+            "the mirror root's own is found through the cache's ancestry"
+        );
+    }
+
+    #[test]
+    fn a_package_import_two_scopes_map_differently_keeps_the_projects_own() {
+        let workspace = TestWorkspace::new("package-imports-conflict");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        for package in ["app", "lib", "other"] {
+            write(
+                &root.join(package).join("package.json"),
+                &format!(
+                    r##"{{ "imports": {{ "#x": "./{package}.js", "#{package}": "./own.js" }} }}"##
+                ),
+            );
+        }
+        write(&root.join("app/tsconfig.json"), "{}");
+        write(
+            &root.join("app/App.svelte"),
+            "<script lang=\"ts\">import A from '../lib/A.svelte';import B from '../other/B.svelte';</script>",
+        );
+        write(&root.join("lib/A.svelte"), "<p />");
+        write(&root.join("other/B.svelte"), "<p />");
+        let overlay =
+            TsgoOverlay::build_nested(&root.join("app"), &root.join("app/tsconfig.json"), &root)
+                .unwrap();
+        let paths = overlay_config(&overlay)["compilerOptions"]["paths"].clone();
+        assert_eq!(
+            paths["#x"][0],
+            json!(path_for_tsconfig(&root.join("app/app.js")))
+        );
+        assert_eq!(
+            paths["#lib"][0],
+            json!(path_for_tsconfig(&root.join("lib/own.js")))
+        );
+
+        // Without the project's own mapping, two copies' scopes that disagree
+        // keep none.
+        fs::remove_file(root.join("app/package.json")).unwrap();
+        let overlay =
+            TsgoOverlay::build_nested(&root.join("app"), &root.join("app/tsconfig.json"), &root)
+                .unwrap();
+        let paths = overlay_config(&overlay)["compilerOptions"]["paths"].clone();
+        assert!(paths.get("#x").is_none());
+        assert!(paths.get("#other").is_some());
     }
 
     #[test]

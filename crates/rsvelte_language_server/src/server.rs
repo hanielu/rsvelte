@@ -2265,6 +2265,16 @@ impl Server {
                                 .values()
                                 .any(|dependencies| dependencies.contains(&path))
                         });
+                        let package_changed = changes.iter().any(|change| {
+                            let path = uri_to_path(change.uri.as_str());
+                            path.file_name().is_some_and(|name| name == "package.json")
+                                && !path
+                                    .components()
+                                    .any(|component| component.as_os_str() == "node_modules")
+                        });
+                        if package_changed && !project_changed && !dependency_changed {
+                            self.refresh_package_imports();
+                        }
                         if project_changed || dependency_changed {
                             self.invalidate_project_config();
                             self.rebuild_tsgo_overlays();
@@ -3465,6 +3475,34 @@ impl Server {
                 runtime.open_reachable_javascript(index, roots.iter().cloned());
             }
         }
+    }
+
+    /// A `package.json` changed: its `imports` are part of the overlay
+    /// configs' `paths`, so tsgo rereads a config whose text changed.
+    fn refresh_package_imports(&mut self) {
+        let Some(runtime) = &self.tsgo else {
+            return;
+        };
+        let mut events = Vec::new();
+        for overlay in runtime
+            .overlays
+            .iter()
+            .filter(|overlay| overlay.is_loaded())
+        {
+            match overlay.refresh_package_imports() {
+                Ok(true) => {
+                    if let Some(uri) = path_to_uri(overlay.tsconfig_path()) {
+                        events.push((uri, lsp_types::FileChangeType::CHANGED));
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => log::warn(format_args!(
+                    "could not rewrite the tsgo config for {}: {error}",
+                    overlay.workspace().display()
+                )),
+            }
+        }
+        let _ = runtime.client.notify_watched_files(events);
     }
 
     fn rebuild_tsgo_overlays(&mut self) {
