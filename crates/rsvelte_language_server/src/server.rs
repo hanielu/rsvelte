@@ -436,8 +436,9 @@ enum ProjectLocation {
 
 /// The project that owns `source`: its nearest config within the workspace
 /// folder containing it (`findTsConfigPath`, `utils.ts:146-167`), or the
-/// folder's own configless project when it has none. `None` outside every
-/// workspace folder.
+/// folder's own project when it has none — which, when the folder has a
+/// config, means `source` is a dependency's file under `node_modules`, where
+/// the config search stops. `None` outside every workspace folder.
 fn locate_project(overlays: &[TsgoOverlay], source: &Path) -> Option<ProjectLocation> {
     let mirror_root = overlays
         .iter()
@@ -465,9 +466,7 @@ fn locate_project(overlays: &[TsgoOverlay], source: &Path) -> Option<ProjectLoca
         ),
         None => overlays
             .iter()
-            .position(|overlay| {
-                overlay.workspace() == mirror_root && overlay.source_tsconfig().is_none()
-            })
+            .position(|overlay| overlay.workspace() == mirror_root)
             .map(ProjectLocation::Existing),
     }
 }
@@ -5623,6 +5622,29 @@ mod nested_project_tests {
             Some(ProjectLocation::Existing(1))
         );
         assert!(overlays[1].owns(&root.join("docs/src/Page.svelte")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_dependencys_component_belongs_to_the_folders_project() {
+        // A library component opened from `node_modules`, where the config
+        // search stops, in a folder that has a config of its own.
+        let root = workspace("locate-node-modules");
+        write(&root.join("tsconfig.json"), "{}");
+        write(&root.join("node_modules/pkg/dist/Comp.svelte"), "<p />");
+        write(&root.join("app/tsconfig.json"), "{}");
+        write(&root.join("app/node_modules/dep/Dep.svelte"), "<p />");
+        let overlays = vec![TsgoOverlay::build_deferred(&root, None).unwrap()];
+        for library in [
+            "node_modules/pkg/dist/Comp.svelte",
+            "app/node_modules/dep/Dep.svelte",
+        ] {
+            assert_eq!(
+                locate_project(&overlays, &root.join(library)),
+                Some(ProjectLocation::Existing(0)),
+                "{library}"
+            );
+        }
         let _ = fs::remove_dir_all(&root);
     }
 

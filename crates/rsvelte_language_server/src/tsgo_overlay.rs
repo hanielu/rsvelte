@@ -379,15 +379,27 @@ impl TsgoOverlay {
     /// Each such directory is mirrored as a symlink at its owner's position
     /// in the shadow tree and in the config's ancestry, so both lookups walk
     /// the same chain as from the source. `**` never matches `node_modules`,
-    /// so no package joins the project's root files.
+    /// so no package joins the project's root files. The mirror root's own
+    /// `node_modules` needs no link: the cache lives in the mirror root, so
+    /// every lookup from it ends there anyway — and a link there would keep a
+    /// dependency's component (`node_modules/pkg/Comp.svelte`, opened from a
+    /// definition) out of the shadow tree.
     pub fn link_node_modules(&self) {
         let cache_root = self.mirror_root.join(CACHE_DIRECTORY);
         let mut links = BTreeMap::new();
         let mut seen = BTreeSet::new();
+        let redundant = self.shadow_dir.join("node_modules");
+        if fs::symlink_metadata(&redundant).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            let _ = fs::remove_file(&redundant);
+        }
         for entry in self.entries.values().filter(|entry| entry.is_component()) {
             let mut directory = entry.source_path.parent();
             while let Some(current) = directory {
-                if !current.starts_with(&self.mirror_root) || !seen.insert(current.to_path_buf()) {
+                if current == self.mirror_root
+                    || !current.starts_with(&self.mirror_root)
+                    || !seen.insert(current.to_path_buf())
+                {
                     break;
                 }
                 let target = current.join("node_modules");
@@ -2051,6 +2063,21 @@ impl TsgoOverlay {
                 path: shadow_path.to_path_buf(),
                 reason: "shadow has no parent directory",
             })?;
+        // A dependency's file under a `node_modules` this overlay mirrors
+        // ([`Self::link_node_modules`]): the shadow needs a real directory
+        // there, so the mirror link (this overlay's own) gives way to it.
+        if let Ok(relative) = parent.strip_prefix(&self.shadow_dir) {
+            let mut current = self.shadow_dir.clone();
+            for component in relative.components() {
+                current.push(component);
+                if component.as_os_str() == "node_modules"
+                    && fs::symlink_metadata(&current)
+                        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    fs::remove_file(&current)?;
+                }
+            }
+        }
         reject_symlink_components(parent, &self.cache_dir)?;
         fs::create_dir_all(parent)?;
         reject_symlink_components(parent, &self.cache_dir)?;
@@ -5082,7 +5109,8 @@ mod tests {
         );
         assert_eq!(
             linked(overlay.shadow_dir.join("node_modules")),
-            Some(root.join("node_modules"))
+            None,
+            "the mirror root's own is found through the cache's ancestry"
         );
         assert_eq!(
             linked(cache_root.join("projects/admin/node_modules")),
@@ -5101,6 +5129,44 @@ mod tests {
                 .shadow_dir
                 .join("admin/node_modules/admin-pkg/index.d.ts")
                 .is_file()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dependencys_component_gets_a_real_shadow_directory() {
+        let workspace = TestWorkspace::new("node-modules-member");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        write(&root.join("tsconfig.json"), "{}");
+        write(&root.join("src/App.svelte"), "<p />");
+        write(&root.join("node_modules/pkg/dist/Comp.svelte"), "<p />");
+        write(&root.join("lib/Card.svelte"), "<p />");
+        write(&root.join("lib/node_modules/dep/Dep.svelte"), "<p />");
+        let mut overlay = build_overlay(&root).unwrap();
+        assert!(
+            overlay.shadow_dir.join("lib/node_modules").is_symlink(),
+            "a member's own package directory is mirrored"
+        );
+        for library in [
+            "node_modules/pkg/dist/Comp.svelte",
+            "lib/node_modules/dep/Dep.svelte",
+        ] {
+            let shadow = overlay
+                .open_or_update(&root.join(library), "<p />", 1)
+                .unwrap_or_else(|error| panic!("{library}: {error}"));
+            let shadow_path = crate::uri::uri_to_path(shadow.shadow_uri.as_str());
+            assert!(shadow_path.starts_with(&overlay.shadow_dir), "{library}");
+            assert!(shadow_path.parent().unwrap().is_dir());
+        }
+        assert!(!overlay.shadow_dir.join("lib/node_modules").is_symlink());
+        assert!(
+            !root.join("lib/node_modules/dep/Dep.svelte.tsx").exists(),
+            "nothing is written into the dependency"
+        );
+        overlay.link_node_modules();
+        assert!(
+            !overlay.shadow_dir.join("lib/node_modules").is_symlink(),
+            "a member keeps the directory real"
         );
     }
 
