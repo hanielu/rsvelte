@@ -245,6 +245,9 @@ pub struct TsgoOverlay {
     /// member is a copy of a component another project owns, there only so an
     /// import of it resolves inside this project's shadow tree.
     owned: BTreeSet<PathBuf>,
+    /// Components an import names that do not exist (yet): creating one
+    /// makes it a copy (see [`Self::apply_file_changes`]).
+    missing: BTreeSet<PathBuf>,
 }
 
 impl fmt::Debug for TsgoOverlay {
@@ -466,6 +469,7 @@ impl TsgoOverlay {
             by_shadow: BTreeMap::new(),
             loaded: false,
             owned: BTreeSet::new(),
+            missing: BTreeSet::new(),
         };
         overlay.materialize_support_files()?;
         if load {
@@ -900,6 +904,181 @@ impl TsgoOverlay {
         Ok(update)
     }
 
+    /// Apply the file events an editor reports to a loaded project, touching
+    /// only the files they name: a component it holds is re-projected or
+    /// removed, a new component it owns joins, and a changed component or
+    /// owned module has its `.svelte` imports followed for new copies — the
+    /// cost of a save no longer grows with the project. `None` asks for a
+    /// [`Self::refresh_except`] instead, for an event this cannot place (a
+    /// directory, say). A copy no import needs any more stays until then:
+    /// one extra root file, never a wrong answer.
+    pub fn apply_file_changes(
+        &mut self,
+        changes: &[(PathBuf, lsp_types::FileChangeType)],
+        editor_open: impl Fn(&Path) -> bool,
+    ) -> Result<Option<OverlayUpdate>, TsgoOverlayError> {
+        let changes = changes
+            .iter()
+            .map(|(path, change)| (canonical_event_path(path), *change))
+            .filter(|(path, _)| path.starts_with(&self.mirror_root))
+            .collect::<Vec<_>>();
+        // Decided before anything changes, so the fallback never drops an
+        // update this pass already made.
+        // A hidden or `node_modules` path holds no member (`walk_owned_files`).
+        let unplaceable = |path: &Path| {
+            (path.is_dir() || path.extension().is_none())
+                && !path
+                    .strip_prefix(&self.mirror_root)
+                    .unwrap_or(path)
+                    .components()
+                    .any(|component| {
+                        let name = component.as_os_str().to_string_lossy();
+                        name.starts_with('.') || name == "node_modules"
+                    })
+        };
+        if changes.iter().any(|(path, _)| unplaceable(path)) {
+            return Ok(None);
+        }
+        let mut update = OverlayUpdate::default();
+        let mut scan = Vec::new();
+        for (path, change) in changes {
+            if editor_open(&path) {
+                continue;
+            }
+            let Some(name) = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            let component = name.ends_with(".svelte");
+            if !component && !is_script_module(&name) {
+                continue;
+            }
+            if change == lsp_types::FileChangeType::DELETED {
+                if component
+                    && self
+                        .entries
+                        .get(&path)
+                        .is_some_and(ShadowState::is_component)
+                {
+                    if let Some(entry) = self.entries.get(&path) {
+                        update.closed.push(entry.document.shadow_uri.clone());
+                    }
+                    self.owned.remove(&path);
+                    self.remove_source(&path)?;
+                }
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if component {
+                let held = self
+                    .entries
+                    .get(&path)
+                    .is_some_and(ShadowState::is_component);
+                let owned = !held && self.owns_location(&path);
+                let wanted = self.missing.remove(&path);
+                if !(held || owned || wanted) {
+                    continue;
+                }
+                if owned {
+                    self.owned.insert(path.clone());
+                }
+                if self
+                    .entries
+                    .get(&path)
+                    .is_none_or(|entry| entry.source_text != text)
+                {
+                    let version = self
+                        .entries
+                        .get(&path)
+                        .map_or(0, |entry| entry.document.version.saturating_add(1));
+                    update
+                        .opened_or_changed
+                        .push(self.open_or_update(&path, &text, version)?);
+                }
+                scan.push((path, text));
+            } else if self.owns_location(&path) {
+                scan.push((path, text));
+            }
+        }
+        self.follow_imports(scan, &editor_open, &mut update)?;
+        Ok(Some(update))
+    }
+
+    /// Project, as copies, the components `sources` import that this
+    /// project does not hold yet, transitively.
+    fn follow_imports(
+        &mut self,
+        mut pending: Vec<(PathBuf, String)>,
+        editor_open: &impl Fn(&Path) -> bool,
+        update: &mut OverlayUpdate,
+    ) -> Result<(), TsgoOverlayError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let aliases = self.alias_patterns();
+        while let Some((path, text)) = pending.pop() {
+            let Some(directory) = path.parent() else {
+                continue;
+            };
+            for specifier in svelte_specifiers(&text) {
+                for target in resolve_svelte_specifier(directory, specifier, &aliases) {
+                    let Ok(target) = fs::canonicalize(&target) else {
+                        if target.starts_with(&self.mirror_root) {
+                            self.missing.insert(target);
+                        }
+                        continue;
+                    };
+                    if !target.starts_with(&self.mirror_root)
+                        || !target.is_file()
+                        || self.entries.contains_key(&target)
+                        || editor_open(&target)
+                    {
+                        continue;
+                    }
+                    let Ok(text) = fs::read_to_string(&target) else {
+                        continue;
+                    };
+                    update
+                        .opened_or_changed
+                        .push(self.open_or_update(&target, &text, 0)?);
+                    pending.push((target, text));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this project owns a file at `path` (canonical): inside its
+    /// workspace, with no config, `node_modules` or hidden directory between
+    /// (see `walk_owned_files`).
+    fn owns_location(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.workspace) else {
+            return false;
+        };
+        let mut directory = self.workspace.clone();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            let name = component.as_os_str().to_string_lossy();
+            if name.starts_with('.') || name == "node_modules" {
+                return false;
+            }
+            if components.peek().is_none() {
+                return true;
+            }
+            directory.push(component);
+            if directory.join("tsconfig.json").is_file()
+                || directory.join("jsconfig.json").is_file()
+            {
+                return false;
+            }
+        }
+        false
+    }
+
     /// Every `.svelte` source this project needs: the ones it owns — its
     /// config is their nearest one, so a subdirectory with a config of its own
     /// is left to that project, as upstream keys a service by each document's
@@ -918,6 +1097,7 @@ impl TsgoOverlay {
             .collect::<BTreeSet<_>>();
         self.owned = discovered.clone();
         let aliases = self.alias_patterns();
+        let mut missing = BTreeSet::new();
         let mut pending = discovered.iter().cloned().collect::<Vec<_>>();
         pending.extend(owned_modules);
         while let Some(path) = pending.pop() {
@@ -933,6 +1113,9 @@ impl TsgoOverlay {
             for specifier in svelte_specifiers(&text) {
                 for target in resolve_svelte_specifier(directory, specifier, &aliases) {
                     let Ok(target) = fs::canonicalize(&target) else {
+                        if target.starts_with(&self.mirror_root) {
+                            missing.insert(target);
+                        }
                         continue;
                     };
                     if target.starts_with(&self.mirror_root)
@@ -944,6 +1127,7 @@ impl TsgoOverlay {
                 }
             }
         }
+        self.missing = missing;
         discovered
     }
 
@@ -2318,6 +2502,29 @@ fn resolve_svelte_specifier(
     candidates
 }
 
+/// A script module `walk_owned_files` collects: not a declaration file.
+fn is_script_module(name: &str) -> bool {
+    !name.ends_with(".d.ts")
+        && [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
+            .iter()
+            .any(|extension| name.ends_with(extension))
+}
+
+/// An event's path in the canonical form the overlay keys sources by, also
+/// for a file that no longer exists (its directory usually does).
+fn canonical_event_path(path: &Path) -> PathBuf {
+    let path = absolute_normalized(path);
+    if let Ok(canonical) = fs::canonicalize(&path) {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            fs::canonicalize(parent).map_or(path.clone(), |parent| parent.join(name))
+        }
+        _ => path,
+    }
+}
+
 /// The files a project at `dir` owns: subdirectories carrying their own
 /// `tsconfig.json` / `jsconfig.json` belong to that project, and
 /// `node_modules` and hidden entries are skipped as the workspace walker
@@ -2346,11 +2553,7 @@ fn walk_owned_files(dir: &Path, components: &mut Vec<PathBuf>, modules: &mut Vec
         } else if file_type.is_file() {
             if name.ends_with(".svelte") {
                 components.push(path);
-            } else if !name.ends_with(".d.ts")
-                && [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
-                    .iter()
-                    .any(|extension| name.ends_with(extension))
-            {
+            } else if is_script_module(&name) {
                 modules.push(path);
             }
         }
@@ -4458,6 +4661,147 @@ mod tests {
             parallel
                 .parser_error(&root.join("src/Broken.svelte"))
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn file_events_touch_only_the_files_they_name() {
+        use lsp_types::FileChangeType;
+        let workspace = TestWorkspace::new("file-events");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        write(&root.join("app/tsconfig.json"), "{}");
+        write(&root.join("app/A.svelte"), "<p>a</p>");
+        write(&root.join("app/B.svelte"), "<p>b</p>");
+        write(&root.join("app/nested/tsconfig.json"), "{}");
+        write(
+            &root.join("lib/Shared.svelte"),
+            "<script lang=\"ts\">import Leaf from './Leaf.svelte';</script>",
+        );
+        write(&root.join("lib/Leaf.svelte"), "<p />");
+        let mut overlay =
+            TsgoOverlay::build_nested(&root.join("app"), &root.join("app/tsconfig.json"), &root)
+                .unwrap();
+        let none = |_: &Path| false;
+        let changed = |overlay: &mut TsgoOverlay, path: &Path, change| {
+            overlay
+                .apply_file_changes(&[(path.to_path_buf(), change)], none)
+                .unwrap()
+                .expect("placeable")
+        };
+
+        write(&root.join("app/A.svelte"), "<p>a2</p>");
+        let update = changed(
+            &mut overlay,
+            &root.join("app/A.svelte"),
+            FileChangeType::CHANGED,
+        );
+        assert_eq!(update.opened_or_changed.len(), 1);
+        assert_eq!(
+            overlay.source_text(&root.join("app/A.svelte")),
+            Some("<p>a2</p>")
+        );
+        assert!(
+            changed(
+                &mut overlay,
+                &root.join("README.md"),
+                FileChangeType::CHANGED
+            )
+            .opened_or_changed
+            .is_empty()
+        );
+
+        write(&root.join("app/C.svelte"), "<p>c</p>");
+        let update = changed(
+            &mut overlay,
+            &root.join("app/C.svelte"),
+            FileChangeType::CREATED,
+        );
+        assert_eq!(update.opened_or_changed.len(), 1);
+        assert!(overlay.owns(&root.join("app/C.svelte")));
+        write(&root.join("app/nested/D.svelte"), "<p>d</p>");
+        changed(
+            &mut overlay,
+            &root.join("app/nested/D.svelte"),
+            FileChangeType::CREATED,
+        );
+        assert!(
+            overlay
+                .shadow_for_source(&root.join("app/nested/D.svelte"))
+                .is_none(),
+            "a nested config's component is its own project's"
+        );
+
+        // A new import of another project's component brings a copy, and its
+        // imports too.
+        write(
+            &root.join("app/B.svelte"),
+            "<script lang=\"ts\">import Shared from '../lib/Shared.svelte';\nimport Soon from './Soon.svelte';</script>",
+        );
+        let update = changed(
+            &mut overlay,
+            &root.join("app/B.svelte"),
+            FileChangeType::CHANGED,
+        );
+        assert_eq!(update.opened_or_changed.len(), 3, "B, Shared, Leaf");
+        assert!(
+            overlay
+                .shadow_for_source(&root.join("lib/Leaf.svelte"))
+                .is_some()
+        );
+        assert!(!overlay.owns(&root.join("lib/Shared.svelte")));
+        // ...and an import of a file that does not exist yet resolves once it does.
+        write(&root.join("app/Soon.svelte"), "<p />");
+        changed(
+            &mut overlay,
+            &root.join("app/Soon.svelte"),
+            FileChangeType::CREATED,
+        );
+        assert!(
+            overlay
+                .shadow_for_source(&root.join("app/Soon.svelte"))
+                .is_some()
+        );
+
+        overlay.persist_body(&root.join("app/C.svelte")).unwrap();
+        let body = overlay.shadow_dir.join("app/C.svelte.tsx");
+        assert!(body.is_file());
+        fs::remove_file(root.join("app/C.svelte")).unwrap();
+        let update = changed(
+            &mut overlay,
+            &root.join("app/C.svelte"),
+            FileChangeType::DELETED,
+        );
+        assert_eq!(update.closed.len(), 1);
+        assert!(!body.exists());
+        assert!(!overlay.owns(&root.join("app/C.svelte")));
+
+        write(&root.join("app/A.svelte"), "<p>a3</p>");
+        let a = root.join("app/A.svelte");
+        let skipped = overlay
+            .apply_file_changes(&[(a.clone(), FileChangeType::CHANGED)], |path| path == a)
+            .unwrap()
+            .unwrap();
+        assert!(
+            skipped.opened_or_changed.is_empty(),
+            "an editor buffer wins"
+        );
+
+        assert!(
+            overlay
+                .apply_file_changes(&[(root.join("app"), FileChangeType::CHANGED)], none)
+                .unwrap()
+                .is_none(),
+            "a directory needs a full refresh"
+        );
+        assert!(
+            overlay
+                .apply_file_changes(
+                    &[(root.join("app/node_modules/x"), FileChangeType::CREATED)],
+                    none
+                )
+                .unwrap()
+                .is_some(),
+            "a node_modules path holds no member"
         );
     }
 

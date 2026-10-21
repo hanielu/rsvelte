@@ -2048,7 +2048,11 @@ impl Server {
                             self.rebuild_tsgo_overlays();
                             self.restart_preprocessing();
                         } else if !changes.is_empty() {
-                            self.refresh_tsgo_overlays();
+                            let changes = changes
+                                .iter()
+                                .map(|change| (uri_to_path(change.uri.as_str()), change.typ))
+                                .collect::<Vec<_>>();
+                            self.refresh_tsgo_overlays(&changes);
                         }
                         if let Some(runtime) = &self.tsgo {
                             let _ = runtime.client.forward(child_notification.into());
@@ -2742,7 +2746,7 @@ impl Server {
         }
     }
 
-    fn refresh_tsgo_overlays(&mut self) {
+    fn refresh_tsgo_overlays(&mut self, changes: &[(PathBuf, lsp_types::FileChangeType)]) {
         let editor_open = self
             .documents
             .iter()
@@ -2763,7 +2767,13 @@ impl Server {
             .enumerate()
             .filter(|(_, overlay)| overlay.is_loaded())
         {
-            match overlay.refresh_except(|source| editor_open.contains(source)) {
+            let editor_open = |source: &Path| editor_open.contains(source);
+            let update = match overlay.apply_file_changes(changes, editor_open) {
+                Ok(Some(update)) => Ok(update),
+                Ok(None) => overlay.refresh_except(editor_open),
+                Err(error) => Err(error),
+            };
+            match update {
                 Ok(update) => updates.push((index, update)),
                 Err(error) => log::warn(format_args!(
                     "could not refresh tsgo overlay for {}: {error}",
