@@ -683,6 +683,17 @@ impl TsgoOverlay {
 
     /// Reconcile eager shadows with the current workspace tree.
     pub fn refresh(&mut self) -> Result<OverlayUpdate, TsgoOverlayError> {
+        self.refresh_except(|_| false)
+    }
+
+    /// [`Self::refresh`], leaving alone every source `editor_open` names: its
+    /// shadow is the editor's buffer, which a change on disk does not replace
+    /// (the editor reports its own edits), so re-projecting the file would
+    /// hand tsgo stale text until the next keystroke.
+    pub fn refresh_except(
+        &mut self,
+        editor_open: impl Fn(&Path) -> bool,
+    ) -> Result<OverlayUpdate, TsgoOverlayError> {
         let discovered = self.discover_sources();
         let known = self
             .entries
@@ -693,12 +704,18 @@ impl TsgoOverlay {
         let mut update = OverlayUpdate::default();
 
         for removed in known.difference(&discovered) {
+            if editor_open(removed) {
+                continue;
+            }
             if let Some(entry) = self.entries.get(removed) {
                 update.closed.push(entry.document.shadow_uri.clone());
             }
             self.remove_source(removed)?;
         }
         for path in &discovered {
+            if editor_open(path) {
+                continue;
+            }
             let text = fs::read_to_string(path)?;
             let unchanged = self
                 .entries
@@ -3031,6 +3048,36 @@ mod tests {
         assert!(overlay.close(&app).unwrap().is_none());
         assert!(overlay.shadow_for_source(&app).is_none());
         assert!(!overlay.shadow_dir.join("src").exists());
+    }
+
+    #[test]
+    fn a_refresh_leaves_an_editor_buffer_alone() {
+        let workspace = TestWorkspace::new("refresh-editor");
+        let app = workspace.0.join("src/App.svelte");
+        let other = workspace.0.join("src/Other.svelte");
+        write(&app, "<p>disk</p>");
+        write(&other, "<p>other</p>");
+        let mut overlay = build_overlay(&workspace.0).unwrap();
+        overlay.open_or_update(&app, "<p>buffer</p>", 3).unwrap();
+        write(&other, "<p>changed</p>");
+        let app_path = fs::canonicalize(&app).unwrap();
+
+        let update = overlay
+            .refresh_except(|source| source == app_path.as_path())
+            .unwrap();
+        assert_eq!(update.opened_or_changed.len(), 1, "only the closed file");
+        assert_eq!(overlay.source_text(&app), Some("<p>buffer</p>"));
+        assert_eq!(overlay.source_text(&other), Some("<p>changed</p>"));
+
+        fs::remove_file(&app).unwrap();
+        let update = overlay
+            .refresh_except(|source| source == app_path.as_path())
+            .unwrap();
+        assert!(
+            update.closed.is_empty(),
+            "an unsaved buffer outlives its file"
+        );
+        assert!(overlay.shadow_for_source(&app_path).is_some());
     }
 
     #[test]

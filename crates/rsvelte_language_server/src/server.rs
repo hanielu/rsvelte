@@ -2518,11 +2518,19 @@ impl Server {
     }
 
     fn refresh_tsgo_overlays(&mut self) {
+        let editor_open = self
+            .documents
+            .iter()
+            .map(|document| {
+                let path = uri_to_path(document.uri.as_str());
+                fs::canonicalize(&path).unwrap_or(path)
+            })
+            .collect::<HashSet<_>>();
         let Some(runtime) = &mut self.tsgo else {
             return;
         };
         for overlay in &mut runtime.overlays {
-            match overlay.refresh() {
+            match overlay.refresh_except(|source| editor_open.contains(source)) {
                 Ok(update) => {
                     for shadow in update.opened_or_changed {
                         let _ = runtime.client.change_buffer(OpenBuffer::new(
