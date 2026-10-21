@@ -41,8 +41,8 @@ use crate::completions::TRIGGER_CHARACTERS;
 use crate::document::{Document, DocumentStore};
 use crate::log;
 use crate::preprocess_sidecar::{
-    PreprocessEvent, PreprocessInput, PreprocessSidecar, PreprocessSidecarConfig,
-    find_preprocess_config,
+    PreprocessConfigCache, PreprocessEvent, PreprocessInput, PreprocessSidecar,
+    PreprocessSidecarConfig,
 };
 use crate::settings::Settings;
 use crate::text::LineIndex;
@@ -826,6 +826,14 @@ struct Server {
     preprocess_documents: HashMap<PathBuf, PreprocessDocumentState>,
     preprocess_dependencies: HashMap<PathBuf, HashSet<PathBuf>>,
     watched_preprocess_directories: HashSet<PathBuf>,
+    /// Which Svelte config preprocesses each directory's documents.
+    preprocess_configs: PreprocessConfigCache,
+    /// No shadow and no open document has a Svelte config, so there is no
+    /// sidecar to start. Without it every keystroke re-asks for every shadow.
+    /// Cleared whenever the answer can change: a config, setting or folder
+    /// change, a new project, a new source, or an editor document whose
+    /// directory has a config.
+    preprocess_known_empty: bool,
     initialize_params: serde_json::Value,
     shutdown_requested: bool,
     exiting: bool,
@@ -883,6 +891,8 @@ impl Server {
             preprocess_documents: HashMap::new(),
             preprocess_dependencies: HashMap::new(),
             watched_preprocess_directories: HashSet::new(),
+            preprocess_configs: PreprocessConfigCache::default(),
+            preprocess_known_empty: false,
             initialize_params,
             shutdown_requested: false,
             exiting: false,
@@ -2543,6 +2553,8 @@ impl Server {
     }
 
     fn invalidate_project_config(&mut self) {
+        self.preprocess_configs.clear();
+        self.preprocess_known_empty = false;
         self.worker.submit(Job::ClearCaches);
         if !self.client.pull_diagnostics {
             self.relint_open_documents();
@@ -2562,7 +2574,12 @@ impl Server {
         let Some(runtime) = &mut self.tsgo else {
             return;
         };
-        runtime.ensure_overlay_for(&path);
+        if runtime.ensure_overlay_for(&path) {
+            self.preprocess_known_empty = false;
+        }
+        let Some(runtime) = &mut self.tsgo else {
+            return;
+        };
         let svelte = is_svelte_document(&language_id, &path);
         if svelte || is_typescript_or_javascript(&language_id, &path) {
             runtime.activate_project_for(&path);
@@ -2712,6 +2729,15 @@ impl Server {
                 )),
             }
         }
+        if updates
+            .iter()
+            .any(|(_, update)| !update.opened_or_changed.is_empty())
+        {
+            self.preprocess_known_empty = false;
+        }
+        let Some(runtime) = &mut self.tsgo else {
+            return;
+        };
         let mut events = Vec::new();
         for (index, update) in updates {
             for shadow in &update.opened_or_changed {
@@ -2864,11 +2890,12 @@ impl Server {
             self.preprocess_dependencies.clear();
             return;
         }
-        if self.preprocess.is_some() {
+        if self.preprocess.is_some() || self.preprocess_known_empty {
             return;
         }
         let inputs = self.preprocess_inputs();
         if inputs.is_empty() {
+            self.preprocess_known_empty = true;
             return;
         }
         let client = match PreprocessSidecar::spawn(
@@ -2892,13 +2919,17 @@ impl Server {
         });
     }
 
-    fn preprocess_inputs(&self) -> Vec<PreprocessInput> {
+    fn preprocess_inputs(&mut self) -> Vec<PreprocessInput> {
         let mut inputs = HashMap::<PathBuf, PreprocessInput>::new();
         if let Some(runtime) = &self.tsgo {
             for overlay in &runtime.overlays {
                 for shadow in overlay.eager_shadows() {
                     let filename = uri_to_path(shadow.source_uri.as_str());
-                    if find_preprocess_config(&filename, overlay.workspace()).is_none() {
+                    if self
+                        .preprocess_configs
+                        .find(&filename, overlay.workspace())
+                        .is_none()
+                    {
                         continue;
                     }
                     let Some(text) = overlay.source_text(&filename) else {
@@ -2921,7 +2952,11 @@ impl Server {
             let Some(workspace) = self.preprocess_workspace_for_path(&filename) else {
                 continue;
             };
-            if find_preprocess_config(&filename, &workspace).is_none() {
+            if self
+                .preprocess_configs
+                .find(&filename, &workspace)
+                .is_none()
+            {
                 continue;
             }
             inputs.insert(
@@ -2938,6 +2973,19 @@ impl Server {
     }
 
     fn queue_preprocess_document(&mut self, key: &str) -> bool {
+        if self.preprocess_known_empty
+            && let Some(document) = self.documents.get_by_key(key)
+        {
+            let filename = uri_to_path(document.uri.as_str());
+            if let Some(workspace) = self.preprocess_workspace_for_path(&filename)
+                && self
+                    .preprocess_configs
+                    .find(&filename, &workspace)
+                    .is_some()
+            {
+                self.preprocess_known_empty = false;
+            }
+        }
         self.ensure_preprocess_runtime();
         let Some(document) = self.documents.get_by_key(key) else {
             return false;
@@ -2953,7 +3001,11 @@ impl Server {
         let Some(workspace) = self.preprocess_workspace_for_path(&filename) else {
             return false;
         };
-        if find_preprocess_config(&filename, &workspace).is_none() {
+        if self
+            .preprocess_configs
+            .find(&filename, &workspace)
+            .is_none()
+        {
             if let Some(runtime) = &self.preprocess {
                 let _ = runtime.client.remove(filename);
             }
@@ -3073,6 +3125,8 @@ impl Server {
     }
 
     fn restart_preprocessing(&mut self) {
+        self.preprocess_configs.clear();
+        self.preprocess_known_empty = false;
         self.preprocess_failures.clear();
         self.preprocess_documents.clear();
         self.preprocess_dependencies.clear();

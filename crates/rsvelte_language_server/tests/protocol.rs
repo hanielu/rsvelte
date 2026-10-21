@@ -738,6 +738,45 @@ fn preprocessing_runs_only_in_trusted_workspaces_and_maps_diagnostics() {
 }
 
 #[test]
+fn a_document_under_a_svelte_config_starts_preprocessing_after_none_had_one() {
+    if Command::new("node").arg("--version").output().is_err() {
+        return;
+    }
+    // The server remembers that nothing needs preprocessing, so the keystrokes
+    // in `App.svelte` stop re-asking; a document whose directory has a config
+    // must still start the sidecar.
+    let root = temp_dir("preprocess-late-config");
+    let marker = root.join("config-executed");
+    write_preprocess_fixture(&root, &marker);
+    std::fs::create_dir_all(root.join("pre")).unwrap();
+    std::fs::rename(
+        root.join("svelte.config.mjs"),
+        root.join("pre/svelte.config.mjs"),
+    )
+    .unwrap();
+    let mut server = workspace_server(&root, true);
+    let plain = file_uri(&root.join("App.svelte"));
+    did_open(&mut server, &plain, "<p>plain</p>");
+    let _ = server.diagnostics(&plain);
+    assert!(!marker.exists(), "nothing to preprocess yet");
+
+    let uri = file_uri(&root.join("pre/App.svelte"));
+    did_open(
+        &mut server,
+        &uri,
+        r#"<template lang="pug">p image</template>"#,
+    );
+    let diagnostics = server.diagnostics_matching(&uri, |diagnostics| {
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "a11y_missing_attribute")
+    });
+    assert!(!diagnostics.is_empty());
+    assert!(marker.is_file());
+    assert_eq!(server.shutdown(), Some(0));
+}
+
+#[test]
 fn compiled_code_matches_the_upstream_wire_shape() {
     let dir = temp_dir("compiled-code");
     let uri = file_uri(&dir.join("App.svelte"));

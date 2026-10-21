@@ -750,10 +750,108 @@ pub fn find_preprocess_config(filename: &Path, workspace: &Path) -> Option<PathB
     }
 }
 
+/// [`find_preprocess_config`] answered once per directory. The server asks it
+/// for every shadow when it decides whether to start the sidecar, and for the
+/// edited document on every keystroke; uncached, that is five `realpath`s per
+/// ancestor directory each time (about 230 ms across a 500-component monorepo,
+/// on the main loop). Cleared whenever a project config may have changed.
+#[derive(Debug, Default)]
+pub struct PreprocessConfigCache {
+    canonical: std::collections::HashMap<PathBuf, Option<PathBuf>>,
+    configs: std::collections::HashMap<(PathBuf, PathBuf), Option<PathBuf>>,
+}
+
+impl PreprocessConfigCache {
+    /// Forget every answer, after a config may have appeared or gone.
+    pub fn clear(&mut self) {
+        self.canonical.clear();
+        self.configs.clear();
+    }
+
+    /// The same answer as [`find_preprocess_config`].
+    pub fn find(&mut self, filename: &Path, workspace: &Path) -> Option<PathBuf> {
+        let workspace = self.canonicalize(workspace)?;
+        let directory = self.canonicalize(filename.parent()?)?;
+        self.find_in(&directory, &workspace)
+    }
+
+    fn canonicalize(&mut self, path: &Path) -> Option<PathBuf> {
+        if let Some(known) = self.canonical.get(path) {
+            return known.clone();
+        }
+        let canonical = fs::canonicalize(path).ok();
+        self.canonical.insert(path.to_path_buf(), canonical.clone());
+        canonical
+    }
+
+    fn find_in(&mut self, directory: &Path, workspace: &Path) -> Option<PathBuf> {
+        if !directory.starts_with(workspace) {
+            return None;
+        }
+        let key = (directory.to_path_buf(), workspace.to_path_buf());
+        if let Some(known) = self.configs.get(&key) {
+            return known.clone();
+        }
+        let mut found = CONFIG_NAMES.iter().find_map(|name| {
+            let candidate = fs::canonicalize(directory.join(name)).ok()?;
+            (candidate.starts_with(workspace) && candidate.is_file()).then_some(candidate)
+        });
+        if found.is_none()
+            && directory != workspace
+            && let Some(parent) = directory.parent()
+        {
+            found = self.find_in(parent, workspace);
+        }
+        self.configs.insert(key, found.clone());
+        found
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn the_cache_answers_exactly_as_the_walk_does() {
+        let root = temp_dir("config-cache");
+        fs::create_dir_all(root.join("app/src/lib")).unwrap();
+        fs::create_dir_all(root.join("plain/src")).unwrap();
+        fs::write(root.join("app/svelte.config.js"), "export default {};").unwrap();
+        let mut cache = PreprocessConfigCache::default();
+        for file in [
+            "app/src/lib/A.svelte",
+            "app/src/B.svelte",
+            "app/C.svelte",
+            "plain/src/D.svelte",
+            "E.svelte",
+        ] {
+            let file = root.join(file);
+            assert_eq!(
+                cache.find(&file, &root),
+                find_preprocess_config(&file, &root),
+                "{}",
+                file.display()
+            );
+            assert_eq!(
+                cache.find(&file, &root.join("app")),
+                find_preprocess_config(&file, &root.join("app"))
+            );
+        }
+        fs::write(root.join("svelte.config.mjs"), "export default {};").unwrap();
+        assert_eq!(cache.find(&root.join("E.svelte"), &root), None, "cached");
+        cache.clear();
+        assert_eq!(
+            cache.find(&root.join("plain/src/D.svelte"), &root),
+            find_preprocess_config(&root.join("plain/src/D.svelte"), &root)
+        );
+        assert!(
+            cache
+                .find(&root.join("plain/src/D.svelte"), &root)
+                .is_some()
+        );
+        fs::remove_dir_all(&root).ok();
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
