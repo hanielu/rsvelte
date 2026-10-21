@@ -328,7 +328,70 @@ impl TsgoOverlay {
             }
         }
         self.write_tsconfig()?;
+        self.link_node_modules();
         Ok(true)
+    }
+
+    /// tsgo looks a bare import up in the `node_modules` of every directory
+    /// above the importing file, and a config's `types` and default
+    /// `typeRoots` in those above the config. A shadow and the overlay config
+    /// live in the cache, not beside their source, so a nested package's own
+    /// `node_modules` (monorepo/admin/node_modules, under a workspace-root cache)
+    /// is on neither path: every import of a package only it installs fails.
+    /// Each such directory is mirrored as a symlink at its owner's position
+    /// in the shadow tree and in the config's ancestry, so both lookups walk
+    /// the same chain as from the source. `**` never matches `node_modules`,
+    /// so no package joins the project's root files.
+    pub fn link_node_modules(&self) {
+        let cache_root = self.mirror_root.join(CACHE_DIRECTORY);
+        let mut links = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        for entry in self.entries.values().filter(|entry| entry.is_component()) {
+            let mut directory = entry.source_path.parent();
+            while let Some(current) = directory {
+                if !current.starts_with(&self.mirror_root) || !seen.insert(current.to_path_buf()) {
+                    break;
+                }
+                let target = current.join("node_modules");
+                if let Ok(relative) = current.strip_prefix(&self.mirror_root)
+                    && target.is_dir()
+                {
+                    links.insert(self.shadow_dir.join(relative).join("node_modules"), target);
+                }
+                directory = current.parent();
+            }
+        }
+        // `<cache>/projects/<project>/tsgo/tsconfig.json`: the directories
+        // above the config mirror the project's own ancestry.
+        let mut source = Some(self.workspace.as_path());
+        let mut mirror = self.cache_dir.parent();
+        while let (Some(current), Some(position)) = (source, mirror) {
+            if current == self.mirror_root || !position.starts_with(&cache_root) {
+                break;
+            }
+            let target = current.join("node_modules");
+            if target.is_dir() {
+                links.insert(position.join("node_modules"), target);
+            }
+            source = current.parent();
+            mirror = position.parent();
+        }
+        for (link, target) in links {
+            // A member reached through `node_modules` keeps a real directory.
+            if self
+                .entries
+                .values()
+                .any(|entry| entry.shadow_path.starts_with(&link))
+            {
+                continue;
+            }
+            if let Err(error) = place_symlink(&link, &target, &cache_root) {
+                crate::log::warn(format_args!(
+                    "could not mirror {} for tsgo: {error}",
+                    target.display()
+                ));
+            }
+        }
     }
 
     /// Read and project `sources` from disk, on up to
@@ -901,6 +964,9 @@ impl TsgoOverlay {
                 .opened_or_changed
                 .push(self.open_or_update(path, &text, version)?);
         }
+        if !update.opened_or_changed.is_empty() {
+            self.link_node_modules();
+        }
         Ok(update)
     }
 
@@ -1005,6 +1071,9 @@ impl TsgoOverlay {
             }
         }
         self.follow_imports(scan, &editor_open, &mut update)?;
+        if !update.opened_or_changed.is_empty() {
+            self.link_node_modules();
+        }
         Ok(Some(update))
     }
 
@@ -2897,6 +2966,30 @@ fn write_body(
     } else {
         lsp_types::FileChangeType::CREATED
     }))
+}
+
+/// Make `link` a symlink to `target`, unless something real is already there.
+fn place_symlink(link: &Path, target: &Path, cache_root: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(link) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if fs::read_link(link).is_ok_and(|existing| existing == target) {
+                return Ok(());
+            }
+            fs::remove_file(link)?;
+        }
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let Some(parent) = link.parent() else {
+        return Ok(());
+    };
+    fs::create_dir_all(parent)?;
+    reject_symlink_components(parent, cache_root)?;
+    #[cfg(unix)]
+    return std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    return std::os::windows::fs::symlink_dir(target, link);
 }
 
 /// Whether `path` lies inside an overlay cache, where every file is this
@@ -4802,6 +4895,55 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "a node_modules path holds no member"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_nested_packages_node_modules_is_mirrored_into_the_cache() {
+        let workspace = TestWorkspace::new("node-modules");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        write(&root.join("node_modules/root-pkg/index.d.ts"), "export {};");
+        write(
+            &root.join("admin/node_modules/admin-pkg/index.d.ts"),
+            "export {};",
+        );
+        write(&root.join("admin/src/tsconfig.json"), "{}");
+        write(&root.join("admin/src/ui/A.svelte"), "<p />");
+        let overlay = TsgoOverlay::build_nested(
+            &root.join("admin/src"),
+            &root.join("admin/src/tsconfig.json"),
+            &root,
+        )
+        .unwrap();
+        let cache_root = root.join(CACHE_DIRECTORY);
+        let linked = |link: PathBuf| fs::read_link(&link).ok();
+        assert_eq!(
+            linked(overlay.shadow_dir.join("admin/node_modules")),
+            Some(root.join("admin/node_modules")),
+            "a shadow finds the package where its source does"
+        );
+        assert_eq!(
+            linked(overlay.shadow_dir.join("node_modules")),
+            Some(root.join("node_modules"))
+        );
+        assert_eq!(
+            linked(cache_root.join("projects/admin/node_modules")),
+            Some(root.join("admin/node_modules")),
+            "the config's `types` and `typeRoots` walk the project's ancestry"
+        );
+        assert!(
+            !cache_root.join("projects/admin/src/node_modules").exists(),
+            "only directories that have one"
+        );
+        // Idempotent, and the sweep leaves the links alone.
+        overlay.link_node_modules();
+        assert!(overlay.sweep_bodies(|_| true).is_empty());
+        assert!(
+            overlay
+                .shadow_dir
+                .join("admin/node_modules/admin-pkg/index.d.ts")
+                .is_file()
         );
     }
 
