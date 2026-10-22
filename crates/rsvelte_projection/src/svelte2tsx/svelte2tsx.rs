@@ -789,11 +789,7 @@ pub fn svelte2tsx(
     if has_instance_script {
         has_top_level_await = process_instance_script_tag(
             &ast,
-            parsed_scripts
-                .instance
-                .as_ref()
-                .expect("instance script")
-                .program(),
+            parsed_scripts.instance.as_ref().expect("instance script"),
             source,
             &options,
             &mut str,

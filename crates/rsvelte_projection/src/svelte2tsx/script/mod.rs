@@ -37,6 +37,7 @@ use super::utils::lexical::contains_word;
 
 pub use component_events::ComponentEvents;
 pub use exported_names::{ExportedNameInfo, ExportedNames};
+pub(super) use recovery::closers_for_hoisted;
 pub(super) use stores::{StoreScanContext, collect_module_import_store_declarations};
 
 use ast_utils::{

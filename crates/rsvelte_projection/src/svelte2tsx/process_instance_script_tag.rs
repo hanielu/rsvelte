@@ -11,7 +11,7 @@ use super::nodes::generics::{
     type_text_typeof_references_local_value,
 };
 use super::nodes::scripts::{LiftedImport, detect_top_level_await, find_script_close_tag_start};
-use super::script::ExportedNames;
+use super::script::{ExportedNames, ParsedScript, closers_for_hoisted};
 use super::svelte2tsx::slice_src;
 
 /// Overwrite the instance script tags and lift its imports. Import declarations
@@ -27,7 +27,7 @@ use super::svelte2tsx::slice_src;
 )]
 pub fn process_instance_script_tag(
     ast: &Root,
-    instance_program: &oxc_ast::ast::Program,
+    instance_script: &ParsedScript<'_>,
     source: &str,
     options: &Svelte2TsxOptions,
     str: &mut MagicString<'_>,
@@ -56,7 +56,7 @@ pub fn process_instance_script_tag(
     // `async`; mirror that (the awaits stay in the raw, oxfmt-skipped output).
     let script_parse_failed = !instance.raw_content.is_empty();
     let has_top_level_await =
-        !script_parse_failed && detect_top_level_await(raw_content, instance_program);
+        !script_parse_failed && detect_top_level_await(raw_content, instance_script.program());
     if has_top_level_await {
         exported_names.set_uses_runes(true);
     }
@@ -276,7 +276,15 @@ pub fn process_instance_script_tag(
         // instance-script walk, before the type/interface hoists, and each
         // `move` lands before the chunk that still starts at `sp` — so the
         // relocation order is the output order.
-        lift_imports(imports, source, content_start, sp, has_module_script, str);
+        lift_imports(
+            imports,
+            source,
+            instance_script.source(),
+            content_start,
+            sp,
+            has_module_script,
+            str,
+        );
         if ts_component_props_in_part_a && let Some(last) = imports.last() {
             str.append_left_fmt(
                 content_start + last.end,
@@ -306,7 +314,10 @@ pub fn process_instance_script_tag(
                 // hoist target — `prepend_left` would leave the
                 // semicolon stranded at the original location.
                 str.prepend_right(s, ";\n");
-                str.append_left(e, ";");
+                let closers =
+                    hoisted_closers(source, instance_script.source(), content_start, s, e)
+                        .unwrap_or_default();
+                str.append_left_fmt(e, format_args!("{closers};"));
                 str.move_range(s, e, sp);
             }
         }
@@ -330,7 +341,10 @@ pub fn process_instance_script_tag(
         for &(s, e) in &exported_names.dollar_generic_referenced_ranges {
             if s < e && (e as usize) <= source.len() {
                 str.prepend_right(s, "\n");
-                str.append_left(e, "\n");
+                let closers =
+                    hoisted_closers(source, instance_script.source(), content_start, s, e)
+                        .unwrap_or_default();
+                str.append_left_fmt(e, format_args!("{closers}\n"));
                 str.move_range(s, e, sp);
             }
         }
@@ -421,6 +435,7 @@ pub fn process_instance_script_tag(
 fn lift_imports(
     imports: &[LiftedImport],
     source: &str,
+    recovered: &str,
     content_start: u32,
     hoist_target: u32,
     has_module_script: bool,
@@ -446,11 +461,19 @@ fn lift_imports(
             let comment_end = content_start + comment.end;
             str.move_range(content_start + comment.start, comment_end, hoist_target);
             if comment.has_trailing_newline {
-                append_newline_to_last_char(str, source, comment_end);
+                append_newline_to_last_char(str, source, comment_end, "");
             }
         }
         str.move_range(start, end, hoist_target);
-        append_newline_to_last_char(str, source, end);
+        // A repaired import is terminated where the author's text ends, so
+        // TypeScript reports what it lacks there rather than on the next one.
+        let ending = match hoisted_closers(source, recovered, content_start, start, end) {
+            Some(closers) if !slice_src(source, start as usize, end as usize).ends_with(';') => {
+                closers + ";"
+            }
+            closers => closers.unwrap_or_default(),
+        };
+        append_newline_to_last_char(str, source, end, &ending);
     }
 
     // Separate the hoisted block from the `;` that replaced `<`, and from a
@@ -472,18 +495,44 @@ fn lift_imports(
 
     // Terminate the last import so auto-imports and completions don't attach to
     // the generated code that follows it.
+    let last_start = content_start + last.start;
     let last_end = content_start + last.end;
     let (last_char_start, last_char) = last_char_of(source, last_end);
     if last_char != ";" {
-        str.overwrite_fmt(last_char_start, last_end, format_args!("{last_char};\n"));
+        let closers = hoisted_closers(source, recovered, content_start, last_start, last_end)
+            .unwrap_or_default();
+        str.overwrite_fmt(
+            last_char_start,
+            last_end,
+            format_args!("{last_char}{closers};\n"),
+        );
     }
 }
 
+/// What closes the brackets a hoisted declaration (`start..end` in `source`)
+/// leaves open, if script recovery repaired it (`recovered` is the instance
+/// script's recovered content); see `closers_for_hoisted`.
+fn hoisted_closers(
+    source: &str,
+    recovered: &str,
+    content_start: u32,
+    start: u32,
+    end: u32,
+) -> Option<String> {
+    let from = start.checked_sub(content_start)? as usize;
+    let to = end.checked_sub(content_start)? as usize;
+    closers_for_hoisted(
+        slice_src(source, start as usize, end as usize),
+        recovered.get(from..to),
+    )
+}
+
 /// `moveNode`'s `overwrite(end - 1, end, original[end - 1] + '\n')`: the
-/// newline has to sit inside the moved chunk so it travels with it.
-fn append_newline_to_last_char(str: &mut MagicString<'_>, source: &str, end: u32) {
+/// newline has to sit inside the moved chunk so it travels with it. `ending`
+/// goes between the author's text and the newline.
+fn append_newline_to_last_char(str: &mut MagicString<'_>, source: &str, end: u32, ending: &str) {
     let (last_char_start, last_char) = last_char_of(source, end);
-    str.overwrite_fmt(last_char_start, end, format_args!("{last_char}\n"));
+    str.overwrite_fmt(last_char_start, end, format_args!("{last_char}{ending}\n"));
 }
 
 fn last_char_of(source: &str, end: u32) -> (u32, &str) {

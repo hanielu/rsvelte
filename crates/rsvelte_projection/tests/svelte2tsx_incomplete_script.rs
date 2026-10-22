@@ -171,3 +171,82 @@ fn multibyte_whitespace_in_an_unfinished_construct() {
         assert!(code.contains("export default"), "{source:?}\n{code}");
     }
 }
+
+/// An import or a type alias being typed above other code. svelte2tsx hoists
+/// it above `$$render()` with the author's bytes, so its open `{` ran into the
+/// generated code after it: TypeScript read `import {` on into the
+/// `$$ComponentProps` alias (`type` is a valid import specifier) and left the
+/// props untyped, and an open type literal reported errors on generated `;`s,
+/// which the language server could only place at the start of the file. The
+/// hoisted copy now closes what the author's text leaves open, and a repaired
+/// import is terminated, so TypeScript reports what is missing at its end.
+#[test]
+fn a_hoisted_declaration_left_open_is_closed_after_the_authors_text() {
+    let head = "<script lang=\"ts\">\n\timport Child from \"./Child.svelte\";\n\tlet { title }: { title: number } = $props();\n";
+    let props = ";type $$ComponentProps =  { title: number };function $$render() {";
+    for (typed, hoisted) in [
+        ("\timport {", "import {};\n"),
+        ("\timport { ", "import {};\n"),
+        ("\timport { x", "import { x};\n"),
+        ("\timport type {", "import type {};\n"),
+        ("\timport { a,\n\t\tb\n\tconst x = 1;", "import { a,};\n"),
+        (
+            "\timport {\n\timport B from \"b\";",
+            "import {};\nimport B from \"b\";\n",
+        ),
+        (
+            "\ttype T = { a: string;",
+            ";\n\ttype T = { a: string;\n};\n",
+        ),
+    ] {
+        let source = format!("{head}{typed}\n</script>\n\n<Child label={{title}} />\n");
+        let code = convert(&source);
+        let expected = format!("import Child from \"./Child.svelte\";\n{hoisted}{props}");
+        assert!(code.contains(&expected), "{typed:?}\n{code}");
+    }
+    // A declaration recovery did not touch keeps its text.
+    let code = convert(&format!(
+        "{head}\timport {{ x }} from './x';\n\tconst o = \n</script>\n"
+    ));
+    assert!(
+        code.contains("import { x } from './x';\n;type $$ComponentProps"),
+        "{code}"
+    );
+}
+
+/// A type alias or an interface being typed above a function. oxc read the
+/// function's line as members of the open body (`type T = {` made `function` a
+/// type), so the function was lost from the program and hoisted, broken, with
+/// the type: TypeScript reported the function's text as errors and the
+/// template's calls to it as unknown names. TypeScript ends the body before
+/// the function; recovery now closes it there, so the type is hoisted with
+/// the members typed so far and the function stays in `$$render()`.
+#[test]
+fn a_type_body_left_open_above_a_function_ends_before_it() {
+    let head = "<script lang=\"ts\">\n\timport Child from \"./Child.svelte\";\n\tlet { title }: { title: T } = $props();\n";
+    let tail = "\n\tfunction go(x: number) { return x * 2; }\n</script>\n\n<Child label={title} />\n<p>{go(1)}</p>\n";
+    for (typed, hoisted) in [
+        ("\ttype T = {", ";\n\ttype T = {\n};\n"),
+        (
+            "\ttype T = {\n\t\ta: string;",
+            ";\n\ttype T = {\n\t\ta: string;\n};\n",
+        ),
+        ("\tinterface T {", ";\n\tinterface T {\n};\n"),
+        (
+            "\tinterface T {\n\t\ta: string;",
+            ";\n\tinterface T {\n\t\ta: string;\n};\n",
+        ),
+    ] {
+        let code = convert(&format!("{head}{typed}{tail}"));
+        let expected = format!(
+            "import Child from \"./Child.svelte\";\n{hoisted};type $$ComponentProps =  {{ title: T }};function $$render() {{"
+        );
+        assert!(code.contains(&expected), "{typed:?}\n{code}");
+        assert!(
+            code.contains(
+                "= $props();\n\tfunction go(x: number) { return x * 2; }\n;\nasync () => {"
+            ),
+            "{typed:?}\n{code}"
+        );
+    }
+}
