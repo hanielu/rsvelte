@@ -2278,18 +2278,25 @@ impl TsgoOverlay {
         // is the only place the translation can be written: a tsconfig cannot
         // unset an option it inherits through `extends`. A project that declares
         // `*` itself is left alone — the loop below overwrites this entry.
-        if let Some(base_url) = self.overlay_base_url() {
-            mappings.insert(
-                "*".to_string(),
-                json!([
-                    format!("{base_url}/*"),
-                    format!("{}/*", path_for_tsconfig(&self.shadow_dir))
-                ]),
+        let base_url = self.overlay_base_url();
+        if let Some(base_url) = &base_url {
+            // The shadow twin is `baseUrl`'s own place in the shadow tree, which is
+            // the tree's root only when `baseUrl` is the mirror root: a nested
+            // project's `"baseUrl": "./src"` maps `features/x.svelte` to
+            // `<shadow>/apps/web/src/features/x.svelte.tsx`.
+            let mut targets = vec![json!(format!("{base_url}/*"))];
+            targets.extend(
+                self.shadow_twin(Path::new(base_url))
+                    .map(|twin| json!(format!("{twin}/*"))),
             );
+            mappings.insert("*".to_string(), serde_json::Value::Array(targets));
         }
         let Some((value, base)) = resolve_config_value_with_base(source, "paths") else {
             return (!mappings.is_empty()).then_some(serde_json::Value::Object(mappings));
         };
+        // TypeScript 5 resolves `paths` targets against `baseUrl` when the project
+        // sets one, and against the config that declares them otherwise.
+        let base = base_url.map_or(base, PathBuf::from);
         for (pattern, targets) in value.as_object().into_iter().flatten() {
             let mut candidates = Vec::new();
             for target in targets
@@ -2302,8 +2309,8 @@ impl TsgoOverlay {
                 // The source target stays first, so nothing that resolves today
                 // can start resolving somewhere else.
                 candidates.push(json!(absolute));
-                if let Ok(relative) = Path::new(&absolute).strip_prefix(&self.mirror_root) {
-                    candidates.push(json!(path_for_tsconfig(&self.shadow_dir.join(relative))));
+                if let Some(twin) = self.shadow_twin(Path::new(&absolute)) {
+                    candidates.push(json!(twin));
                 }
             }
             // The override is total, so a pattern this loop cannot rewrite is a
@@ -2467,6 +2474,50 @@ impl TsgoOverlay {
         })
     }
 
+    /// Where `path`, inside the mirror root, sits in the shadow tree.
+    fn shadow_twin(&self, path: &Path) -> Option<String> {
+        let inside = path.strip_prefix(&self.mirror_root).ok()?;
+        Some(if inside.as_os_str().is_empty() {
+            path_for_tsconfig(&self.shadow_dir)
+        } else {
+            path_for_tsconfig(&self.shadow_dir.join(inside))
+        })
+    }
+
+    /// The overlay's `rootDirs`: the mirror root and the shadow tree, then the
+    /// project's own roots with their shadow twins. `rootDirs` is not merged
+    /// through `extends` — the overlay's replaces the project's — and
+    /// SvelteKit's generated config roots `./$types` at `.svelte-kit/types` that
+    /// way, so without them every route's `data`, `form` and `params` is `any`.
+    fn overlay_root_dirs(&self) -> Vec<String> {
+        let mut roots = vec![
+            path_for_tsconfig(&self.mirror_root),
+            path_for_tsconfig(&self.shadow_dir),
+        ];
+        let Some(source) = self.source_tsconfig.as_deref() else {
+            return roots;
+        };
+        let config_dir = source.parent().unwrap_or_else(|| Path::new("."));
+        let Some((value, base)) = resolve_config_value_with_base(source, "rootDirs") else {
+            return roots;
+        };
+        for spec in value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+        {
+            let absolute = rebase_config_spec(spec, &base, config_dir);
+            let twin = self.shadow_twin(Path::new(&absolute));
+            for root in std::iter::once(absolute).chain(twin) {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+        }
+        roots
+    }
+
     /// The project's `baseUrl` as an absolute path, when it declares one.
     fn overlay_base_url(&self) -> Option<String> {
         let source = self.source_tsconfig.as_deref()?;
@@ -2527,10 +2578,7 @@ impl TsgoOverlay {
                 "allowImportingTsExtensions": true,
                 "jsx": "preserve",
                 "noEmit": true,
-                "rootDirs": [
-                    path_for_tsconfig(&self.mirror_root),
-                    path_for_tsconfig(&self.shadow_dir)
-                ]
+                "rootDirs": self.overlay_root_dirs()
             },
             "files": files,
             "include": include
@@ -5460,6 +5508,76 @@ mod tests {
                 format!("{}/*", path_for_tsconfig(&overlay.shadow_dir))
             ])
         );
+    }
+
+    #[test]
+    fn a_base_url_below_the_mirror_root_maps_to_its_own_shadow_directory() {
+        // `"baseUrl": "./src"` in a project nested in a monorepo: `*` and every
+        // `paths` target resolve against `src`, and their shadow twins sit at
+        // `src`'s place in the shadow tree, not at the tree's root.
+        let workspace = TestWorkspace::new("base-url-nested");
+        write(
+            &workspace.0.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "baseUrl": "./src", "paths": { "$desktop/*": ["features/desktop/*"] } } }"#,
+        );
+        write(
+            &workspace.0.join("src/features/desktop/Socket.svelte"),
+            "<p />",
+        );
+
+        let overlay = build_overlay(&workspace.0).unwrap();
+        let config = overlay_config(&overlay);
+        let src = overlay.workspace().join("src");
+        let shadow_src = overlay
+            .shadow_dir
+            .join(src.strip_prefix(&overlay.mirror_root).unwrap());
+        assert_eq!(
+            config["compilerOptions"]["paths"]["*"],
+            json!([
+                format!("{}/*", path_for_tsconfig(&src)),
+                format!("{}/*", path_for_tsconfig(&shadow_src))
+            ])
+        );
+        assert_eq!(
+            config["compilerOptions"]["paths"]["$desktop/*"],
+            json!([
+                format!("{}/*", path_for_tsconfig(&src.join("features/desktop"))),
+                format!(
+                    "{}/*",
+                    path_for_tsconfig(&shadow_src.join("features/desktop"))
+                )
+            ])
+        );
+    }
+
+    #[test]
+    fn the_projects_root_dirs_are_kept_beside_the_shadow_tree() {
+        // SvelteKit roots `./$types` at `.svelte-kit/types` through `rootDirs`;
+        // the overlay's own `rootDirs` replaces the inherited one, so it has to
+        // carry it over or every route's `data` is `any`.
+        let workspace = TestWorkspace::new("root-dirs");
+        write(
+            &workspace.0.join(".svelte-kit/tsconfig.json"),
+            r#"{ "compilerOptions": { "rootDirs": ["..", "./types"] } }"#,
+        );
+        write(
+            &workspace.0.join("tsconfig.json"),
+            r#"{ "extends": "./.svelte-kit/tsconfig.json" }"#,
+        );
+        write(&workspace.0.join("src/routes/+page.svelte"), "<p />");
+
+        let overlay = build_overlay(&workspace.0).unwrap();
+        let config = overlay_config(&overlay);
+        let roots = config["compilerOptions"]["rootDirs"].as_array().unwrap();
+        let types = path_for_tsconfig(&overlay.workspace().join(".svelte-kit/types"));
+        assert_eq!(roots[0], json!(path_for_tsconfig(&overlay.mirror_root)));
+        assert_eq!(roots[1], json!(path_for_tsconfig(&overlay.shadow_dir)));
+        assert!(roots.contains(&json!(types)), "{roots:?}");
+        let unique = roots
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), roots.len(), "no root twice: {roots:?}");
     }
 
     #[test]
