@@ -299,8 +299,9 @@ pub fn rewrite_workspace_edit(
         {
             return;
         }
+        let new_text = store_value_text(document.source_text, source_start, source_end, new_text);
         let (source_range, replacement) =
-            correct_shorthand(document.source_text, source_range, new_text, new_name);
+            correct_shorthand(document.source_text, source_range, &new_text, new_name);
         edits.push(EditorEdit {
             uri: document.source_uri.as_str().to_string(),
             range: source_range,
@@ -630,6 +631,32 @@ fn correct_shorthand(
     // A key/value pair outside Svelte shorthand syntax is already a complete
     // TypeScript replacement and must retain tsgo's prefix/suffix semantics.
     (range, raw_replacement.to_string())
+}
+
+/// The replacement of a `$store` use: renaming a store renames its `$store`
+/// uses with the `$` kept. Renamed from a `$store` use, tsgo renames the
+/// generated `$store` local to the name the editor typed for the store (the
+/// prepare answer offers `store`, without the `$`), which would read the
+/// store object instead of its value (review 6: `$count++` became
+/// `total++`). In a component a `$` name is always a store's value: Svelte
+/// reserves the prefix.
+fn store_value_text<'a>(
+    source: &str,
+    start: usize,
+    end: usize,
+    replacement: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    let replaced = source.get(start..end).unwrap_or_default();
+    if replaced.len() > 1
+        && replaced.starts_with('$')
+        && !replaced[1..].starts_with('$')
+        && is_identifier(replacement)
+        && !replacement.starts_with('$')
+    {
+        std::borrow::Cow::Owned(format!("${replacement}"))
+    } else {
+        std::borrow::Cow::Borrowed(replacement)
+    }
 }
 
 /// The directives whose shorthand names both the directive and the variable
@@ -1079,6 +1106,38 @@ mod tests {
             RenameFollowupReason::StoreBase
         );
         assert_eq!(dollar_rewritten.followups[0].new_name, "renamed");
+    }
+
+    /// Renamed from a `$store` use, tsgo renames the generated `$store` local
+    /// to the new store name, without the `$`: each `$store` use keeps it.
+    #[test]
+    fn a_store_value_renamed_from_its_use_keeps_its_dollar() {
+        let source_uri = uri("file:///Input.svelte");
+        let shadow_uri = uri("file:///cache/Input.svelte.tsx");
+        let source = "<script>let store; $store;</script>{$store}";
+        let artifact = project(source);
+        let document = view(&source_uri, &shadow_uri, source, &artifact);
+        let template = source.rfind("$store").unwrap();
+        let generated = artifact
+            .exact_mappings
+            .as_ref()
+            .unwrap()
+            .source_to_generated(u32::try_from(template).unwrap())
+            .first()
+            .copied()
+            .unwrap() as usize;
+        assert_eq!(&artifact.code[generated..generated + 6], "$store");
+        let response = edit(
+            &shadow_uri,
+            "renamed",
+            utf8_position(&artifact.code, generated),
+            utf8_position(&artifact.code, generated + "$store".len()),
+        );
+        let position = LineIndex::new(source).position(source, template + 1);
+        let plan = prepare_rename_plan(document, position);
+        let rewritten = rewrite_workspace_edit(&plan, &response, &[document], "renamed", true);
+        let edits = rewritten.edit["changes"][source_uri.as_str()].clone();
+        assert_eq!(edits[0]["newText"], "$renamed", "{edits}");
     }
 
     #[test]
