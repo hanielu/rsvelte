@@ -1,6 +1,7 @@
 //! Raw-source scanners for tag positions that the AST does not record.
 
 use crate::ast::template::Attribute;
+use crate::svelte2tsx::magic_string::MagicString;
 use crate::svelte2tsx::template::attributes::attribute_end;
 use rsvelte_core::compiler::utils::is_escaped;
 
@@ -116,6 +117,20 @@ pub fn find_closing_tag_start(source: &str, end: u32) -> u32 {
     }
 
     source_offset(end)
+}
+
+/// Turn a block's `{/…}` closing tag — what lies between the end of its last
+/// content and `block_end` — into `closer`. A block that loose parsing closed
+/// implicitly, because the template or an enclosing element ended before its
+/// `{/…}`, has none: `closer` is appended at its end instead, as upstream's
+/// `isImplicitlyClosedBlock` branches do, so the generated scopes stay
+/// balanced while the author is still typing.
+pub fn close_block(str: &mut MagicString<'_>, content_end: u32, block_end: u32, closer: &str) {
+    if content_end < block_end {
+        str.overwrite(content_end, block_end, closer);
+    } else {
+        str.append_left(block_end, closer);
+    }
 }
 
 #[cfg(test)]

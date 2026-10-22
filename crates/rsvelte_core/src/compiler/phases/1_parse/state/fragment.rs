@@ -228,6 +228,19 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Pop a block's stack entry once the block is over: its `{/…}` closed
+    /// it, or loose parsing closed it implicitly before the end of the input
+    /// (an enclosing element's closing tag, an outer block's continuation or
+    /// close), which upstream's `close()` pops as well. Only a block the input
+    /// ends inside stays on the stack, for `block_unclosed`.
+    pub(crate) fn pop_block_entry(&mut self, found_closing: bool) {
+        if (found_closing || (self.options.loose && !self.remaining_is_whitespace_only()))
+            && !self.stack.is_empty()
+        {
+            self.stack.pop();
+        }
+    }
+
     /// Record a node that ends without its close. In a loose parse that is
     /// at EOF, it is one of the nodes upstream leaves open.
     pub(crate) fn note_left_open(&mut self, found_closing: bool, start: u32) {

@@ -8,6 +8,7 @@ use crate::svelte2tsx::template::ctx::{Counter, TemplateNodeExt};
 use crate::svelte2tsx::template::nodes::snippet_block::hoist_snippet_blocks;
 use crate::svelte2tsx::template::nodes::special_element::process_fragment_trimmed;
 use crate::svelte2tsx::template::utils::expr::{get_expression_range, get_expression_text};
+use crate::svelte2tsx::template::utils::source::close_block;
 
 /// Handle a key block: `{#key expression}...{/key}`.
 pub fn handle_key_block(
@@ -68,7 +69,5 @@ pub fn handle_key_block(
         block.fragment.nodes.last().unwrap().end()
     };
 
-    if content_end < block.end {
-        str.overwrite(content_end, block.end, "}");
-    }
+    close_block(str, content_end, block.end, "}");
 }
