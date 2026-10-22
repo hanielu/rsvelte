@@ -1341,6 +1341,17 @@ impl Server {
                 },
                 recv(timer) -> _ => {
                     self.run_scheduled_lints();
+                    // tsgo's answers wait in the channel while the loop is
+                    // busy elsewhere: one tsgo already sent is not lost,
+                    // however late the loop gets to it.
+                    if self
+                        .tsgo_request_deadline()
+                        .is_some_and(|deadline| deadline <= Instant::now())
+                    {
+                        while let Ok(event) = tsgo_events.try_recv() {
+                            self.on_tsgo_event(event);
+                        }
+                    }
                     self.expire_tsgo_requests();
                     self.step_background();
                 },

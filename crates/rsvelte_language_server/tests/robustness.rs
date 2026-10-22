@@ -1660,6 +1660,80 @@ fn a_restarted_tsgo_has_the_editor_pull_its_diagnostics_again() {
     server.shutdown();
 }
 
+/// tsgo's answers wait in a channel while the server's main loop is busy.
+/// One already received is not lost however long the loop was busy: the
+/// server answers the editor with it, and does not restart a tsgo that
+/// answered everything (review 4: mapping a burst of folding ranges kept
+/// the loop busy for more than the request timeout).
+#[cfg(unix)]
+#[test]
+fn answers_tsgo_sent_while_the_server_was_busy_are_not_counted_as_lost() {
+    let dir = TestDir::new("busy-loop-answers");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = one_project(&dir.0);
+    // A client that pulls diagnostics, so that opening the large component
+    // below does not also start an analysis of it.
+    let mut server = Server::start_with_capabilities(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            ("RSVELTE_TEST_HOVER_DELAY_MS", Path::new("200")),
+            ("RSVELTE_TSGO_REQUEST_TIMEOUT_MS", Path::new("1000")),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+        &json!({ "textDocument": { "diagnostic": {} } }),
+    );
+    let x = file_uri(&root.join("X.svelte"));
+    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
+    hover(&mut server, &x);
+    // A component large enough that projecting it when it opens keeps the
+    // main loop busy past the timeout; tsgo answers the hovers meanwhile.
+    let mut big = "<script lang=\"ts\">\n".to_string();
+    let mut template = String::new();
+    for index in 0..20_000 {
+        writeln!(big, "\tlet v{index} = $state({index});").unwrap();
+        writeln!(
+            template,
+            "<div class=\"r{index}\" title={{String(v{index})}}>{{v{index} * 2}}</div>"
+        )
+        .unwrap();
+    }
+    big.push_str("</script>\n");
+    big.push_str(&template);
+    let sent = Instant::now();
+    let hovers = (0..10)
+        .map(|_| {
+            server.request(
+                "textDocument/hover",
+                json!({ "textDocument": { "uri": x }, "position": { "line": 1, "character": 5 } }),
+            )
+        })
+        .collect::<Vec<_>>();
+    server.open(&file_uri(&root.join("Big.svelte")), &big);
+    for id in hovers {
+        let answer = server.response(id, Duration::from_secs(60));
+        assert!(answer.to_string().contains("recorded"), "{answer}");
+    }
+    assert!(
+        sent.elapsed() >= Duration::from_millis(1_000),
+        "the main loop was not busy past the timeout ({:?}): make the component larger",
+        sent.elapsed()
+    );
+    let lines = traffic(&log);
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| **line == format!("textDocument/didOpen {shadow}"))
+            .count(),
+        1,
+        "tsgo was restarted: {lines:?}"
+    );
+    server.shutdown();
+}
+
 /// A workspace with three projects that own components and one that owns
 /// none, for the background-loading tests.
 #[cfg(unix)]
@@ -1953,7 +2027,11 @@ fn main() {
             let body = format!(
                 r#"{{"jsonrpc":"2.0","id":{id},"result":{{"contents":{{"kind":"plaintext","value":"recorded"}}}}}}"#
             );
-            answer(body);
+            // Answered from another thread: a later message is read meanwhile.
+            match delay("RSVELTE_TEST_HOVER_DELAY_MS") {
+                Some(delay) => answer_later(delay, body),
+                None => answer(body),
+            }
         } else if method == "textDocument/diagnostic" && delay("RSVELTE_TEST_SLOW_DIAGNOSTIC_MS").is_some() {
             // A check that takes long, while every other request is answered.
             let id = json_id(&message);
