@@ -85,3 +85,38 @@ fn every_keystroke_of_a_then_binding_with_an_auto_closed_brace() {
     );
     type_out("", "{#await p then value", "}\n\t<p>done</p>\n{/await}\n");
 }
+
+#[test]
+fn an_each_block_with_nothing_typed_after_as() {
+    assert_eq!(
+        convert(&[HEAD, "{#each items as }\n<p>after</p>\n"].concat()),
+        [
+            RENDER,
+            " for(let $$each_item of __sveltets_2_ensureArray(items)){$$each_item;\n { svelteHTML.createElement(\"p\", {});  }}\n};\n",
+            TAIL
+        ]
+        .concat()
+    );
+}
+
+#[test]
+fn an_each_block_with_an_index_but_no_context() {
+    let code = convert(&[HEAD, "{#each items as , i}\n<p>{i}</p>\n{/each}\n"].concat());
+    assert!(
+        code.contains(
+            " for(let $$each_item of __sveltets_2_ensureArray(items)){$$each_item;let i = 1;"
+        ),
+        "{code}"
+    );
+}
+
+#[test]
+fn every_keystroke_of_an_each_block_with_an_auto_closed_brace() {
+    type_out("", "{#each items as item, i (item)", "}\n<p>after</p>\n");
+    type_out("", "{#each items as { a, b }", "}\n<p>{a}</p>\n{/each}\n");
+    type_out("", "{#each items as [a, b]", "}\n<p>{a}</p>\n{/each}\n");
+    assert!(
+        convert(&[HEAD, "{#each items as item}\n<p>{item}</p>\n{/each}\n"].concat())
+            .contains("  for(let item of __sveltets_2_ensureArray(items)){\n"),
+    );
+}
