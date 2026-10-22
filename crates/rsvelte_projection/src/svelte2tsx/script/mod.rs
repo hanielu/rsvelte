@@ -15,6 +15,7 @@ mod nested_special_types;
 mod parse;
 mod props_rune;
 mod reactive;
+mod recovery;
 mod runes;
 mod script_facts;
 mod stores;
