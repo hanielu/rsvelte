@@ -1,8 +1,10 @@
 //! Position and URI translation at the tsgo protocol boundary.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -65,6 +67,38 @@ pub struct TsgoResponseMapper<'a> {
     /// as upstream does for definitions (see
     /// [`TsgoOverlay::map_definition_range`]).
     definition_locations: bool,
+    caches: MapperCaches<'a>,
+}
+
+/// What mapping one message reads about each document it names, found once
+/// rather than for every position: a response can carry thousands.
+struct MapperCaches<'a> {
+    /// The index of the overlay that serves a document, by shadow URI, with
+    /// the source path it was found for ([`TsgoResponseMapper::overlay_for_context`]).
+    overlays: RefCell<BTreeMap<String, (PathBuf, Option<usize>)>>,
+    /// [`FoldingTexts`] by shadow URI, with the source path they are for.
+    folding: RefCell<BTreeMap<String, (PathBuf, Option<Rc<FoldingTexts<'a>>>)>>,
+}
+
+impl MapperCaches<'_> {
+    const fn new() -> Self {
+        Self {
+            overlays: RefCell::new(BTreeMap::new()),
+            folding: RefCell::new(BTreeMap::new()),
+        }
+    }
+}
+
+/// What [`TsgoResponseMapper::folding_range_is_one_to_one`] reads about a
+/// document: both texts, their line indexes, and the source's scripts. The
+/// last is a parse of the whole component, which once ran for every range
+/// (about 1.9 s for a folding answer at 2,100 lines, review 4).
+struct FoldingTexts<'a> {
+    source_text: &'a str,
+    source_index: LineIndex,
+    scripts: EmbeddedRegions,
+    shadow_text: &'a str,
+    shadow_index: LineIndex,
 }
 
 impl<'a> TsgoResponseMapper<'a> {
@@ -76,6 +110,7 @@ impl<'a> TsgoResponseMapper<'a> {
             aliases: Vec::new(),
             clamp_request_ranges: false,
             definition_locations: false,
+            caches: MapperCaches::new(),
         }
     }
 
@@ -88,6 +123,7 @@ impl<'a> TsgoResponseMapper<'a> {
             aliases: Vec::new(),
             clamp_request_ranges: false,
             definition_locations: false,
+            caches: MapperCaches::new(),
         }
     }
 
@@ -103,6 +139,7 @@ impl<'a> TsgoResponseMapper<'a> {
             aliases: Vec::new(),
             clamp_request_ranges: false,
             definition_locations: false,
+            caches: MapperCaches::new(),
         }
     }
 
@@ -118,6 +155,7 @@ impl<'a> TsgoResponseMapper<'a> {
             aliases: Vec::new(),
             clamp_request_ranges: false,
             definition_locations: false,
+            caches: MapperCaches::new(),
         }
     }
 
@@ -133,6 +171,7 @@ impl<'a> TsgoResponseMapper<'a> {
             aliases: Vec::new(),
             clamp_request_ranges: false,
             definition_locations: false,
+            caches: MapperCaches::new(),
         }
     }
 
@@ -147,6 +186,7 @@ impl<'a> TsgoResponseMapper<'a> {
             aliases: Vec::new(),
             clamp_request_ranges: false,
             definition_locations: false,
+            caches: MapperCaches::new(),
         }
     }
 
@@ -215,6 +255,7 @@ impl<'a> TsgoResponseMapper<'a> {
                 aliases: self.aliases.clone(),
                 clamp_request_ranges: true,
                 definition_locations: false,
+                caches: MapperCaches::new(),
             };
             return clamping.map_transactional(method, params, Direction::SourceToShadow);
         }
@@ -247,6 +288,7 @@ impl<'a> TsgoResponseMapper<'a> {
                 aliases: self.aliases.clone(),
                 clamp_request_ranges: self.clamp_request_ranges,
                 definition_locations: true,
+                caches: MapperCaches::new(),
             };
             return definitions.map_response(method, result);
         }
@@ -471,21 +513,18 @@ impl<'a> TsgoResponseMapper<'a> {
         shadow: Range,
         source: Range,
     ) -> bool {
-        let Some(overlay) = self.overlay_for_context(context) else {
+        let Some(texts) = self.folding_texts(context) else {
             return true;
         };
-        let Some(source_text) = overlay.source_text(&context.source_path) else {
-            return true;
-        };
-        let Some(shadow_text) = overlay
-            .shadow_for_source(&context.source_path)
-            .map(|document| document.text.as_str())
-        else {
-            return true;
-        };
-        let source_index = LineIndex::new(source_text);
+        let FoldingTexts {
+            source_text,
+            source_index,
+            scripts,
+            shadow_text,
+            shadow_index,
+        } = &*texts;
         let start = source_index.offset(source_text, source.start);
-        if crate::context::EmbeddedRegions::new(source_text).in_script(start) {
+        if scripts.in_script(start) {
             return true;
         }
         let end = source_index.offset(source_text, source.end);
@@ -495,12 +534,39 @@ impl<'a> TsgoResponseMapper<'a> {
         if original.is_empty() {
             return false;
         }
-        let shadow_index = LineIndex::new(shadow_text);
         let generated = shadow_text.get(
             shadow_index.offset(shadow_text, shadow.start)
                 ..shadow_index.offset(shadow_text, shadow.end),
         );
         generated.is_some_and(|generated| original.trim() == generated.trim())
+    }
+
+    /// [`FoldingTexts`] for a document, built once per message.
+    fn folding_texts(&self, context: &RequestDocumentContext) -> Option<Rc<FoldingTexts<'a>>> {
+        let key = context.shadow_uri.as_str();
+        if let Some((path, texts)) = self.caches.folding.borrow().get(key)
+            && *path == context.source_path
+        {
+            return texts.clone();
+        }
+        let texts = self.overlay_for_context(context).and_then(|overlay| {
+            let source_text = overlay.source_text(&context.source_path)?;
+            let shadow_text = overlay
+                .shadow_for_source(&context.source_path)
+                .map(|document| document.text.as_str())?;
+            Some(Rc::new(FoldingTexts {
+                source_text,
+                source_index: LineIndex::new(source_text),
+                scripts: EmbeddedRegions::new(source_text),
+                shadow_text,
+                shadow_index: LineIndex::new(shadow_text),
+            }))
+        });
+        self.caches.folding.borrow_mut().insert(
+            key.to_string(),
+            (context.source_path.clone(), texts.clone()),
+        );
+        texts
     }
 
     fn map_uri_value(&self, value: &mut Value, direction: Direction) {
@@ -726,12 +792,25 @@ impl<'a> TsgoResponseMapper<'a> {
         true
     }
 
+    /// The overlay that serves a document, found once per message: each
+    /// overlay's lookup canonicalizes the source path on disk.
     fn overlay_for_context(&self, context: &RequestDocumentContext) -> Option<&'a TsgoOverlay> {
-        self.overlays.iter().find(|overlay| {
+        let key = context.shadow_uri.as_str();
+        if let Some((path, index)) = self.caches.overlays.borrow().get(key)
+            && *path == context.source_path
+        {
+            return index.map(|index| &self.overlays[index]);
+        }
+        let index = self.overlays.iter().position(|overlay| {
             overlay
                 .shadow_for_source(&context.source_path)
                 .is_some_and(|shadow| shadow.shadow_uri == context.shadow_uri)
-        })
+        });
+        self.caches
+            .overlays
+            .borrow_mut()
+            .insert(key.to_string(), (context.source_path.clone(), index));
+        index.map(|index| &self.overlays[index])
     }
 
     fn alias_for_uri(&self, uri: &str) -> Option<&UriAlias> {
@@ -1786,6 +1865,84 @@ mod tests {
             .map_source_range(&path, source_range(source, "<div class=\"a\">"))
             .unwrap();
         assert_eq!(fold(element), 0, "the shadow rewrites the element");
+    }
+
+    /// A folding answer for a large component reads the component once,
+    /// not once per range (review 4: a whole parse per range, about 1.9 s
+    /// for one answer at 2,100 lines), and every range gets the answer it
+    /// gets on its own.
+    #[test]
+    fn a_folding_answer_reads_its_component_once_and_maps_each_range_as_alone() {
+        use std::fmt::Write as _;
+        use std::time::Instant;
+
+        let mut source = "<script>\n".to_string();
+        let mut template = String::new();
+        for index in 0..300 {
+            writeln!(source, "function f{index}() {{\n\treturn {index};\n}}").unwrap();
+            writeln!(
+                template,
+                "<div class=\"r{index}\">\n\t<p>{{f{index}()}}</p>\n</div>"
+            )
+            .unwrap();
+        }
+        source.push_str("</script>\n");
+        source.push_str(&template);
+        let (_workspace, path, overlay) = overlay(&source);
+        let source_uri = overlay.shadow_for_source(&path).unwrap().source_uri.clone();
+        let params = json!({ "textDocument": { "uri": source_uri.as_str() } });
+        let context = TsgoResponseMapper::for_request(&overlay, &params)
+            .default_document()
+            .cloned()
+            .unwrap();
+        let ranges = source
+            .match_indices("function f")
+            .map(|(start, _)| (start, source[start..].find("\n}").unwrap() + 2))
+            .chain(
+                source
+                    .match_indices("<div class")
+                    .map(|(start, _)| (start, source[start..].find("</div>").unwrap() + 6)),
+            )
+            .filter_map(|(start, length)| {
+                overlay
+                    .map_source_range(&path, source_range(&source, &source[start..start + length]))
+            })
+            .map(|range| {
+                json!({
+                    "startLine": range.start.line,
+                    "startCharacter": range.start.character,
+                    "endLine": range.end.line,
+                    "endCharacter": range.end.character
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(ranges.len() >= 400, "{}", ranges.len());
+        let fold = |ranges: &[Value]| {
+            let mapper = TsgoResponseMapper::with_default_document(&overlay, Some(context.clone()));
+            let mut response = Value::Array(ranges.to_vec());
+            mapper.map_response("textDocument/foldingRange", &mut response);
+            response.as_array().cloned().unwrap_or_default()
+        };
+        let started = Instant::now();
+        let together = fold(&ranges);
+        let together_took = started.elapsed();
+        let started = Instant::now();
+        let alone = ranges
+            .iter()
+            .flat_map(|range| fold(std::slice::from_ref(range)))
+            .collect::<Vec<_>>();
+        let alone_took = started.elapsed();
+        assert_eq!(together, alone);
+        assert!(
+            !together.is_empty() && together.len() < ranges.len(),
+            "script spans are kept and template spans dropped: {} of {}",
+            together.len(),
+            ranges.len()
+        );
+        assert!(
+            together_took * 5 < alone_took,
+            "one answer took {together_took:?}, its ranges one at a time {alone_took:?}"
+        );
     }
 
     #[test]
