@@ -270,24 +270,25 @@ pub fn handle_snippet_block_inner(
     // leading `const`, the return-type annotation, and the generic `<typeParams>`
     // — mirroring upstream's `addImplicitSnippetProp` transforms — and closes
     // with a trailing `,` so it slots into the component `props` object literal.
-    let header = if as_component_prop {
-        format!(
-            "{name_text}:({params_text}) => {{ async ()/*\u{03A9}ignore_position\u{03A9}*/ => {{"
+    //
+    // The header is `{lead}{name}{mid}{params}{tail}`.
+    let (lead, mid, tail) = if as_component_prop {
+        (
+            String::new(),
+            ":(".to_string(),
+            ") => { async ()/*\u{03A9}ignore_position\u{03A9}*/ => {",
         )
     } else if use_ts_syntax {
-        format!(
-            "{}const {}/*\u{03A9}ignore_position\u{03A9}*/ = {}({})/*\u{03A9}ignore_start\u{03A9}*/: ReturnType<import('svelte').Snippet>/*\u{03A9}ignore_end\u{03A9}*/ => {{ async ()/*\u{03A9}ignore_position\u{03A9}*/ => {{",
-            opener_pad(block, source),
-            name_text,
-            type_params_str,
-            params_text
+        (
+            format!("{}const ", opener_pad(block, source)),
+            format!("/*\u{03A9}ignore_position\u{03A9}*/ = {type_params_str}("),
+            ")/*\u{03A9}ignore_start\u{03A9}*/: ReturnType<import('svelte').Snippet>/*\u{03A9}ignore_end\u{03A9}*/ => { async ()/*\u{03A9}ignore_position\u{03A9}*/ => {",
         )
     } else {
-        format!(
-            "{}const {}/*\u{03A9}ignore_position\u{03A9}*/ = /** @returns {{ReturnType<import('svelte').Snippet>}} */ ({}) => {{ async ()/*\u{03A9}ignore_position\u{03A9}*/ => {{",
-            opener_pad(block, source),
-            name_text,
-            params_text
+        (
+            format!("{}const ", opener_pad(block, source)),
+            "/*\u{03A9}ignore_position\u{03A9}*/ = /** @returns {ReturnType<import('svelte').Snippet>} */ (".to_string(),
+            ") => { async ()/*\u{03A9}ignore_position\u{03A9}*/ => {",
         )
     };
     let closing = if as_component_prop {
@@ -295,8 +296,42 @@ pub fn handle_snippet_block_inner(
     } else {
         "};return __sveltets_2_any(0)};"
     };
+    // The header ends where the body starts, or with the block when the body is
+    // empty, and then also carries the closing.
+    let (header_end, header_tail) = if has_body_nodes {
+        (body_start, tail.to_string())
+    } else {
+        (block.end, format!("{tail}{closing}"))
+    };
+    match header_in_place(block, source, header_end) {
+        Some(((name_start, name_end), params)) => {
+            // Upstream overwrites the block's opening around the snippet's name
+            // and its parameter list, which keep their own mappings: a rename of
+            // the snippet, or of a type its parameters use, lands on the
+            // author's text.
+            str.overwrite(block.start, name_start, &lead);
+            match params {
+                Some((params_start, params_end)) => {
+                    str.overwrite(name_end, params_start, &mid);
+                    str.overwrite(params_end, header_end, &header_tail);
+                }
+                None => {
+                    str.overwrite_fmt(name_end, header_end, format_args!("{mid}{header_tail}"));
+                }
+            }
+        }
+        None => {
+            str.overwrite_fmt(
+                block.start,
+                header_end,
+                format_args!("{lead}{name_text}{mid}{params_text}{header_tail}"),
+            );
+        }
+    }
+    // Empty body: the whole `{#snippet name(params)}{/snippet}` is the header,
+    // which carries the closing (with a separate overwrite for it, both would
+    // land at the same offset and the closing was lost).
     if has_body_nodes {
-        str.overwrite(block.start, body_start, &header);
         // Process body at depth 0: official resets `element = undefined` when
         // entering a SnippetBlock, so element/component names inside a snippet
         // body always count depth from the snippet (e.g. `<Child>` directly in
@@ -311,13 +346,30 @@ pub fn handle_snippet_block_inner(
 
         let body_end = block.body.nodes.last().unwrap().end();
         close_block(str, body_end, block.end, closing);
-    } else {
-        // Empty body: collapse the whole `{#snippet name(params)}{/snippet}`
-        // into a single declaration. Without this branch the closing
-        // `};return __sveltets_2_any(0)};` was never emitted because both the
-        // body-start overwrite and the would-be closing overwrite landed at
-        // the same offset.
-        let combined = format!("{header}{closing}");
-        str.overwrite(block.start, block.end, &combined);
     }
+}
+
+/// The ranges of the snippet's name and, if it has any, its parameter list,
+/// when the header can be written around them: each lies inside the block's
+/// opening, in order, with generated text to go before, between and after them.
+fn header_in_place(
+    block: &SnippetBlock,
+    source: &str,
+    header_end: u32,
+) -> Option<((u32, u32), Option<(u32, u32)>)> {
+    let (name_start, name_end) = get_expression_range(&block.expression)?;
+    if !(block.start < name_start && name_start < name_end && name_end < header_end) {
+        return None;
+    }
+    let params = match params_range(block, source) {
+        Some((start, end)) if start < end => {
+            let (start, end) = (u32::try_from(start).ok()?, u32::try_from(end).ok()?);
+            if !(name_end < start && end < header_end) {
+                return None;
+            }
+            Some((start, end))
+        }
+        _ => None,
+    };
+    Some(((name_start, name_end), params))
 }

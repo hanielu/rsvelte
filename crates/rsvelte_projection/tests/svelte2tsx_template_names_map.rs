@@ -11,12 +11,18 @@ use rsvelte_projection::{
 };
 
 fn project(source: &str) -> ProjectionArtifact {
+    project_with(source, true)
+}
+
+/// A JavaScript component is projected as the language server does, with JSDoc.
+fn project_with(source: &str, is_ts_file: bool) -> ProjectionArtifact {
     ProjectionEngine::new()
         .project(
             source,
             Svelte2TsxOptions {
                 filename: "Card.svelte".to_string(),
-                is_ts_file: true,
+                is_ts_file,
+                emit_jsdoc: !is_ts_file,
                 ..Default::default()
             },
         )
@@ -123,4 +129,68 @@ fn a_named_slot_components_closing_tag_keeps_its_name_in_place() {
         assert_maps_in_place(&artifact, source, nth_offset(source, "</Inner>", nth, 2), 5);
         assert_maps_in_place(&artifact, source, nth_offset(source, "</Outer>", nth, 2), 5);
     }
+}
+
+#[test]
+fn a_snippets_name_and_parameters_keep_their_place() {
+    let source = "<script lang=\"ts\">\n\timport Child from \"./Child.svelte\";\n\ttype Size = \"sm\" | \"lg\";\n\ttype Row = { id: string; size: Size };\n\tlet rows: Row[] = $state([]);\n</script>\n{#snippet cell(x: Size, r: Row)}<td>{r.id}{x}</td>{/snippet}\n{#snippet empty()}{/snippet}\n{#snippet generic<T extends Size>(v: T)}{v}{/snippet}\n{#snippet commented(/* c */ a: number = 1)}{a}{/snippet}\n{#snippet  spaced ( s : Size ) }{s}{/snippet}\n{#snippet noparams()}<b>x</b>{/snippet}\n{#snippet onlyempty(e: Size)}{/snippet}\n{@render cell(\"sm\", rows[0])}\n<Child>{#snippet named(q: Size)}{q}{/snippet}</Child>\n<div>{#snippet inner(y: Size)}{y}{/snippet}{@render inner(\"lg\")}</div>\n";
+    let artifact = project(source);
+    assert_code_contains(
+        &artifact,
+        &[
+            " const cell/*\u{03A9}ignore_position\u{03A9}*/ = (x: Size, r: Row)/*\u{03A9}ignore_start\u{03A9}*/: ReturnType<import('svelte').Snippet>/*\u{03A9}ignore_end\u{03A9}*/ => { async ()/*\u{03A9}ignore_position\u{03A9}*/ => { { svelteHTML.createElement(\"td\", {});r.id;x; }};return __sveltets_2_any(0)};  const empty/*\u{03A9}ignore_position\u{03A9}*/ = ()/*\u{03A9}ignore_start\u{03A9}*/: ReturnType<import('svelte').Snippet>/*\u{03A9}ignore_end\u{03A9}*/ => { async ()/*\u{03A9}ignore_position\u{03A9}*/ => {};return __sveltets_2_any(0)};  const generic/*\u{03A9}ignore_position\u{03A9}*/ = <T extends Size>(v: T)/*\u{03A9}ignore_start\u{03A9}*/",
+            " const commented/*\u{03A9}ignore_position\u{03A9}*/ = (/* c */ a: number = 1)/*\u{03A9}ignore_start\u{03A9}*/",
+            "   const spaced/*\u{03A9}ignore_position\u{03A9}*/ = (s : Size)/*\u{03A9}ignore_start\u{03A9}*/",
+            " const onlyempty/*\u{03A9}ignore_position\u{03A9}*/ = (e: Size)/*\u{03A9}ignore_start\u{03A9}*/: ReturnType<import('svelte').Snippet>/*\u{03A9}ignore_end\u{03A9}*/ => { async ()/*\u{03A9}ignore_position\u{03A9}*/ => {};return __sveltets_2_any(0)};\n",
+            "props: {named:(q: Size) => { async ()/*\u{03A9}ignore_position\u{03A9}*/ => {q;};return __sveltets_2_any(0)},}});",
+            "{ svelteHTML.createElement(\"div\", {}); const inner/*\u{03A9}ignore_position\u{03A9}*/ = (y: Size)/*\u{03A9}ignore_start\u{03A9}*/",
+        ],
+    );
+    for name in [
+        "cell(",
+        "empty(",
+        "generic<",
+        "commented(",
+        " spaced ",
+        "noparams(",
+        "onlyempty(",
+        "named(",
+        "inner(",
+    ] {
+        let at = nth_offset(source, &format!("{{#snippet {name}"), 0, 10);
+        let at = at + source[at..].find(|c: char| c != ' ').unwrap();
+        let len = source[at..].find(|c: char| !c.is_alphanumeric()).unwrap();
+        assert_maps_in_place(&artifact, source, at, len);
+    }
+    for params in [
+        "x: Size, r: Row",
+        "v: T",
+        "/* c */ a: number = 1",
+        "s : Size",
+        "e: Size",
+        "q: Size",
+        "y: Size",
+    ] {
+        assert_maps_in_place(
+            &artifact,
+            source,
+            nth_offset(source, params, 0, 0),
+            params.len(),
+        );
+    }
+}
+
+#[test]
+fn a_javascript_snippets_name_and_parameters_keep_their_place() {
+    let source = "<script>\n\tlet n = 1;\n</script>\n{#snippet cell(x)}<td>{x}</td>{/snippet}\n{#snippet none()}{/snippet}\n{@render cell(n)}\n";
+    let artifact = project_with(source, false);
+    assert_code_contains(
+        &artifact,
+        &[
+            " const cell/*\u{03A9}ignore_position\u{03A9}*/ = /** @returns {ReturnType<import('svelte').Snippet>} */ (x) => { async ()/*\u{03A9}ignore_position\u{03A9}*/ => { { svelteHTML.createElement(\"td\", {});x; }};return __sveltets_2_any(0)};  const none/*\u{03A9}ignore_position\u{03A9}*/ = /** @returns {ReturnType<import('svelte').Snippet>} */ () => { async ()/*\u{03A9}ignore_position\u{03A9}*/ => {};return __sveltets_2_any(0)};\n",
+        ],
+    );
+    assert_maps_in_place(&artifact, source, nth_offset(source, "cell(x)", 0, 0), 4);
+    assert_maps_in_place(&artifact, source, nth_offset(source, "cell(x)", 0, 5), 1);
+    assert_maps_in_place(&artifact, source, nth_offset(source, "none()", 0, 0), 4);
 }
