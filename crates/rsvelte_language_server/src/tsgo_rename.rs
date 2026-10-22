@@ -606,7 +606,8 @@ fn correct_shorthand(
     let start = index.offset(source, range.start);
     let end = index.offset(source, range.end).max(start);
     let Some((public, value)) = split_rename_pair(raw_replacement) else {
-        return (range, raw_replacement.to_string());
+        return expand_directive_shorthand(source, &index, start, end, raw_replacement)
+            .unwrap_or_else(|| (range, raw_replacement.to_string()));
     };
 
     let directive = source[..start]
@@ -629,6 +630,68 @@ fn correct_shorthand(
     // A key/value pair outside Svelte shorthand syntax is already a complete
     // TypeScript replacement and must retain tsgo's prefix/suffix semantics.
     (range, raw_replacement.to_string())
+}
+
+/// The directives whose shorthand names both the directive and the variable
+/// it reads: `bind:value` binds the property `value` to the variable `value`,
+/// `class:active` toggles the class `active` by the variable `active`.
+const SHORTHAND_DIRECTIVES: [&str; 4] = ["bind:", "let:", "class:", "style:"];
+
+/// A plain rename of the variable a directive shorthand reads (an element's
+/// `bind:value`: svelte2tsx keeps the property as a string key and maps the
+/// directive's name to the variable alone, so tsgo replaces just the name)
+/// renames the variable, not the property, class or style: the shorthand
+/// becomes `name={new}`, after any modifiers (`style:color|important`).
+/// Review 6: `<input bind:value />` became `<input bind:text />`.
+fn expand_directive_shorthand(
+    source: &str,
+    index: &LineIndex,
+    start: usize,
+    end: usize,
+    replacement: &str,
+) -> Option<(Range, String)> {
+    if !is_identifier(replacement) || !is_identifier(source.get(start..end)?) {
+        return None;
+    }
+    let directive = SHORTHAND_DIRECTIVES
+        .iter()
+        .find_map(|prefix| source[..start].strip_suffix(prefix))?;
+    if !directive.ends_with(|character: char| character.is_ascii_whitespace()) {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let mut name_end = end;
+    while bytes.get(name_end) == Some(&b'|') {
+        name_end += 1;
+        while bytes
+            .get(name_end)
+            .is_some_and(|byte| is_identifier_byte(*byte))
+        {
+            name_end += 1;
+        }
+    }
+    if bytes
+        .get(name_end)
+        .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(byte, b'/' | b'>'))
+    {
+        return None;
+    }
+    Some((
+        Range::new(
+            index.position(source, start),
+            index.position(source, name_end),
+        ),
+        format!("{}={{{replacement}}}", &source[start..name_end]),
+    ))
+}
+
+/// Whether `text` is one JavaScript identifier (as the rename module reads
+/// them: ASCII letters, digits, `_`, `$` and any non-ASCII character).
+fn is_identifier(text: &str) -> bool {
+    text.bytes()
+        .next()
+        .is_some_and(|first| !first.is_ascii_digit())
+        && text.bytes().all(is_identifier_byte)
 }
 
 fn split_rename_pair(replacement: &str) -> Option<(&str, &str)> {
@@ -1071,6 +1134,53 @@ mod tests {
         assert_eq!(
             correct_shorthand(source, slot, "slot: renamed", "renamed"),
             (slot, "slot={renamed}".to_string())
+        );
+    }
+
+    /// A rename of the variable a directive shorthand reads that tsgo answers
+    /// with the plain new name (review 6: an element's `bind:value`) expands
+    /// the shorthand, keeping the property, class or style name; an explicit
+    /// directive value, or a name that is no shorthand's, is left alone.
+    #[test]
+    fn a_plain_rename_of_a_directive_shorthand_expands_it() {
+        let source = "<input bind:value />\n<p class:active style:color|important\nclass:on={on}>x</p><i bind:value>";
+        let index = LineIndex::new(source);
+        let at = |needle: &str| {
+            let start = source.find(needle).unwrap();
+            Range::new(
+                index.position(source, start),
+                index.position(source, start + needle.len()),
+            )
+        };
+        let applied = |range: Range, replacement: &str| {
+            let (range, text) = correct_shorthand(source, range, replacement, replacement);
+            let start = index.offset(source, range.start);
+            let end = index.offset(source, range.end);
+            format!("{}{text}{}", &source[..start], &source[end..])
+        };
+        assert!(applied(at("value"), "text").starts_with("<input bind:value={text} />"));
+        assert!(applied(at("active"), "on").contains("<p class:active={on} style:color"));
+        assert!(applied(at("color"), "hue").contains("style:color|important={hue}\n"));
+        let last = source.rfind("value").unwrap();
+        let last = Range::new(
+            index.position(source, last),
+            index.position(source, last + "value".len()),
+        );
+        assert!(applied(last, "text").ends_with("<i bind:value={text}>"));
+        // `class:on={on}`: the value is a variable of its own.
+        let value = source.find("{on}").unwrap() + 1;
+        let value = Range::new(
+            index.position(source, value),
+            index.position(source, value + 2),
+        );
+        assert_eq!(
+            correct_shorthand(source, value, "off", "off"),
+            (value, "off".to_string())
+        );
+        // A replacement that is no plain identifier is tsgo's own.
+        assert_eq!(
+            correct_shorthand(source, at("value"), "a.b", "a.b"),
+            (at("value"), "a.b".to_string())
         );
     }
 
