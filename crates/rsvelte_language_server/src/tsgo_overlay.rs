@@ -13,6 +13,7 @@
 //! each `didOpen` a file *creation* for tsgo, so it rebuilds the whole program
 //! once per component before it can answer the first request.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
@@ -858,7 +859,11 @@ impl TsgoOverlay {
         let mut tokens = parse_mapping_tokens(&source_path, projection_source_map.as_deref())?;
         let original_generated = artifact.code;
         let original_index = LineIndex::new(&original_generated);
-        let (generated_text, import_insertions) = rewrite_plain_svelte_imports(&original_generated);
+        let package_imports = self.package_import_scope(&source_path);
+        let (generated_text, import_insertions) =
+            rewrite_shadow_imports(&original_generated, |specifier| {
+                package_imports.as_ref()?.respell(specifier)
+            });
         let insertion_positions = import_insertions
             .iter()
             .map(|(original_offset, generated_range)| {
@@ -1328,8 +1333,11 @@ impl TsgoOverlay {
                 continue;
             };
             let module = !path.to_string_lossy().ends_with(".svelte");
+            let package_imports = OnceCell::new();
             for specifier in svelte_specifiers(&text) {
-                for target in resolve_svelte_specifier(directory, specifier, &aliases) {
+                let targets =
+                    self.svelte_targets(&path, directory, specifier, &aliases, &package_imports);
+                for target in targets {
                     let target = fs::canonicalize(&target).unwrap_or(target);
                     if module && target.starts_with(&self.mirror_root) && target.is_file() {
                         self.module_imports.insert(target.clone());
@@ -1381,16 +1389,23 @@ impl TsgoOverlay {
         let Some(directory) = source_path.parent() else {
             return false;
         };
+        let package_imports = OnceCell::new();
         svelte_specifiers(text).into_iter().any(|specifier| {
-            resolve_svelte_specifier(directory, specifier, self.alias_patterns())
-                .iter()
-                .any(|target| {
-                    target.starts_with(&self.mirror_root)
-                        && !self.entries.contains_key(target)
-                        && (target.is_file() || is_open(target))
-                        && fs::canonicalize(target)
-                            .map_or(true, |canonical| !self.entries.contains_key(&canonical))
-                })
+            self.svelte_targets(
+                source_path,
+                directory,
+                specifier,
+                self.alias_patterns(),
+                &package_imports,
+            )
+            .iter()
+            .any(|target| {
+                target.starts_with(&self.mirror_root)
+                    && !self.entries.contains_key(target)
+                    && (target.is_file() || is_open(target))
+                    && fs::canonicalize(target)
+                        .map_or(true, |canonical| !self.entries.contains_key(&canonical))
+            })
         })
     }
 
@@ -1477,8 +1492,11 @@ impl TsgoOverlay {
                 continue;
             };
             let module = !path.to_string_lossy().ends_with(".svelte");
+            let package_imports = OnceCell::new();
             for specifier in svelte_specifiers(&text) {
-                for target in resolve_svelte_specifier(directory, specifier, aliases) {
+                for target in
+                    self.svelte_targets(&path, directory, specifier, aliases, &package_imports)
+                {
                     let Ok(target) = fs::canonicalize(&target) else {
                         if target.starts_with(&self.mirror_root) {
                             missing.insert(target);
@@ -1537,9 +1555,15 @@ impl TsgoOverlay {
             let Some(directory) = path.parent() else {
                 continue;
             };
+            let package_imports = OnceCell::new();
             for specifier in svelte_specifiers(&entry.source_text) {
-                for target in resolve_svelte_specifier(directory, specifier, self.alias_patterns())
-                {
+                for target in self.svelte_targets(
+                    &path,
+                    directory,
+                    specifier,
+                    self.alias_patterns(),
+                    &package_imports,
+                ) {
                     let target = if self.entries.contains_key(&target) {
                         target
                     } else {
@@ -1552,6 +1576,30 @@ impl TsgoOverlay {
             }
         }
         reached
+    }
+
+    /// The files a `.svelte` specifier in `importer` may name: relative to
+    /// its `directory`, through the project's `paths`, or through the
+    /// `imports` of the package `importer` is in (read once per importer,
+    /// into `package_imports`, and only for a `#` specifier).
+    fn svelte_targets(
+        &self,
+        importer: &Path,
+        directory: &Path,
+        specifier: &str,
+        aliases: &[AliasPattern],
+        package_imports: &OnceCell<Option<PackageImportScope>>,
+    ) -> Vec<PathBuf> {
+        let mut targets = resolve_svelte_specifier(directory, specifier, aliases);
+        if specifier.starts_with('#') {
+            targets.extend(
+                package_imports
+                    .get_or_init(|| self.package_imports_of(importer))
+                    .as_ref()
+                    .and_then(|scope| scope.target(specifier)),
+            );
+        }
+        targets
     }
 
     /// The project's `paths` patterns, with each target absolute, plus the
@@ -2198,35 +2246,15 @@ impl TsgoOverlay {
     /// components the project holds and of the project itself; a pattern two
     /// of them map differently keeps the project's own mapping, or none.
     fn package_import_paths(&self) -> BTreeMap<String, Vec<serde_json::Value>> {
-        let package_scope = |directory: &Path| {
-            directory
-                .ancestors()
-                .take_while(|ancestor| ancestor.starts_with(&self.mirror_root))
-                .map(|ancestor| ancestor.join("package.json"))
-                .find(|package| package.is_file())
-        };
-        let own = package_scope(&self.workspace);
+        let own = self.package_scope(&self.workspace);
         let mut scopes = self
             .entries
             .values()
             .filter(|entry| entry.is_component())
-            .filter_map(|entry| package_scope(entry.source_path.parent()?))
+            .filter_map(|entry| self.package_scope(entry.source_path.parent()?))
             .collect::<BTreeSet<_>>();
         scopes.extend(own.clone());
-        let conditions = self
-            .source_tsconfig
-            .as_deref()
-            .and_then(|config| resolve_config_value(config, "customConditions"))
-            .and_then(|value| {
-                value.as_array().map(|conditions| {
-                    conditions
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                })
-            })
-            .unwrap_or_default();
+        let conditions = self.custom_conditions();
         let mut mappings = BTreeMap::<String, (bool, Vec<serde_json::Value>)>::new();
         let mut conflicted = BTreeSet::new();
         for scope in scopes {
@@ -2280,6 +2308,77 @@ impl TsgoOverlay {
             .filter(|(pattern, (own, _))| *own || !conflicted.contains(pattern))
             .map(|(pattern, (_, targets))| (pattern, targets))
             .collect()
+    }
+
+    /// The `package.json` whose scope `directory` is in, within the mirror.
+    fn package_scope(&self, directory: &Path) -> Option<PathBuf> {
+        directory
+            .ancestors()
+            .take_while(|ancestor| ancestor.starts_with(&self.mirror_root))
+            .map(|ancestor| ancestor.join("package.json"))
+            .find(|package| package.is_file())
+    }
+
+    /// The project's `customConditions`, which `imports` targets match.
+    fn custom_conditions(&self) -> Vec<String> {
+        self.source_tsconfig
+            .as_deref()
+            .and_then(|config| resolve_config_value(config, "customConditions"))
+            .and_then(|value| {
+                value.as_array().map(|conditions| {
+                    conditions
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    /// The `imports` a component's shadow respells: those of its package,
+    /// when that is not the project's own ([`PackageImportScope`]).
+    fn package_import_scope(&self, source: &Path) -> Option<PackageImportScope> {
+        let scope = self.package_imports_of(source)?;
+        let own = self.package_scope(&self.workspace);
+        (own.as_deref().and_then(Path::parent) != Some(scope.directory.as_path())).then_some(scope)
+    }
+
+    /// The `imports` of the package `source` is in.
+    fn package_imports_of(&self, source: &Path) -> Option<PackageImportScope> {
+        let component_directory = source.parent()?;
+        let scope = self.package_scope(component_directory)?;
+        let imports = fs::read_to_string(&scope)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|package| package.get("imports").cloned())?;
+        let conditions = self.custom_conditions();
+        let patterns = imports
+            .as_object()?
+            .iter()
+            .filter_map(|(pattern, target)| {
+                let stars = pattern.matches('*').count();
+                if !pattern.starts_with('#') || stars > 1 || pattern.ends_with('/') {
+                    return None;
+                }
+                let target = import_targets(target, &conditions)
+                    .into_iter()
+                    .find(|target| {
+                        target.starts_with("./") && target.matches('*').count() == stars
+                    })?;
+                let (prefix, suffix) = match pattern.split_once('*') {
+                    Some((prefix, suffix)) => (prefix.to_string(), Some(suffix.to_string())),
+                    None => (pattern.clone(), None),
+                };
+                Some((prefix, suffix, target.to_string()))
+            })
+            .collect::<Vec<_>>();
+        let directory = scope.parent()?.to_path_buf();
+        (!patterns.is_empty()).then(|| PackageImportScope {
+            directory,
+            component_directory: component_directory.to_path_buf(),
+            patterns,
+        })
     }
 
     /// The project's `baseUrl` as an absolute path, when it declares one.
@@ -3264,8 +3363,22 @@ fn walk_owned_files(dir: &Path, components: &mut Vec<PathBuf>, modules: &mut Vec
 }
 
 fn rewrite_plain_svelte_imports(source: &str) -> (String, Vec<(usize, std::ops::Range<usize>)>) {
+    rewrite_shadow_imports(source, |_| None)
+}
+
+/// [`rewrite_plain_svelte_imports`], which also respells each `#` specifier
+/// `package_import` resolves ([`PackageImportScope`]). The respelling keeps
+/// the specifier's offsets: it overwrites the specifier in place, padding a
+/// shorter one with `/` after its first `/` (`#lib/util.js` becomes
+/// `.////util.js`, which TypeScript normalises to `./util.js`), and inserts
+/// what a longer one has left at its end, as generated text.
+fn rewrite_shadow_imports(
+    source: &str,
+    package_import: impl Fn(&str) -> Option<String>,
+) -> (String, Vec<(usize, std::ops::Range<usize>)>) {
     let bytes = source.as_bytes();
-    let mut insertions = Vec::new();
+    let mut overwrites = Vec::<(usize, String)>::new();
+    let mut insertions = Vec::<(usize, String)>::new();
     let mut index = 0;
     while index < bytes.len() {
         let quote = bytes[index];
@@ -3290,35 +3403,132 @@ fn rewrite_plain_svelte_imports(source: &str) -> (String, Vec<(usize, std::ops::
             break;
         }
         let content = &source[content_start..index];
-        let svelte_end = content
-            .rfind(".svelte")
-            .map(|offset| content_start + offset + 7);
-        let suffix_ok = svelte_end
-            .is_some_and(|end| end == index || matches!(bytes.get(end), Some(b'?' | b'#')));
         let prefix = source[..start].trim_end();
         let module_context = prefix.ends_with("from")
             || prefix.ends_with("import")
             || prefix.ends_with("import(")
             || prefix.ends_with("require(");
+        let respelled = (module_context && content.starts_with('#') && content.is_ascii())
+            .then(|| package_import(content))
+            .flatten()
+            .filter(|respelled| respelled.is_ascii() && !respelled.is_empty());
+        if let Some(respelled) = respelled {
+            let mut written = respelled.clone();
+            let mut rest = String::new();
+            if written.len() < content.len() {
+                let pad = "/".repeat(content.len() - written.len());
+                let at = written.find('/').map_or(written.len(), |slash| slash + 1);
+                written.insert_str(at, &pad);
+            } else {
+                rest = written.split_off(content.len());
+            }
+            overwrites.push((content_start, written));
+            if respelled.ends_with(".svelte") {
+                rest.push_str(".tsx");
+            }
+            if !rest.is_empty() {
+                insertions.push((index, rest));
+            }
+            index += 1;
+            continue;
+        }
+        let svelte_end = content
+            .rfind(".svelte")
+            .map(|offset| content_start + offset + 7);
+        let suffix_ok = svelte_end
+            .is_some_and(|end| end == index || matches!(bytes.get(end), Some(b'?' | b'#')));
         if suffix_ok && module_context {
-            insertions.push(svelte_end.expect("checked above"));
+            insertions.push((svelte_end.expect("checked above"), ".tsx".to_string()));
         }
         index += 1;
     }
 
     let mut generated = source.to_string();
-    for &offset in insertions.iter().rev() {
-        generated.insert_str(offset, ".tsx");
+    for (offset, written) in &overwrites {
+        generated.replace_range(*offset..offset + written.len(), written);
     }
+    for (offset, text) in insertions.iter().rev() {
+        generated.insert_str(*offset, text);
+    }
+    let mut inserted = 0;
     let ranges = insertions
         .into_iter()
-        .enumerate()
-        .map(|(index, source)| {
-            let start = source + index * 4;
-            (source, start..start + 4)
+        .map(|(source, text)| {
+            let start = source + inserted;
+            inserted += text.len();
+            (source, start..start + text.len())
         })
         .collect();
     (generated, ranges)
+}
+
+/// The `package.json` `imports` of a component held by a project of another
+/// package (a copy). The overlay's `paths` carry the project's own
+/// `imports` ([`TsgoOverlay::package_import_paths`]), and `paths` apply to
+/// every file of the program, so a copy's `#lib` would resolve into the
+/// project's `src/lib`. Its shadow spells each of its own package's `#`
+/// specifiers as the path from the component to the target instead, which
+/// `rootDirs` resolves from the shadow as from the source.
+struct PackageImportScope {
+    directory: PathBuf,
+    component_directory: PathBuf,
+    /// `(prefix, suffix, target)`: `suffix` is `None` for an exact pattern;
+    /// a wildcard pattern's target holds its one `*`.
+    patterns: Vec<(String, Option<String>, String)>,
+}
+
+impl PackageImportScope {
+    /// The file `specifier` names, when the scope maps it: an exact pattern
+    /// first, else the wildcard pattern with the longest prefix, as Node and
+    /// TypeScript pick one.
+    fn target(&self, specifier: &str) -> Option<PathBuf> {
+        let target = self
+            .patterns
+            .iter()
+            .find(|(prefix, suffix, _)| suffix.is_none() && prefix == specifier)
+            .map(|(_, _, target)| target.clone())
+            .or_else(|| {
+                self.patterns
+                    .iter()
+                    .filter_map(|(prefix, suffix, target)| {
+                        let suffix = suffix.as_deref()?;
+                        let middle = specifier
+                            .strip_prefix(prefix.as_str())?
+                            .strip_suffix(suffix)?;
+                        Some((prefix.len(), target.replacen('*', middle, 1)))
+                    })
+                    .max_by_key(|(prefix, _)| *prefix)
+                    .map(|(_, target)| target)
+            })?;
+        Some(absolute_normalized(&self.directory.join(target)))
+    }
+
+    /// `specifier` respelled as the path from the component to its
+    /// [`Self::target`].
+    fn respell(&self, specifier: &str) -> Option<String> {
+        let target = self.target(specifier)?;
+        let from = self.component_directory.components().collect::<Vec<_>>();
+        let to = target.components().collect::<Vec<_>>();
+        let common = from
+            .iter()
+            .zip(&to)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let mut relative = if common == from.len() {
+            "./".to_string()
+        } else {
+            "../".repeat(from.len() - common)
+        };
+        let rest = to[common..]
+            .iter()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>();
+        if rest.is_empty() {
+            return None;
+        }
+        relative.push_str(&rest.join("/"));
+        Some(relative)
+    }
 }
 
 fn closest_source_token(tokens: &[MappingToken], source: Position) -> Option<MappingToken> {
@@ -5835,6 +6045,74 @@ mod tests {
             fs::symlink_metadata(overlay.shadow_dir.join("package.json")).is_err(),
             "the mirror root's own is found through the cache's ancestry"
         );
+    }
+
+    /// `paths` apply to the whole program, so a component of another package
+    /// that the project holds as a copy would resolve its own `#lib` into the
+    /// project's `src/lib` (both packages map `#lib/*` to `./src/lib/*`). The
+    /// copy's shadow spells its package's `#` specifiers as paths from the
+    /// component instead, at the same offsets, and the components it reaches
+    /// through them are copied too; the project's own components keep theirs.
+    #[test]
+    fn a_copy_resolves_its_package_imports_in_its_own_package() {
+        let workspace = TestWorkspace::new("package-imports-copy");
+        let root = fs::canonicalize(&workspace.0).unwrap();
+        write(&root.join("package.json"), r#"{ "name": "root" }"#);
+        for package in ["ui", "rt"] {
+            write(
+                &root.join(package).join("package.json"),
+                r##"{ "type": "module", "imports": { "#lib": "./src/lib/index.js", "#lib/*": "./src/lib/*" } }"##,
+            );
+            write(&root.join(package).join("tsconfig.json"), "{}");
+        }
+        let button = "<script lang=\"ts\">\n\timport type { Kind } from '#lib';\n\timport type { Size } from '#lib/util.js';\n\timport Icon from '#lib/Icon.svelte';\n\tlet { kind, size }: { kind: Kind; size: Size } = $props();\n</script>\n<Icon />{kind}{size}\n";
+        write(&root.join("ui/src/lib/Button.svelte"), button);
+        write(&root.join("ui/src/lib/Icon.svelte"), "<i />");
+        write(
+            &root.join("rt/src/lib/Editor.svelte"),
+            "<script lang=\"ts\">\n\timport Button from '../../../ui/src/lib/Button.svelte';\n\timport type { Size } from '#lib/util.js';\n</script>\n<Button kind=\"x\" size=\"y\" />\n",
+        );
+        let overlay =
+            TsgoOverlay::build_nested(&root.join("rt"), &root.join("rt/tsconfig.json"), &root)
+                .unwrap();
+        let copy = &overlay
+            .shadow_for_source(&root.join("ui/src/lib/Button.svelte"))
+            .expect("the imported component is copied")
+            .text;
+        assert!(copy.contains("from './index.js'"), "{copy}");
+        assert!(copy.contains("from './///util.js'"), "{copy}");
+        assert!(
+            copy.contains("from './///Icon.svelte.tsx'"),
+            "a component specifier is suffixed as well: {copy}"
+        );
+        assert!(!copy.contains("'#lib"), "{copy}");
+        assert!(
+            overlay
+                .shadow_for_source(&root.join("ui/src/lib/Icon.svelte"))
+                .is_some(),
+            "what the copy reaches through its package imports is copied too"
+        );
+        let own = &overlay
+            .shadow_for_source(&root.join("rt/src/lib/Editor.svelte"))
+            .unwrap()
+            .text;
+        assert!(own.contains("from '#lib/util.js'"), "{own}");
+
+        // The specifiers keep their offsets: a position after them on the
+        // same line, and the line below, map back to where they were.
+        let source = root.join("ui/src/lib/Button.svelte");
+        let shadow = overlay.entries[&source].shadow_path.clone();
+        for (line, needle) in [(2, "util.js';"), (3, "Icon.svelte';"), (4, "$props")] {
+            let column = button.lines().nth(line).unwrap().find(needle).unwrap() as u32;
+            let generated = overlay
+                .map_source_position(&source, Position::new(line as u32, column))
+                .expect("maps forward");
+            assert_eq!(
+                overlay.map_generated_position(&shadow, generated),
+                Some(Position::new(line as u32, column)),
+                "{needle}"
+            );
+        }
     }
 
     #[test]
