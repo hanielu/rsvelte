@@ -1815,6 +1815,281 @@ fn a_second_request_tsgo_would_loop_on_is_answered_without_it() {
     server.shutdown();
 }
 
+/// How many times tsgo was started for `shadow`: each start opens it again.
+#[cfg(unix)]
+fn shadow_opens(log: &Path, shadow: &str) -> usize {
+    traffic(log)
+        .iter()
+        .filter(|line| **line == format!("textDocument/didOpen {shadow}"))
+        .count()
+}
+
+/// Wait until tsgo has been started `count` times for `shadow`.
+#[cfg(unix)]
+fn wait_for_shadow_opens(
+    server: &mut Server,
+    log: &Path,
+    shadow: &str,
+    count: usize,
+    within: Duration,
+) {
+    let deadline = Instant::now() + within;
+    while shadow_opens(log, shadow) < count {
+        assert!(
+            Instant::now() < deadline,
+            "tsgo was not restarted: {:?}",
+            traffic(log)
+        );
+        server.probe();
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A completion at a position the model does not say tsrs loops on
+/// (`X.svelte`'s script has no `<`), in the editor's document.
+#[cfg(unix)]
+fn completion(server: &mut Server, uri: &str) -> i64 {
+    server.request(
+        "textDocument/completion",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 1, "character": 5 } }),
+    )
+}
+
+/// A tsrs loop the model misses (review 6: a regular expression on the
+/// walk's line) takes a worker for good, and with every worker looping tsrs
+/// answers nothing at all. tsgo is restarted once it has answered nothing
+/// for a timeout since a request it was sent, whatever the model says (the
+/// fake tsgo answers nothing after a completion the model clears), and
+/// answers again.
+#[cfg(unix)]
+#[test]
+fn a_tsgo_that_answers_nothing_is_restarted_whatever_the_model_says() {
+    let dir = TestDir::new("wedged-tsgo");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = one_project(&dir.0);
+    let mut server = Server::start_with_settings(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            (
+                "RSVELTE_TEST_TSGO_WEDGE",
+                Path::new("textDocument/completion"),
+            ),
+            ("RSVELTE_TSGO_REQUEST_TIMEOUT_MS", Path::new("1000")),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+    );
+    let x = file_uri(&root.join("X.svelte"));
+    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
+    assert!(hover(&mut server, &x).to_string().contains("recorded"));
+    let sent = Instant::now();
+    let lost = completion(&mut server, &x);
+    let unanswered = server.request(
+        "textDocument/hover",
+        json!({ "textDocument": { "uri": x }, "position": { "line": 1, "character": 5 } }),
+    );
+    server.response(lost, Duration::from_secs(10));
+    server.response(unanswered, Duration::from_secs(10));
+    wait_for_shadow_opens(&mut server, &log, &shadow, 2, Duration::from_secs(10));
+    assert!(
+        sent.elapsed() >= Duration::from_millis(900),
+        "restarted before a timeout passed: {:?}",
+        sent.elapsed()
+    );
+    assert!(hover(&mut server, &x).to_string().contains("recorded"));
+    server.shutdown();
+}
+
+/// tsrs answers a slow completion or signature help once it is done, even
+/// cancelled, and never one it loops on, which keeps a core busy for good.
+/// One the model does not say it loops on is answered without tsgo at the
+/// timeout and kept: while it is overdue, the editor's next completions in
+/// that document are answered without tsgo rather than sent (each would
+/// take another worker), and if tsgo has still not answered it after four
+/// timeouts, tsgo is restarted, though tsgo answers everything else.
+#[cfg(unix)]
+#[test]
+fn a_completion_tsgo_never_answers_restarts_it_after_four_timeouts() {
+    let dir = TestDir::new("suspect-completion");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = one_project(&dir.0);
+    let mut server = Server::start_with_settings(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            (
+                "RSVELTE_TEST_TSGO_IGNORE",
+                Path::new("textDocument/completion"),
+            ),
+            ("RSVELTE_TSGO_REQUEST_TIMEOUT_MS", Path::new("1000")),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+    );
+    let x = file_uri(&root.join("X.svelte"));
+    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
+    assert!(hover(&mut server, &x).to_string().contains("recorded"));
+    let sent_to_tsgo = |log: &Path| {
+        traffic(log)
+            .iter()
+            .filter(|line| line.starts_with("textDocument/completion "))
+            .count()
+    };
+    let sent = Instant::now();
+    let lost = completion(&mut server, &x);
+    // tsgo answers what it is asked after it.
+    assert!(hover(&mut server, &x).to_string().contains("recorded"));
+    server.response(lost, Duration::from_secs(10));
+    let asked = Instant::now();
+    let again = completion(&mut server, &x);
+    server.response(again, Duration::from_secs(10));
+    assert!(
+        asked.elapsed() < Duration::from_millis(500),
+        "a completion waited {:?} behind one tsgo has not answered",
+        asked.elapsed()
+    );
+    assert_eq!(sent_to_tsgo(&log), 1, "{:?}", traffic(&log));
+    while sent.elapsed() < Duration::from_millis(3_500) {
+        assert!(hover(&mut server, &x).to_string().contains("recorded"));
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        shadow_opens(&log, &shadow),
+        1,
+        "restarted within four timeouts, while tsgo answered hovers"
+    );
+    wait_for_shadow_opens(&mut server, &log, &shadow, 2, Duration::from_secs(10));
+    let after_restart = completion(&mut server, &x);
+    server.response(after_restart, Duration::from_secs(10));
+    assert_eq!(sent_to_tsgo(&log), 2, "not sent after the restart");
+    server.shutdown();
+}
+
+/// Each request tsrs loops on holds one of the three checkers a project has
+/// for them, so with three overdue at once tsrs answers nothing else about
+/// the project. Three overdue requests restart tsgo at their timeout, whatever
+/// the model says and though tsgo still answers other requests.
+#[cfg(unix)]
+#[test]
+fn as_many_overdue_requests_as_tsrs_runs_restart_tsgo() {
+    let dir = TestDir::new("saturated-tsgo");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = one_project(&dir.0);
+    let mut server = Server::start_with_settings(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            (
+                "RSVELTE_TEST_TSGO_IGNORE",
+                Path::new("textDocument/completion"),
+            ),
+            ("RSVELTE_TSGO_REQUEST_TIMEOUT_MS", Path::new("1000")),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+    );
+    let x = file_uri(&root.join("X.svelte"));
+    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
+    assert!(hover(&mut server, &x).to_string().contains("recorded"));
+    let sent = Instant::now();
+    let lost = [0, 1, 2].map(|_| completion(&mut server, &x));
+    while sent.elapsed() < Duration::from_millis(800) {
+        assert!(hover(&mut server, &x).to_string().contains("recorded"));
+        thread::sleep(Duration::from_millis(100));
+    }
+    for id in lost {
+        server.response(id, Duration::from_secs(10));
+    }
+    wait_for_shadow_opens(&mut server, &log, &shadow, 2, Duration::from_secs(10));
+    assert!(
+        sent.elapsed() < Duration::from_millis(3_500),
+        "restarted only after {:?}",
+        sent.elapsed()
+    );
+    server.shutdown();
+}
+
+/// Requests a check holds back are slow, not lost, however many there are,
+/// however long the check takes and whether or not the editor asks anything
+/// else meanwhile (review 5's slowmix.mjs: five; tsrs answers them just after
+/// the pull; on a busy machine its 7 s check took over 12 s, four of
+/// runall.sh's timeouts). Three overdue requests about a document whose pull
+/// is with tsgo for five timeouts, answered just after it, do not restart
+/// tsgo.
+#[cfg(unix)]
+#[test]
+fn requests_a_check_holds_back_do_not_restart_tsgo() {
+    let dir = TestDir::new("held-back-by-check");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = one_project(&dir.0);
+    let mut server = Server::start_with_capabilities(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            (
+                "RSVELTE_TEST_SLOW_METHODS",
+                Path::new(
+                    "textDocument/signatureHelp,textDocument/definition,textDocument/completion",
+                ),
+            ),
+            ("RSVELTE_TEST_SLOW_MS", Path::new("5200")),
+            ("RSVELTE_TEST_SLOW_DIAGNOSTIC_MS", Path::new("5000")),
+            ("RSVELTE_TEST_DIAGNOSTIC_WORD", Path::new("answer")),
+            ("RSVELTE_TSGO_REQUEST_TIMEOUT_MS", Path::new("1000")),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+        &json!({ "textDocument": { "diagnostic": {} } }),
+    );
+    let x = file_uri(&root.join("X.svelte"));
+    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
+    assert!(hover(&mut server, &x).to_string().contains("recorded"));
+    let pull = server.request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": x } }),
+    );
+    let slow = [
+        "textDocument/signatureHelp",
+        "textDocument/definition",
+        "textDocument/completion",
+    ]
+    .map(|method| {
+        server.request(
+            method,
+            json!({ "textDocument": { "uri": x }, "position": { "line": 1, "character": 5 } }),
+        )
+    });
+    for id in slow {
+        let answer = server.response(id, Duration::from_secs(10));
+        assert!(answer.get("result").is_some(), "{answer}");
+    }
+    let report = server.response(pull, Duration::from_secs(10));
+    assert_eq!(
+        report["result"]["items"][0]["code"], 2322,
+        "the pull lost its TypeScript half: {report}"
+    );
+    // Past the slow requests' answers and the timeout after the pull.
+    thread::sleep(Duration::from_millis(1_500));
+    server.probe();
+    assert!(hover(&mut server, &x).to_string().contains("recorded"));
+    assert_eq!(
+        shadow_opens(&log, &shadow),
+        1,
+        "tsgo was restarted: {:?}",
+        traffic(&log)
+    );
+    server.shutdown();
+}
+
 /// After tsgo restarts, the pulls it was asked for before were answered
 /// without it, so the editor is asked to pull again (review 4).
 #[cfg(unix)]
@@ -2214,6 +2489,10 @@ fn main() {
     // A pull reports one error on the first `RSVELTE_TEST_DIAGNOSTIC_WORD` of
     // the document, as opened.
     let diagnostic_word = std::env::var("RSVELTE_TEST_DIAGNOSTIC_WORD").ok();
+    // Once asked an `RSVELTE_TEST_TSGO_WEDGE` request, nothing is answered any
+    // more: tsrs with every worker looping.
+    let wedge = std::env::var("RSVELTE_TEST_TSGO_WEDGE").ok();
+    let mut wedged = false;
     let mut texts = std::collections::HashMap::new();
     let stdin = io::stdin();
     let mut input = stdin.lock();
@@ -2250,6 +2529,14 @@ fn main() {
             if let Some(text) = json_string_field(&message, "text") {
                 texts.insert(uri.clone(), text);
             }
+        }
+        if method == "exit" {
+            return;
+        }
+        wedged |= wedge.as_deref() == Some(method.as_str());
+        // A request tsgo loses: never answered, not even once cancelled.
+        if wedged || std::env::var("RSVELTE_TEST_TSGO_IGNORE").is_ok_and(|ignored| ignored == method) {
+            continue;
         }
         if method == "initialize" {
             let id = json_id(&message);
@@ -2310,8 +2597,6 @@ fn main() {
         } else if method == "$/cancelRequest" {
             // A notification (its `id` names the request): an answered request
             // stays answered, a lost one stays lost.
-        } else if std::env::var("RSVELTE_TEST_TSGO_IGNORE").is_ok_and(|ignored| ignored == method) {
-            // A request tsgo loses: never answered, not even once cancelled.
         } else if !method.is_empty() && message.contains(r#""id":"#) {
             let id = json_id(&message);
             answer(format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#));

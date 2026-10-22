@@ -1,6 +1,6 @@
 //! The LSP message loop.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
@@ -457,10 +457,72 @@ struct SentRequest {
     /// Whether tsrs loops on it for good ([`TsgoRuntime::loops_on`]).
     loops: bool,
     /// Answered without tsgo once overdue, and cancelled; still tracked
-    /// because tsgo loops on it ([`tsgo_loop::request_loops`]), until the
-    /// restart that ends the loop.
+    /// until tsgo answers it late (tsrs answers a slow request even once
+    /// cancelled) or restarts: tsrs never answers one it loops on, and one
+    /// the model ([`tsgo_loop`]) misses is told apart only by that
+    /// ([`Server::tsgo_restart_at`]).
     overdue: bool,
 }
+
+impl SentRequest {
+    /// An overdue completion or signature help the model does not say tsrs
+    /// loops on: the two requests tsrs is known to loop on, so possibly a
+    /// loop the model misses (review 6: regular expressions), possibly a
+    /// slow one ([`SUSPECT_RESTART_TIMEOUTS`]).
+    fn suspect(&self) -> bool {
+        self.overdue && !self.loops && may_loop(&self.method)
+    }
+}
+
+/// Whether tsrs can loop for good on a request of `method`
+/// (`docs/upstream/tsrs-lost-request` in svelte-rs).
+fn may_loop(method: &str) -> bool {
+    matches!(
+        method,
+        "textDocument/completion" | "textDocument/signatureHelp"
+    )
+}
+
+/// How many requests about one project tsrs runs at once: each project's
+/// checker pool has four checkers, one of them kept for diagnostics
+/// (`tsrs_project` `checkerpool.rs`), and a request holds one while it runs.
+/// With this many looping, tsrs answers nothing else about the project
+/// (review 5's loopstorm.mjs: three; review 6's missedloop.mjs: four), so
+/// this many overdue requests restart tsgo whatever the model says
+/// ([`Server::tsgo_restart_at`]).
+const TSRS_QUERY_CHECKERS: usize = 3;
+
+/// After how many timeouts an overdue completion or signature help the model
+/// does not say tsrs loops on restarts tsgo ([`SentRequest::suspect`]): tsrs
+/// answers a slow one once it is done, even cancelled, and never one it
+/// loops on, which keeps a core busy for good (review 6: 100% CPU for the
+/// rest of the session).
+const SUSPECT_RESTART_TIMEOUTS: u32 = 4;
+
+/// The [`RestartBackoff`] key of the restarts for a tsgo that answers nothing.
+fn liveness_key() -> (String, Option<String>) {
+    ("tsgo answers nothing".to_string(), None)
+}
+
+/// A reason to restart tsgo ([`Server::tsgo_restart_candidates`]).
+struct TsgoRestart {
+    /// When it falls due.
+    at: Instant,
+    /// What tsgo is still busy with, for the log.
+    why: String,
+    /// The [`RestartBackoff`] key it counts toward, and when the request
+    /// behind it was sent.
+    backoff: ((String, Option<String>), Instant),
+}
+
+/// Whether a request is the background's own, which has tsgo build a project
+/// ([`Server::warm_up`]).
+fn is_warm_up(id: &RequestId) -> bool {
+    id.to_string().contains(WARM_UP_ID)
+}
+
+/// The start of the ids of [`Server::warm_up`]'s requests.
+const WARM_UP_ID: &str = "rsvelte-background-warm-up-";
 
 /// A request tsgo answers whenever it is done: a document's check can take
 /// longer than any timeout and is not lost. tsrs answers a cancelled pull
@@ -563,6 +625,14 @@ struct TsgoRuntime {
     /// The requests tsgo has not answered yet. A cancelled request stays:
     /// tsgo answers those too, and one it never answers is still running.
     sent: RefCell<HashMap<RequestId, SentRequest>>,
+    /// When tsgo last answered a request that is not a diagnostic pull (or
+    /// started). tsrs checks a project's diagnostics with a checker of their
+    /// own, so it may answer pulls while every request it runs with the other
+    /// checkers loops ([`TSRS_QUERY_CHECKERS`]).
+    last_query_answer: Cell<Instant>,
+    /// For each document, when the last diagnostic pull of it tsgo answered
+    /// was sent and answered ([`Server::waiting_for_check_until`]).
+    pulls_answered: RefCell<HashMap<String, (Instant, Instant)>>,
 }
 
 /// tsgo takes a buffer's script kind from its language id. A JavaScript
@@ -774,6 +844,8 @@ impl TsgoRuntime {
             keep_alive: HashMap::new(),
             keep_all: false,
             sent: RefCell::new(HashMap::new()),
+            last_query_answer: Cell::new(Instant::now()),
+            pulls_answered: RefCell::new(HashMap::new()),
         })
     }
 
@@ -844,24 +916,57 @@ impl TsgoRuntime {
     }
 
     /// A request about the same document as `params` that tsgo has not
-    /// answered and loops on, when tsrs would loop on this one too
+    /// answered and loops on, when tsrs would loop on this one too, or an
+    /// overdue completion or signature help there it may loop on
+    /// ([`SentRequest::suspect`]), when this is one of those
     /// ([`Server::forward_tsgo_request_with_fallback`]).
     fn looping_on_document(&self, method: &str, params: &serde_json::Value) -> Option<RequestId> {
+        if !may_loop(method) {
+            return None;
+        }
         let document = params
             .pointer("/textDocument/uri")
             .and_then(serde_json::Value::as_str)?;
-        let looping = self
-            .sent
-            .borrow()
+        let sent = self.sent.borrow();
+        let on_document = |sent: &&SentRequest| sent.document.as_deref() == Some(document);
+        if let Some((suspect, _)) = sent
             .iter()
-            .find(|(_, sent)| sent.loops && sent.document.as_deref() == Some(document))
+            .find(|(_, sent)| sent.suspect() && on_document(sent))
+        {
+            return Some(suspect.clone());
+        }
+        let looping = sent
+            .iter()
+            .find(|(_, sent)| sent.loops && on_document(sent))
             .map(|(id, _)| id.clone())?;
+        drop(sent);
         self.loops_on(method, params).then_some(looping)
     }
 
-    /// Forget a request tsgo answered.
-    fn answered(&self, id: &RequestId) {
-        self.sent.borrow_mut().remove(id);
+    /// Forget a request tsgo answered, noting when tsgo answers
+    /// ([`Self::last_query_answer`], [`Self::pulls_answered`]), and return
+    /// it, if tsgo had not answered it yet: the server answers an overdue
+    /// request through the same path, after it stopped tracking it.
+    fn answered(&self, id: &RequestId) -> Option<SentRequest> {
+        let request = self.sent.borrow_mut().remove(id)?;
+        let now = Instant::now();
+        if waits_for_tsgo(&request.method) {
+            if let Some(document) = request.document.clone() {
+                self.pulls_answered
+                    .borrow_mut()
+                    .insert(document, (request.at, now));
+            }
+        } else {
+            self.last_query_answer.set(now);
+        }
+        Some(request)
+    }
+
+    /// Forget every request tsgo was asked: it restarted or exited.
+    fn forget_requests(&self) {
+        self.sent.borrow_mut().clear();
+        self.pulls_answered.borrow_mut().clear();
+        self.last_query_answer.set(Instant::now());
     }
 
     fn sent_at(&self, id: &RequestId) -> Option<Instant> {
@@ -2860,10 +2965,12 @@ impl Server {
         // nothing else until it restarts (review 5, loopstorm.mjs). One per
         // document is sent, and restarts tsgo once overdue; the editor's
         // others meanwhile (it asks again as the cursor moves) are answered
-        // at once without tsgo, as the first will be.
+        // at once without tsgo, as the first will be. Likewise after an
+        // overdue completion or signature help the model clears, which may
+        // be a loop it misses (review 6).
         if let Some(looping) = runtime.looping_on_document(&request.method, &request.params) {
             log::warn(format_args!(
-                "not sending {} ({id}) to tsgo, which loops on it and has not answered {looping}",
+                "not sending {} ({id}) to tsgo, which loops on it, or may, and has not answered {looping}",
                 request.method
             ));
             self.respond(Response::new_ok(
@@ -3301,30 +3408,34 @@ impl Server {
             })
     }
 
-    /// When the next request tsgo has not answered is due to expire, or to
-    /// restart tsgo.
+    /// When the next request tsgo has not answered is due to expire, or
+    /// tsgo to restart ([`Self::tsgo_restart_candidates`]).
     fn tsgo_request_deadline(&self) -> Option<Instant> {
         let runtime = self.tsgo.as_ref()?;
-        runtime
+        let expiry = runtime
             .sent
             .borrow()
             .values()
-            .filter_map(|request| {
-                if waits_for_tsgo(&request.method) {
-                    None
-                } else if !request.overdue {
-                    Some(request.at + self.tsgo_answer_timeout)
-                } else {
-                    self.restart_deadline(request)
-                }
-            })
+            .filter(|request| !request.overdue && !waits_for_tsgo(&request.method))
+            .map(|request| request.at + self.tsgo_answer_timeout)
+            .min();
+        expiry
+            .into_iter()
+            .chain(
+                self.tsgo_restart_candidates()
+                    .iter()
+                    .map(|restart| restart.at),
+            )
             .min()
     }
 
-    /// When an overdue request restarts tsgo: only one tsgo loops on
-    /// ([`SentRequest::overdue`]); a request that is merely slow is answered
-    /// whenever tsgo is done. Each restart for the same method and document
-    /// doubles the next one's wait.
+    /// When an overdue request restarts tsgo on its own: one tsgo loops on
+    /// ([`SentRequest::loops`]) after the timeout, a completion or signature
+    /// help it may loop on ([`SentRequest::suspect`]) after
+    /// [`SUSPECT_RESTART_TIMEOUTS`]; any other is slow, and answered whenever
+    /// tsgo is done, unless tsgo stops answering altogether
+    /// ([`Self::tsgo_restart_candidates`]). Each restart for the same method
+    /// and document doubles the next one's wait.
     ///
     /// tsrs answers a request about a document whose check is running only
     /// once the check is done (review 5), so while a pull of the document is
@@ -3332,6 +3443,20 @@ impl Server {
     /// only once the pull is answered, which keeps the pull's answer.
     fn restart_deadline(&self, request: &SentRequest) -> Option<Instant> {
         if !request.overdue {
+            return None;
+        }
+        let key = (request.method.clone(), request.document.clone());
+        let doublings = self
+            .tsgo_restarts
+            .doublings(&key, request.at, self.tsgo_answer_timeout);
+        if request.suspect() {
+            return self.waiting_for_check_until(request).map(|until| {
+                (request.at
+                    + self.tsgo_answer_timeout * SUSPECT_RESTART_TIMEOUTS * 2_u32.pow(doublings))
+                .max(until)
+            });
+        }
+        if !request.loops {
             return None;
         }
         let checking = self.tsgo.as_ref().is_some_and(|runtime| {
@@ -3344,18 +3469,132 @@ impl Server {
         if checking {
             return None;
         }
-        let restarts = self.tsgo_restarts.doublings(
-            &(request.method.clone(), request.document.clone()),
-            request.at,
-            self.tsgo_answer_timeout,
-        );
-        Some(request.at + self.tsgo_answer_timeout * 2_u32.pow(restarts))
+        Some(request.at + self.tsgo_answer_timeout * 2_u32.pow(doublings))
     }
 
-    /// Whether an overdue request restarts tsgo now ([`Self::restart_deadline`]).
-    fn restart_due(&self, request: &SentRequest, now: Instant) -> bool {
-        self.restart_deadline(request)
-            .is_some_and(|deadline| deadline <= now)
+    /// Until when a request may be waiting for a check of its document rather
+    /// than lost: tsrs answers a request about a document whose check runs
+    /// once the check is done (review 5). While a pull of the document is with
+    /// tsgo, until it is answered (`None`: a check can take minutes, and
+    /// longer still on a busy machine, review 6's `slowmix.mjs` at a load of
+    /// 40); then for a timeout after a pull that ran past the request's own
+    /// timeout, the time tsrs takes to answer what the check held back.
+    fn waiting_for_check_until(&self, request: &SentRequest) -> Option<Instant> {
+        let timeout = self.tsgo_answer_timeout;
+        let Some(runtime) = &self.tsgo else {
+            return Some(request.at);
+        };
+        let Some(document) = request.document.as_deref() else {
+            return Some(request.at);
+        };
+        if runtime
+            .sent
+            .borrow()
+            .values()
+            .any(|sent| waits_for_tsgo(&sent.method) && sent.document.as_deref() == Some(document))
+        {
+            return None;
+        }
+        let checked = runtime
+            .pulls_answered
+            .borrow()
+            .get(document)
+            .filter(|(sent, answered)| {
+                *sent < request.at + timeout && request.at + timeout <= *answered
+            })
+            .map(|(_, answered)| *answered + timeout);
+        Some(checked.map_or(request.at, |until| until.max(request.at)))
+    }
+
+    /// Every reason to restart tsgo there is or will be, given the requests
+    /// it has not answered, each with the time it falls due
+    /// ([`Self::expire_tsgo_requests`] restarts tsgo for those due):
+    ///
+    /// * an overdue request tsgo loops on, or may ([`Self::restart_deadline`]);
+    /// * a request tsgo has answered nothing since it was sent, for a timeout:
+    ///   a slow tsrs still answers the editor's other requests meanwhile (the
+    ///   hovers while `slowsig.mjs`'s check runs), one that loops on every
+    ///   request it can run answers none (review 6: four completions the
+    ///   model missed, after which every hover went unanswered);
+    /// * [`TSRS_QUERY_CHECKERS`] requests overdue at once, as many as tsrs
+    ///   runs about a project.
+    ///
+    /// The last two need no model of what tsrs loops on, so a loop the model
+    /// misses costs at most a timeout once it holds tsrs back; they skip the
+    /// background's own requests (a large project may take that long to
+    /// build while the editor is quiet) and diagnostic pulls (a check may),
+    /// and wait for a check the request may be waiting for
+    /// ([`Self::waiting_for_check_until`]). Their restarts back off together.
+    fn tsgo_restart_candidates(&self) -> Vec<TsgoRestart> {
+        let Some(runtime) = &self.tsgo else {
+            return Vec::new();
+        };
+        let timeout = self.tsgo_answer_timeout;
+        let sent = runtime.sent.borrow();
+        let mut restarts = Vec::new();
+        for (id, request) in sent.iter() {
+            if let Some(at) = self.restart_deadline(request) {
+                restarts.push(TsgoRestart {
+                    at,
+                    why: format!(
+                        "{} ({id}){}",
+                        request.method,
+                        if request.loops {
+                            ""
+                        } else {
+                            ", which it may loop on"
+                        }
+                    ),
+                    backoff: (
+                        (request.method.clone(), request.document.clone()),
+                        request.at,
+                    ),
+                });
+            }
+        }
+        // Each request the liveness rules count, with the time it falls due.
+        let mut due = sent
+            .iter()
+            .filter(|(id, request)| !waits_for_tsgo(&request.method) && !is_warm_up(id))
+            .filter_map(|(id, request)| {
+                let doublings = self
+                    .tsgo_restarts
+                    .doublings(&liveness_key(), request.at, timeout);
+                let at = (request.at + timeout * 2_u32.pow(doublings))
+                    .max(self.waiting_for_check_until(request)?);
+                Some((at, id, request))
+            })
+            .collect::<Vec<_>>();
+        due.sort_by_key(|(at, _, _)| *at);
+        let last_answer = runtime.last_query_answer.get();
+        if let Some((at, id, request)) =
+            due.iter().find(|(_, _, request)| request.at >= last_answer)
+        {
+            restarts.push(TsgoRestart {
+                at: *at,
+                why: format!(
+                    "nothing since {} ({id}), which it has not answered either",
+                    request.method
+                ),
+                backoff: (liveness_key(), request.at),
+            });
+        }
+        if let Some((at, _, _)) = due.get(TSRS_QUERY_CHECKERS - 1) {
+            restarts.push(TsgoRestart {
+                at: *at,
+                why: format!(
+                    "{} requests it has not answered: {}",
+                    due.iter().filter(|(due, _, _)| due <= at).count(),
+                    due.iter()
+                        .take_while(|(due, _, _)| due <= at)
+                        .map(|(_, id, request)| format!("{} ({id})", request.method))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                backoff: (liveness_key(), due[0].2.at),
+            });
+        }
+        restarts
     }
 
     /// Answer every request tsgo has left unanswered for
@@ -3369,11 +3608,11 @@ impl Server {
     /// take that long, and the editor gets tsgo's answer when it is done.
     ///
     /// tsrs loses a request by looping on it for good, one core busy and a
-    /// cancellation ignored (`docs/upstream/tsrs-lost-request`), so tsgo is
-    /// restarted for an overdue request it loops on ([`tsgo_loop`]), after
-    /// [`Self::restart_deadline`]. Any other overdue request is slow, not
-    /// lost (a check it waits for, a large workspace): it is forgotten, and
-    /// tsgo's answer, whenever it comes, has nobody waiting for it.
+    /// cancellation ignored (`docs/upstream/tsrs-lost-request`), while it
+    /// answers a slow one once it is done, cancelled or not. An overdue
+    /// request stays tracked until tsgo answers it, and tsgo is restarted for
+    /// those it loops on, or may, and when it stops answering
+    /// ([`Self::tsgo_restart_candidates`]).
     fn expire_tsgo_requests(&mut self) {
         let Some(runtime) = &self.tsgo else {
             return;
@@ -3400,12 +3639,13 @@ impl Server {
             runtime.cancel(&id);
             let warm_up = self.background.warming.as_ref() == Some(&id);
             let method = request.method.clone();
-            let loops = request.loops;
             log::warn(format_args!(
                 "tsgo did not answer {method} ({id}) in {} ms; answering without it{}",
                 self.tsgo_answer_timeout.as_millis(),
-                if loops {
+                if request.loops {
                     " (a request tsrs loops on)"
+                } else if may_loop(&method) {
+                    " (a request tsrs may loop on)"
                 } else {
                     ""
                 }
@@ -3425,40 +3665,36 @@ impl Server {
                 };
                 self.on_tsgo_message(Message::Response(response));
             }
-            if loops && let Some(runtime) = &self.tsgo {
+            if let Some(runtime) = &self.tsgo {
                 request.overdue = true;
                 runtime.sent.borrow_mut().insert(id, request);
             }
         }
-        let Some(runtime) = &self.tsgo else {
-            return;
-        };
-        let hung = runtime
-            .sent
-            .borrow()
-            .iter()
-            .filter(|(_, request)| self.restart_due(request, now))
-            .map(|(id, request)| {
-                (
-                    id.clone(),
-                    (request.method.clone(), request.document.clone()),
-                    request.at,
-                )
-            })
+        let due = self
+            .tsgo_restart_candidates()
+            .into_iter()
+            .filter(|restart| restart.at <= now)
             .collect::<Vec<_>>();
-        if hung.is_empty() {
+        if due.is_empty() {
             return;
         }
         log::warn(format_args!(
             "restarting tsgo, which is still busy with {}",
-            hung.iter()
-                .map(|(id, (method, _), _)| format!("{method} ({id})"))
+            due.iter()
+                .map(|restart| restart.why.as_str())
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join("; ")
         ));
-        for (_, key, sent) in hung {
-            self.tsgo_restarts
-                .restarted(key, sent, now, self.tsgo_answer_timeout);
+        let mut counted = HashSet::new();
+        for TsgoRestart {
+            backoff: (key, sent),
+            ..
+        } in due
+        {
+            if counted.insert(key.clone()) {
+                self.tsgo_restarts
+                    .restarted(key, sent, now, self.tsgo_answer_timeout);
+            }
         }
         self.abort_tsgo_requests("TypeScript service restarted: a request never finished");
         if let Some(runtime) = &mut self.tsgo {
@@ -3660,10 +3896,7 @@ impl Server {
             return;
         };
         self.next_request_id += 1;
-        let id = RequestId::from(format!(
-            "rsvelte-background-warm-up-{}",
-            self.next_request_id
-        ));
+        let id = RequestId::from(format!("{WARM_UP_ID}{}", self.next_request_id));
         let request = Request::new(
             id.clone(),
             "textDocument/documentSymbol".to_string(),
@@ -4726,6 +4959,8 @@ impl Server {
             } => {
                 if let Some(runtime) = &mut self.tsgo {
                     runtime.generation = Some(generation);
+                    // It has answered nothing yet, and need not have.
+                    runtime.last_query_answer.set(Instant::now());
                 }
                 // A restarted tsgo registers its watchers again.
                 if let Some(params) = self.tsgo_watchers.reset() {
@@ -4768,7 +5003,7 @@ impl Server {
     fn abort_tsgo_requests(&mut self, message: &str) {
         self.background.warming = None;
         if let Some(runtime) = &self.tsgo {
-            runtime.sent.borrow_mut().clear();
+            runtime.forget_requests();
         }
         let stale_child_requests = self
             .outgoing
@@ -4829,9 +5064,11 @@ impl Server {
     fn on_tsgo_message(&mut self, message: Message) {
         match message {
             Message::Response(mut response) => {
-                if let Some(runtime) = &self.tsgo {
-                    runtime.answered(&response.id);
-                }
+                let late = self.tsgo.as_ref().is_some_and(|runtime| {
+                    runtime
+                        .answered(&response.id)
+                        .is_some_and(|request| request.overdue)
+                });
                 if self.background.warming.as_ref() == Some(&response.id) {
                     self.background.warming = None;
                     return;
@@ -4841,8 +5078,13 @@ impl Server {
                 }
                 let Some(pending) = self.pending_tsgo.remove(&response.id) else {
                     log::warn(format_args!(
-                        "response to unknown tsgo request {}",
-                        response.id
+                        "response to unknown tsgo request {}{}",
+                        response.id,
+                        if late {
+                            " (answered late: it was overdue)"
+                        } else {
+                            ""
+                        }
                     ));
                     return;
                 };
