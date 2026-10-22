@@ -3235,8 +3235,23 @@ impl Server {
     /// ([`SentRequest::overdue`]); a request that is merely slow is answered
     /// whenever tsgo is done. Each restart for the same method and document
     /// doubles the next one's wait.
+    ///
+    /// tsrs answers a request about a document whose check is running only
+    /// once the check is done (review 5), so while a pull of the document is
+    /// with tsgo, an overdue request may be waiting for it: it restarts tsgo
+    /// only once the pull is answered, which keeps the pull's answer.
     fn restart_deadline(&self, request: &SentRequest) -> Option<Instant> {
         if !request.overdue {
+            return None;
+        }
+        let checking = self.tsgo.as_ref().is_some_and(|runtime| {
+            runtime
+                .sent
+                .borrow()
+                .values()
+                .any(|sent| waits_for_tsgo(&sent.method) && sent.document == request.document)
+        });
+        if checking {
             return None;
         }
         let restarts = self

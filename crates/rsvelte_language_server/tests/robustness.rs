@@ -1629,6 +1629,87 @@ fn a_slow_signature_help_or_definition_does_not_restart_tsgo() {
     server.shutdown();
 }
 
+/// tsrs answers a request about a document whose check is running only once
+/// the check is done (review 5), so a request it would loop on does not
+/// restart tsgo while a pull of its document is with tsgo: the pull keeps
+/// its TypeScript half, and tsgo restarts once the pull is answered.
+#[cfg(unix)]
+#[test]
+fn a_looping_request_restarts_tsgo_only_after_a_pull_of_its_document() {
+    let dir = TestDir::new("loop-during-pull");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = one_project(&dir.0);
+    let mut server = Server::start_with_capabilities(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            (
+                "RSVELTE_TEST_TSGO_IGNORE",
+                Path::new("textDocument/signatureHelp"),
+            ),
+            ("RSVELTE_TEST_SLOW_DIAGNOSTIC_MS", Path::new("3000")),
+            ("RSVELTE_TEST_DIAGNOSTIC_WORD", Path::new("q")),
+            ("RSVELTE_TSGO_REQUEST_TIMEOUT_MS", Path::new("1000")),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+        &json!({ "textDocument": { "diagnostic": {} } }),
+    );
+    let x = file_uri(&root.join("X.svelte"));
+    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
+    hover(&mut server, &x);
+    let (lost_path, lost_text, at) = looping_buffer(&root);
+    let lost_uri = file_uri(&lost_path);
+    server.open_as(&lost_uri, "typescript", lost_text);
+    hover(&mut server, &lost_uri);
+    let opened = |log: &Path| {
+        traffic(log)
+            .iter()
+            .filter(|line| **line == format!("textDocument/didOpen {shadow}"))
+            .count()
+    };
+    let sent = Instant::now();
+    let pull = server.request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": lost_uri } }),
+    );
+    let lost = server.request(
+        "textDocument/signatureHelp",
+        json!({ "textDocument": { "uri": lost_uri }, "position": at }),
+    );
+    assert_eq!(
+        server.response(lost, Duration::from_secs(10))["result"],
+        Value::Null
+    );
+    // Past the timeout: without the pull, tsgo would have restarted by now.
+    thread::sleep(Duration::from_millis(2_000).saturating_sub(sent.elapsed()));
+    server.probe();
+    assert_eq!(opened(&log), 1, "restarted while the pull was with tsgo");
+    let report = server.response(pull, Duration::from_secs(10));
+    assert!(
+        sent.elapsed() >= Duration::from_millis(2_500),
+        "the pull was answered without tsgo after {:?}",
+        sent.elapsed()
+    );
+    assert_eq!(
+        report["result"]["items"][0]["code"], 2322,
+        "the pull lost its TypeScript half: {report}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while opened(&log) < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "tsgo was not restarted once the pull was answered: {:?}",
+            traffic(&log)
+        );
+        server.probe();
+        thread::sleep(Duration::from_millis(100));
+    }
+    server.shutdown();
+}
+
 /// After tsgo restarts, the pulls it was asked for before were answered
 /// without it, so the editor is asked to pull again (review 4).
 #[cfg(unix)]
