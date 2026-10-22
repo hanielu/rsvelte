@@ -1164,7 +1164,12 @@ impl Server {
             };
             select! {
                 recv(connection.receiver) -> message => {
-                    self.background.last_activity = Instant::now();
+                    // The editor's own requests and notifications, not its
+                    // answers to the server's (a watcher registration tsgo
+                    // made while a background project built).
+                    if !matches!(message, Ok(Message::Response(_))) {
+                        self.background.last_activity = Instant::now();
+                    }
                     match message {
                         Ok(Message::Request(request)) => self.on_request(request),
                         Ok(Message::Notification(notification)) => self.on_notification(notification),

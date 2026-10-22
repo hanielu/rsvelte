@@ -1337,6 +1337,58 @@ fn the_other_projects_load_in_the_background_once_the_editor_is_quiet() {
     server.shutdown();
 }
 
+/// The editor's answers to the server's own requests (the watcher
+/// registrations tsgo makes as each background project builds) are not
+/// editor activity: they must not keep postponing the background.
+#[cfg(unix)]
+#[test]
+fn the_editors_answers_do_not_hold_the_background_back() {
+    let dir = TestDir::new("background-answers");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = three_projects(&dir.0);
+    let mut server = Server::start(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+        ],
+    );
+    let x = file_uri(&root.join("a/X.svelte"));
+    server.open(&x, &fs::read_to_string(root.join("a/X.svelte")).unwrap());
+    hover(&mut server, &x);
+    let kept = |project: &str, file: &str| {
+        file_uri(
+            &root
+                .join(".svelte-rs/projects")
+                .join(project)
+                .join("tsgo/svelte")
+                .join(project)
+                .join(format!("{file}.svelte.tsx")),
+        )
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut answer = 1_000_000;
+    loop {
+        let lines = traffic(&log);
+        if lines.contains(&format!("textDocument/didOpen {}", kept("b", "Y")))
+            && lines.contains(&format!("textDocument/didOpen {}", kept("c", "Z")))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "answers every 200 ms kept the other projects from loading: {lines:?}"
+        );
+        // An answer to a request of the server's, more often than its idle
+        // time.
+        answer += 1;
+        server.write(&json!({ "jsonrpc": "2.0", "id": answer, "result": null }));
+        thread::sleep(Duration::from_millis(200));
+    }
+    server.shutdown();
+}
+
 /// With the background off, a workspace-wide request loads every project
 /// that owns a component before tsgo answers it.
 #[cfg(unix)]
