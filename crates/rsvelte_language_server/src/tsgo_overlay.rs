@@ -1888,6 +1888,75 @@ impl TsgoOverlay {
         Some(ordered_range(start, end))
     }
 
+    /// [`Self::map_generated_range`] for a diagnostic. One that starts in the
+    /// text svelte2tsx writes before a copy of the author's text
+    /// (`MagicString::insert_copy`: the `;type $$ComponentProps =  ` before the
+    /// props annotation's copy, review 6) lands at the copy's source, where the
+    /// source map puts that text, instead of being dropped as generated: a
+    /// half-typed type literal above a generic component's props declaration
+    /// reported its TypeScript errors there before the copy was mapped (patch
+    /// 65), and official reports them on the annotation's line. An end that
+    /// maps to nothing ends it where it starts.
+    #[must_use]
+    pub fn map_diagnostic_range(&self, shadow_path: &Path, range: Range) -> Option<Range> {
+        if let Some(mapped) = self.map_generated_range(shadow_path, range) {
+            return Some(mapped);
+        }
+        if self.is_generated_range(shadow_path, range) {
+            return None;
+        }
+        let start = self.map_copy_prefix_position(shadow_path, range.start)?;
+        let end = self
+            .map_generated_position(shadow_path, range.end)
+            .or_else(|| self.map_copy_prefix_position(shadow_path, range.end))
+            .unwrap_or(start);
+        Some(ordered_range(start, end))
+    }
+
+    /// The source of a tsgo position in the text written before a copy of the
+    /// author's text, which the source map sends to the copy's start: a
+    /// token there with the same source as the copy's first, and the copy an
+    /// exact segment. [`Self::map_generated_position`] reads such a position
+    /// as an unmapped gap, as it reads text inserted at one source point.
+    fn map_copy_prefix_position(&self, shadow_path: &Path, position: Position) -> Option<Position> {
+        let source_path = self.source_for_shadow(shadow_path)?;
+        let entry = self.entries.get(source_path)?;
+        if entry.identity {
+            return None;
+        }
+        let generated_offset = entry.generated_offset(position);
+        let generated_utf16 = entry
+            .generated_index
+            .position(&entry.document.text, generated_offset);
+        let index = entry.tokens.partition_point(|token| {
+            (token.generated_line, token.generated_column)
+                <= (generated_utf16.line, generated_utf16.character)
+        });
+        let previous = entry.tokens.get(index.checked_sub(1)?)?;
+        let next = entry.tokens.get(index)?;
+        let source = previous.source?;
+        if previous.generated_line != generated_utf16.line
+            || next.generated_line != generated_utf16.line
+            || next.source != Some(source)
+        {
+            return None;
+        }
+        let copy_start = entry.generated_index.offset(
+            &entry.document.text,
+            Position::new(next.generated_line, next.generated_column),
+        );
+        let copy_start = u32::try_from(copy_start).ok()?;
+        if !entry
+            .exact_map
+            .segments()
+            .iter()
+            .any(|segment| segment.generated.start() == copy_start)
+        {
+            return None;
+        }
+        map_preprocessed_to_original(entry, Position::new(source.0, source.1))
+    }
+
     /// [`Self::map_generated_range`] for a definition's location, as
     /// `convertToLocationForReferenceOrDefinition` (`utils.ts:108-128`) does
     /// it: a location in a component's shadow whose start maps back to
@@ -5449,6 +5518,58 @@ mod tests {
 
         let config = overlay_config(&build_overlay(&workspace.0).unwrap());
         assert!(config["compilerOptions"]["paths"].is_null());
+    }
+
+    /// The `$$ComponentProps` alias svelte2tsx keeps inside `$$render` (a
+    /// generic component) is written as `;type $$ComponentProps =  ` before a
+    /// copy of the props annotation. A half-typed type literal above the
+    /// declaration makes TypeScript report errors on that text; they land on
+    /// the annotation, where the source map puts it, instead of being dropped
+    /// (review 6), while other generated text still maps to nothing.
+    #[test]
+    fn a_diagnostic_in_the_text_before_a_copy_lands_on_the_copied_text() {
+        let workspace = TestWorkspace::new("diagnostic-copy-prefix");
+        let app = workspace.0.join("src/App.svelte");
+        let source = "<script lang=\"ts\" generics=\"T\">\n\ttype Q = {\n\tlet { a }: { a: T } = $props();\n</script>\n<p>{String(a)}</p>\n";
+        write(&app, source);
+        let overlay = build_overlay(&workspace.0).unwrap();
+        let shadow = overlay.shadow_for_source(&app).unwrap();
+        let shadow_path = crate::uri::uri_to_path(shadow.shadow_uri.as_str());
+        let text = shadow.text.as_str();
+        let range = |start: usize, end: usize| {
+            Range::new(utf8_position(text, start), utf8_position(text, end))
+        };
+        let prefix = text
+            .find(";type $$ComponentProps =")
+            .expect("the alias inside $$render");
+        let copy = text[prefix..].find('{').unwrap() + prefix;
+        let annotation = LineIndex::new(source).position(source, source.find("{ a: T }").unwrap());
+        // 1131 'Property or signature expected' on the `;`.
+        let semicolon = range(prefix, prefix + 1);
+        assert_eq!(overlay.map_generated_range(&shadow_path, semicolon), None);
+        assert_eq!(
+            overlay.map_diagnostic_range(&shadow_path, semicolon),
+            Some(Range::new(annotation, annotation))
+        );
+        // One that runs into the copy ends where its end maps.
+        let into_copy = range(prefix + ";type ".len(), copy + 1);
+        let mapped = overlay
+            .map_diagnostic_range(&shadow_path, into_copy)
+            .expect("mapped");
+        assert_eq!(mapped.start, annotation);
+        assert_eq!(mapped.end.line, annotation.line);
+        assert!(mapped.end.character > annotation.character);
+        // Generated text elsewhere still maps to nothing.
+        let ignored = text.find("/*Ωignore_startΩ*/").unwrap();
+        assert_eq!(
+            overlay.map_diagnostic_range(&shadow_path, range(ignored, ignored + 3)),
+            None
+        );
+        let header = text.find("function $$render").unwrap();
+        assert_eq!(
+            overlay.map_diagnostic_range(&shadow_path, range(header + 9, header + 17)),
+            overlay.map_generated_range(&shadow_path, range(header + 9, header + 17)),
+        );
     }
 
     #[test]

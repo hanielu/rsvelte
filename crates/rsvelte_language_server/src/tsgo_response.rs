@@ -67,6 +67,10 @@ pub struct TsgoResponseMapper<'a> {
     /// as upstream does for definitions (see
     /// [`TsgoOverlay::map_definition_range`]).
     definition_locations: bool,
+    /// Whether a diagnostic that starts in the text svelte2tsx writes before
+    /// a copy of the author's text lands at the copy's source instead of
+    /// being dropped (see [`TsgoOverlay::map_diagnostic_range`]).
+    diagnostic_ranges: bool,
     caches: MapperCaches<'a>,
 }
 
@@ -113,6 +117,7 @@ impl<'a> TsgoResponseMapper<'a> {
             aliases: Vec::new(),
             clamp_request_ranges: false,
             definition_locations: false,
+            diagnostic_ranges: false,
             caches: MapperCaches::new(),
         }
     }
@@ -126,6 +131,7 @@ impl<'a> TsgoResponseMapper<'a> {
             aliases: Vec::new(),
             clamp_request_ranges: false,
             definition_locations: false,
+            diagnostic_ranges: false,
             caches: MapperCaches::new(),
         }
     }
@@ -142,6 +148,7 @@ impl<'a> TsgoResponseMapper<'a> {
             aliases: Vec::new(),
             clamp_request_ranges: false,
             definition_locations: false,
+            diagnostic_ranges: false,
             caches: MapperCaches::new(),
         }
     }
@@ -158,6 +165,7 @@ impl<'a> TsgoResponseMapper<'a> {
             aliases: Vec::new(),
             clamp_request_ranges: false,
             definition_locations: false,
+            diagnostic_ranges: false,
             caches: MapperCaches::new(),
         }
     }
@@ -174,6 +182,7 @@ impl<'a> TsgoResponseMapper<'a> {
             aliases: Vec::new(),
             clamp_request_ranges: false,
             definition_locations: false,
+            diagnostic_ranges: false,
             caches: MapperCaches::new(),
         }
     }
@@ -189,6 +198,7 @@ impl<'a> TsgoResponseMapper<'a> {
             aliases: Vec::new(),
             clamp_request_ranges: false,
             definition_locations: false,
+            diagnostic_ranges: false,
             caches: MapperCaches::new(),
         }
     }
@@ -258,6 +268,7 @@ impl<'a> TsgoResponseMapper<'a> {
                 aliases: self.aliases.clone(),
                 clamp_request_ranges: true,
                 definition_locations: false,
+                diagnostic_ranges: false,
                 caches: MapperCaches::new(),
             };
             return clamping.map_transactional(method, params, Direction::SourceToShadow);
@@ -291,9 +302,13 @@ impl<'a> TsgoResponseMapper<'a> {
                 aliases: self.aliases.clone(),
                 clamp_request_ranges: self.clamp_request_ranges,
                 definition_locations: true,
+                diagnostic_ranges: false,
                 caches: MapperCaches::new(),
             };
             return definitions.map_response(method, result);
+        }
+        if let Some(diagnostics) = self.for_diagnostics(method) {
+            return diagnostics.map_response(method, result);
         }
 
         let mut mapped = result.clone();
@@ -316,7 +331,29 @@ impl<'a> TsgoResponseMapper<'a> {
         if is_semantic_tokens_method(method) {
             return self.map_response(method, params);
         }
+        if let Some(diagnostics) = self.for_diagnostics(method) {
+            return diagnostics.map_transactional(method, params, Direction::ShadowToSource);
+        }
         self.map_transactional(method, params, Direction::ShadowToSource)
+    }
+
+    /// This mapper with [`Self::diagnostic_ranges`] for a message that carries
+    /// diagnostics, unless it has it already.
+    fn for_diagnostics(&self, method: &str) -> Option<Self> {
+        (!self.diagnostic_ranges
+            && matches!(
+                method,
+                "textDocument/diagnostic" | "textDocument/publishDiagnostics"
+            ))
+        .then(|| Self {
+            overlays: self.overlays,
+            default_document: self.default_document.clone(),
+            aliases: self.aliases.clone(),
+            clamp_request_ranges: self.clamp_request_ranges,
+            definition_locations: self.definition_locations,
+            diagnostic_ranges: true,
+            caches: MapperCaches::new(),
+        })
     }
 
     fn map_transactional(&self, _method: &str, value: &mut Value, direction: Direction) -> bool {
@@ -692,6 +729,9 @@ impl<'a> TsgoResponseMapper<'a> {
             }
             Direction::ShadowToSource if self.definition_locations => {
                 overlay.map_definition_range(&context.shadow_path, range)
+            }
+            Direction::ShadowToSource if self.diagnostic_ranges => {
+                overlay.map_diagnostic_range(&context.shadow_path, range)
             }
             Direction::ShadowToSource => overlay.map_generated_range(&context.shadow_path, range),
         }
