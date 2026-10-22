@@ -200,7 +200,14 @@ pub fn process_instance_script_tag(
     // the tag and missed the annotation. A mapped copy of the annotation
     // (`MagicString::insert_copy`) yields the same code with an exact mapping,
     // and the annotation's own place keeps its `$$ComponentProps` reference.
-    let alias_copy = split_pos.and_then(|_| props_alias_copy(exported_names, source));
+    let alias_copy = split_pos.and_then(|_| {
+        props_alias_copy(
+            exported_names,
+            source,
+            instance_script.source(),
+            content_start,
+        )
+    });
 
     // For best-effort auto-generated types, insert INSIDE $$render.
     //
@@ -274,6 +281,7 @@ pub fn process_instance_script_tag(
     // The alias leads `part_b`, after `part_b_prefix`; as a copy it is
     // inserted just before `part_b`, carrying that prefix.
     let alias_copy_in_part_b = alias_copy
+        .as_ref()
         .filter(|_| !ts_component_props_in_part_a && !ts_component_props_before_render.is_empty());
     let (part_b_lead, part_b_component_props) = if ts_component_props_in_part_a {
         (part_b_prefix, "")
@@ -326,15 +334,13 @@ pub fn process_instance_script_tag(
             str,
         );
         if ts_component_props_in_part_a {
-            if let Some((start, end)) = alias_copy {
+            if let Some(alias) = &alias_copy {
                 // After the imports and before the hoisted types, where `part_a`
                 // or the last import's outro would carry it as text.
-                str.insert_copy(
+                alias.insert(
+                    str,
                     sp,
                     &format!("\n{type_decl_prefix}{COMPONENT_PROPS_ALIAS_HEAD}"),
-                    start,
-                    end,
-                    ";",
                 );
             } else if let Some(last) = imports.last() {
                 str.append_left_fmt(
@@ -403,13 +409,11 @@ pub fn process_instance_script_tag(
         for (s, e) in hoistable_snippet_ranges {
             str.move_range(*s, *e, sp);
         }
-        if let Some((start, end)) = alias_copy_in_part_b {
-            str.insert_copy(
+        if let Some(alias) = alias_copy_in_part_b {
+            alias.insert(
+                str,
                 sp,
                 &format!("{part_b_prefix}{type_decl_prefix}{COMPONENT_PROPS_ALIAS_HEAD}"),
-                start,
-                end,
-                ";",
             );
         }
         if let Some((value_start, value_end)) = generics_in_place {
@@ -452,9 +456,9 @@ pub fn process_instance_script_tag(
         // one to the left chunk's outro only when the declaration opens the
         // script; elsewhere the right chunk also prevents a preceding import
         // from carrying the alias away when it is hoisted.
-        if force_inside_render && let Some((start, end)) = alias_copy {
+        if force_inside_render && let Some(alias) = &alias_copy {
             // Before the declaration's leading trivia, where the text goes.
-            str.insert_copy(let_pos, COMPONENT_PROPS_ALIAS_HEAD, start, end, ";");
+            alias.insert(str, let_pos, COMPONENT_PROPS_ALIAS_HEAD);
         } else if force_inside_render && let_pos == content_start {
             str.append_left(let_pos, &decl);
         } else {
@@ -503,17 +507,105 @@ pub fn process_instance_script_tag(
 /// How the `$$ComponentProps` alias starts; the props type and `;` follow.
 const COMPONENT_PROPS_ALIAS_HEAD: &str = ";type $$ComponentProps =  ";
 
-/// The instance script's `$props()` annotation that the `$$ComponentProps`
-/// alias repeats, when the alias repeats it verbatim (script recovery can
-/// have repaired the text the alias holds; then it stays text).
-fn props_alias_copy(exported_names: &ExportedNames, source: &str) -> Option<(u32, u32)> {
+/// The `$$ComponentProps` alias as mapped copies of the instance script's
+/// `$props()` annotation, which it repeats.
+///
+/// The alias holds the annotation's text, or the text script recovery repaired
+/// it to: recovery only rewrites bytes in place (a `_` or a closer where a type
+/// or a bracket is missing, spaces over what it cannot finish), so the alias is
+/// then the author's text with those bytes replaced. Each run the author wrote
+/// is copied with its exact mapping, so that a rename or a hover there still
+/// reaches the annotation; each run recovery wrote is generated text, wrapped as
+/// generated code unless it is blank, so that what TypeScript says about the
+/// placeholder ("Cannot find name '_'") is not reported — Svelte's own parse
+/// error reports the half-typed annotation. TypeScript reads the same alias as
+/// before, which recovery made parse; copying the author's broken text instead
+/// let TypeScript's own recovery run on into the generated code after it.
+struct AliasCopy {
+    /// Generated text, then a copy of `start..end` of the source.
+    pieces: Vec<(String, u32, u32)>,
+    /// Generated text after the last copy, before the alias's `;`.
+    tail: String,
+}
+
+impl AliasCopy {
+    /// Insert the alias, led by `head`, before the chunk at `index`.
+    fn insert(&self, str: &mut MagicString<'_>, index: u32, head: &str) {
+        let last = self.pieces.len() - 1;
+        for (piece, (text, start, end)) in self.pieces.iter().enumerate() {
+            let prefix = if piece == 0 {
+                format!("{head}{text}")
+            } else {
+                text.clone()
+            };
+            let suffix = if piece == last {
+                format!("{};", self.tail)
+            } else {
+                String::new()
+            };
+            str.insert_copy(index, &prefix, *start, *end, &suffix);
+        }
+    }
+}
+
+fn props_alias_copy(
+    exported_names: &ExportedNames,
+    source: &str,
+    recovered: &str,
+    content_start: u32,
+) -> Option<AliasCopy> {
     if exported_names.type_already_inserted() {
         return None;
     }
     let (start, end) = exported_names.props_type_source?;
-    (start < end
-        && source.get(start as usize..end as usize) == exported_names.props_type_text.as_deref())
-    .then_some((start, end))
+    let alias = exported_names.props_type_text.as_deref()?;
+    let authors = source
+        .get(start as usize..end as usize)
+        .filter(|_| start < end)?;
+    if authors == alias {
+        return Some(AliasCopy {
+            pieces: vec![(String::new(), start, end)],
+            tail: String::new(),
+        });
+    }
+    let repaired = recovered.get(
+        start.checked_sub(content_start)? as usize..end.checked_sub(content_start)? as usize,
+    )?;
+    if repaired != alias || repaired.len() != authors.len() {
+        return None;
+    }
+    let (written, filled) = (authors.as_bytes(), repaired.as_bytes());
+    let mut pieces = Vec::new();
+    let mut text = String::new();
+    let mut at = 0;
+    while at < written.len() {
+        let same = written[at] == filled[at];
+        let run_end = (at..written.len())
+            .find(|&byte| (written[byte] == filled[byte]) != same)
+            .unwrap_or(written.len());
+        if !authors.is_char_boundary(at)
+            || !authors.is_char_boundary(run_end)
+            || !repaired.is_char_boundary(at)
+            || !repaired.is_char_boundary(run_end)
+        {
+            return None;
+        }
+        if same {
+            let offset = |byte: usize| start + u32::try_from(byte).expect("script offset fits");
+            pieces.push((std::mem::take(&mut text), offset(at), offset(run_end)));
+        } else {
+            let fill = &repaired[at..run_end];
+            if fill.trim().is_empty() {
+                text.push_str(fill);
+            } else {
+                text.push_str("/*\u{03A9}ignore_start\u{03A9}*/");
+                text.push_str(fill);
+                text.push_str("/*\u{03A9}ignore_end\u{03A9}*/");
+            }
+        }
+        at = run_end;
+    }
+    (!pieces.is_empty()).then_some(AliasCopy { pieces, tail: text })
 }
 
 /// Hoist the instance script's top-level imports above `$$render()` by

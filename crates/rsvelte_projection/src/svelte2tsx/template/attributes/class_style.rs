@@ -59,6 +59,17 @@ fn style_value_quote(style: &StyleDirective, source: &str) -> char {
         .unwrap_or('"')
 }
 
+/// The name of a shorthand `style:name` directive in the source: right after
+/// `style:`, spelled as the directive's name.
+fn style_shorthand_name_range(style: &StyleDirective, source: &str) -> Option<(u32, u32)> {
+    let start = style.start + "style:".len() as u32;
+    let end = start + u32::try_from(style.name.len()).ok()?;
+    (end <= style.end
+        && source.get(style.start as usize..start as usize) == Some("style:")
+        && source.get(start as usize..end as usize) == Some(style.name.as_str()))
+    .then_some((start, end))
+}
+
 /// Lower `class:` / `style:` directives as statements appended *after* the
 /// element's `svelteHTML.createElement(...)` call, instead of as keys in the
 /// (typed) props object. Mirrors upstream `htmlxtojsx_v2/nodes/Class.ts`
@@ -102,10 +113,14 @@ pub fn class_style_directive_seg(attr: &Attribute, source: &str) -> Option<Vec<S
             segs_push_lit(&mut out, "__sveltets_2_ensureType(String, Number, ");
             match &style.value {
                 AttributeValue::True(_) => {
-                    // Shorthand `style:color` → `…, color);` (implicit
-                    // reference to the `color` binding; synthesised from
-                    // the directive name, so no source range to pin).
-                    segs_push_lit(&mut out, &style.name);
+                    // Shorthand `style:color` → `…, color);`: the name is the
+                    // reference to the `color` binding, kept in place (as
+                    // upstream's `transform()` keeps the identifier's range)
+                    // so that a rename of `color` reaches the directive.
+                    match style_shorthand_name_range(style, source) {
+                        Some((start, end)) => segs_push_src(&mut out, start, end),
+                        None => segs_push_lit(&mut out, &style.name),
+                    }
                 }
                 AttributeValue::Expression(expr) => {
                     if let Some((s, e)) = get_expression_range(&expr.expression) {

@@ -22,9 +22,15 @@ pub fn prefix_with_for(prefix: &str) -> String {
 /// Build the text emitted after EXPR (and the relocated CTX) in the
 /// structured-bake each-block header. Mirrors the non-relocated
 /// `header_after_expr`: `))` closes `__sveltets_2_ensureArray(EXPR)` and
-/// the `for(...)` argument list; `{` opens the for body; the idx / key
-/// bindings still travel as plain text — only CTX is source-preserved.
-pub fn build_each_after_ctx_tail(block: &EachBlock, source: &str, comma_wrap: bool) -> String {
+/// the `for(...)` argument list; `{` opens the for body. The index
+/// declaration and the key (`let i = 1;key;`) end the text unless
+/// `with_index_and_key` is false, when the caller keeps them in place.
+pub fn build_each_after_ctx_tail(
+    block: &EachBlock,
+    source: &str,
+    comma_wrap: bool,
+    with_index_and_key: bool,
+) -> String {
     let suffix = if block.context.is_some() {
         ""
     } else {
@@ -34,15 +40,110 @@ pub fn build_each_after_ctx_tail(block: &EachBlock, source: &str, comma_wrap: bo
     // argument list; `{` opens the for body.
     let close = if comma_wrap { ")" } else { "" };
     let mut s = format!("{close})){{{suffix}");
+    if with_index_and_key {
+        s.push_str(&index_and_key_text(block, source));
+    }
+    s
+}
+
+/// `let i = 1;key;`: the index declaration and the key statement the header
+/// ends with, for the parts the block has.
+fn index_and_key_text(block: &EachBlock, source: &str) -> String {
+    let mut s = String::new();
     if let Some(ref index) = block.index {
         let _ = write!(s, "let {index} = 1;");
     }
     if let Some(ref key) = block.key {
-        let key_text = get_expression_text(key, source);
-        s.push_str(key_text);
+        s.push_str(get_expression_text(key, source));
         s.push(';');
     }
     s
+}
+
+/// The ranges of the each block's index name and key in its opening.
+struct IndexAndKey {
+    index: Option<(u32, u32)>,
+    key: Option<(u32, u32)>,
+}
+
+/// Where the header keeps the each block's index name and key, as upstream
+/// does (`'let ', [index], ' = 1;'` and `[key], ';'`): every one the block has,
+/// after `after` (the end of the last header range that stays or moves), in
+/// order, and before the `)` and `}` that end the opening. Written out as text
+/// instead, they mapped to the start of the text before them, so a rename of
+/// the index, or of a name the key uses, left them behind.
+fn index_and_key_in_place(
+    block: &EachBlock,
+    source: &str,
+    after: u32,
+    body_start: u32,
+) -> Option<IndexAndKey> {
+    let index = match &block.index {
+        Some(name) => Some(index_name_range(source, after, name)?),
+        None => None,
+    };
+    let after_index = index.map_or(after, |(_, end)| end);
+    let key = match &block.key {
+        Some(key) => {
+            let (start, end) = get_expression_range(key)?;
+            if !(after_index < start && start < end) {
+                return None;
+            }
+            Some((start, end))
+        }
+        None => None,
+    };
+    let (_, last_end) = key.or(index)?;
+    (last_end < body_start).then_some(IndexAndKey { index, key })
+}
+
+/// The index name of `, name` after `after`, followed by something that is not
+/// part of a name.
+fn index_name_range(source: &str, after: u32, name: &str) -> Option<(u32, u32)> {
+    let bytes = source.as_bytes();
+    let skip = |mut at: usize| {
+        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+            at += 1;
+        }
+        at
+    };
+    let comma = skip(after as usize);
+    if bytes.get(comma) != Some(&b',') {
+        return None;
+    }
+    let start = skip(comma + 1);
+    let end = start + name.len();
+    let continues = bytes.get(end).is_some_and(|&byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || byte >= 0x80
+    });
+    (!name.is_empty() && source.get(start..end) == Some(name) && !continues)
+        .then(|| Some((u32::try_from(start).ok()?, u32::try_from(end).ok()?)))
+        .flatten()
+}
+
+/// Write `{text}let {index} = 1;{key};` over `[from, to)`, with the index name
+/// and the key left in place.
+fn write_index_and_key(
+    str: &mut MagicString<'_>,
+    from: u32,
+    to: u32,
+    text: &str,
+    place: &IndexAndKey,
+) {
+    let mut text = text.to_string();
+    let mut cursor = from;
+    if let Some((start, end)) = place.index {
+        text.push_str("let ");
+        str.overwrite(cursor, start, &text);
+        cursor = end;
+        text = " = 1;".to_string();
+    }
+    if let Some((start, end)) = place.key {
+        str.overwrite(cursor, start, &text);
+        cursor = end;
+        text = ";".to_string();
+    }
+    str.overwrite(cursor, to, &text);
 }
 
 /// Handle an each block: `{#each items as item, i (key)}...{:else}...{/each}`.
@@ -175,15 +276,18 @@ pub fn handle_each_block(
     // `{#each true, [1, 2] as x}` is legal Svelte but `for (const x of true, [1, 2])`
     // is not, so upstream parenthesises any expression whose source carries a comma.
     let comma_wrap = expr_text.contains(',');
-    let (header_before_expr, header_after_expr) = build_each_loop_header(
-        block,
-        source,
+    let (header_before_expr, header_after_context) = build_each_loop_header(
         &prefix,
         &context_text,
         has_context,
         needs_temp_var,
         comma_wrap,
     );
+    let header_after_expr = format!(
+        "{header_after_context}{}",
+        index_and_key_text(block, source)
+    );
+    let context_range = block.context.as_ref().and_then(get_expression_range);
 
     if let Some((expr_start, expr_end)) = expr_range {
         // Try to also preserve the context binding's source range so a
@@ -203,7 +307,6 @@ pub fn handle_each_block(
         //     (`{#each items as items}`) — the `needs_temp_var` branch
         //     above rebakes the wrapper around the expression and would
         //     repeat the context text twice.
-        let context_range = block.context.as_ref().and_then(get_expression_range);
         if let (Some((ctx_s, ctx_e)), false) = (context_range, needs_temp_var)
             && has_context
             && ctx_s > expr_end
@@ -231,18 +334,30 @@ pub fn handle_each_block(
             // " as " (or whitespace) between EXPR and CTX → "){...tail".
             // Then the trailing characters between CTX and body get
             // emitted/cleared.
-            let tail = build_each_after_ctx_tail(block, source, comma_wrap);
+            let place = index_and_key_in_place(block, source, ctx_e, body_start)
+                .filter(|_| expr_end < ctx_s);
+            let tail = build_each_after_ctx_tail(block, source, comma_wrap, place.is_none());
             if expr_end < ctx_s {
                 str.overwrite(expr_end, ctx_s, &tail);
             } else {
                 str.append_left(ctx_s, &tail);
             }
-            if ctx_e < body_start {
+            if let Some(place) = &place {
+                // The index and the key follow the tail: CTX, between them,
+                // has moved.
+                write_index_and_key(str, ctx_e, body_start, "", place);
+            } else if ctx_e < body_start {
                 str.overwrite(ctx_e, body_start, "");
             }
         } else {
             str.overwrite(block.start, expr_start, &header_before_expr);
-            if expr_end < body_start {
+            // The index follows the context, which stays in the text here.
+            let after_context = context_range
+                .filter(|&(start, end)| expr_end < start && end < body_start)
+                .map_or(expr_end, |(_, end)| end);
+            if let Some(place) = index_and_key_in_place(block, source, after_context, body_start) {
+                write_index_and_key(str, expr_end, body_start, &header_after_context, &place);
+            } else if expr_end < body_start {
                 str.overwrite(expr_end, body_start, &header_after_expr);
             } else {
                 // expr_end >= body_start (no space between expr and body opener).
@@ -314,8 +429,6 @@ pub fn handle_each_block(
 }
 
 fn build_each_loop_header(
-    block: &EachBlock,
-    source: &str,
     prefix: &str,
     context_text: &str,
     has_context: bool,
@@ -323,7 +436,7 @@ fn build_each_loop_header(
     comma_wrap: bool,
 ) -> (String, String) {
     let (open, close) = if comma_wrap { ("(", ")") } else { ("", "") };
-    let (before, mut after) = if needs_temp_var {
+    let (before, after) = if needs_temp_var {
         (
             format!("{prefix}{{ const $$_each = __sveltets_2_ensureArray({open}"),
             format!("{close}); for(let {context_text} of $$_each){{"),
@@ -335,12 +448,5 @@ fn build_each_loop_header(
             format!("{close})){{{suffix}"),
         )
     };
-    if let Some(index) = &block.index {
-        let _ = write!(after, "let {index} = 1;");
-    }
-    if let Some(key) = &block.key {
-        after.push_str(get_expression_text(key, source));
-        after.push(';');
-    }
     (before, after)
 }

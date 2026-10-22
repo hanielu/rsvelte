@@ -140,6 +140,21 @@ fn component_closing_name_range(
     })
 }
 
+/// The name in `</Name>` when the generated `Name}` can keep it where it is, as
+/// upstream's `transform()` does: the tag spells the component's name right
+/// after `</` and something (`>`) follows it. Written out as text instead, the
+/// name mapped to the `<`, two characters early, so renaming the component
+/// edited `</Chi` or left the closing tag behind.
+pub(super) fn component_closing_name_in_place(
+    source: &str,
+    closing_tag_start: u32,
+    comp: &Component,
+) -> Option<(u32, u32)> {
+    let (start, end) = component_closing_name_range(&comp.name, closing_tag_start, comp.end)?;
+    (end < comp.end && source.get(start as usize..end as usize) == Some(comp.name.as_str()))
+        .then_some((start, end))
+}
+
 /// Handle a Svelte component: `<Component ...>`.
 ///
 /// Supports:
@@ -603,8 +618,20 @@ pub fn handle_component(
         } else {
             ""
         };
+        let name_in_place = component_closing_name_in_place(source, closing_tag_start, comp);
         if closing_tag_start == comp.end {
             str.append_left_fmt(comp.end, format_args!("{slot_close}}}"));
+        } else if let Some((name_start, name_end)) = name_in_place {
+            // `</Name>` → `{spaces}{slot_close}Name}`, the name left in place. A
+            // named-slot child closes its own block before the name, and the
+            // `}` after it closes the named-slot block (the caller adds nothing).
+            let block_close = if named_slot_close { "}" } else { "" };
+            str.overwrite_fmt(
+                closing_tag_start,
+                name_start,
+                format_args!("{spaces}{slot_close}{block_close}"),
+            );
+            str.overwrite(name_end, comp.end, "}");
         } else if named_slot_close {
             // Close just this component's block; the named-slot caller emits
             // the component-name reference + the named-slot-block close after.

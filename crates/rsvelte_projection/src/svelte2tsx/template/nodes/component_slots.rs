@@ -779,8 +779,13 @@ pub fn handle_named_slot_component(
         comp,
     );
     if closing_tag_start < comp.end {
-        // The closing tag's gaps were emitted by the component's own overwrite.
-        str.append_left_fmt(comp.end, format_args!("{}}}", comp.name));
+        // The closing tag's gaps were emitted by the component's own overwrite,
+        // and so were its name and this block's `}` when the name stays in place.
+        if super::inline_component::component_closing_name_in_place(source, closing_tag_start, comp)
+            .is_none()
+        {
+            str.append_left_fmt(comp.end, format_args!("{}}}", comp.name));
+        }
     } else {
         str.append_left(comp.end, "}");
     }

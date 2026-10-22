@@ -203,12 +203,7 @@ pub(super) fn emit_opener_segments(
         str.move_range(start, end, range_start);
         return;
     }
-    emit_segmented_overwrite(
-        str,
-        range_start,
-        range_end,
-        &bake_out_of_order_src(segments, source),
-    );
+    emit_opener_copying_tail(str, range_start, range_end, segments, &[], source);
 }
 
 /// Apply an element opener whose generated text starts with statements the
@@ -264,12 +259,7 @@ pub(super) fn emit_opener_with_hoisted_prefix(
         head.push_str(&segs_to_string(prefix, source));
         let mut segments = segments;
         segments.insert(0, Seg::Lit(head));
-        emit_segmented_overwrite(
-            str,
-            range_start,
-            range_end,
-            &bake_out_of_order_src(segments, source),
-        );
+        emit_opener_copying_tail(str, range_start, range_end, segments, &[], source);
         return;
     }
 
@@ -296,16 +286,110 @@ pub(super) fn emit_opener_with_hoisted_prefix(
         str.append_left(*end, &pending);
     }
 
-    emit_segmented_overwrite_around(
-        str,
-        range_start,
-        range_end,
-        &bake_out_of_order_src(segments, source),
-        &hoists,
-    );
+    emit_opener_copying_tail(str, range_start, range_end, segments, &hoists, source);
     for (start, end) in hoists {
         str.move_range(start, end, range_start);
     }
+}
+
+/// Apply an opener's segments when some `Seg::Src` comes after a chunk the
+/// source puts later — a `class:` or `style:` directive's expression, which the
+/// generated text checks after `createElement(…)` while the source spells it
+/// before a later attribute (`<p class:active {onclick}>`). Upstream moves such
+/// chunks after the others (`transform()`); baked into a literal instead
+/// ([`bake_out_of_order_src`]), the expression mapped to the start of the text
+/// around it, and a rename of `active` left the directive behind.
+///
+/// The segments up to the first such `Src` are applied in place over the opener
+/// up to its last character. The rest — that `Src` and everything after it —
+/// follows them as mapped copies of the source ranges (`MagicString::insert_copy`)
+/// with the literals between them, before the last character, whose chunk
+/// carries the final literal, so that whatever is appended at the opener's end
+/// still comes after all of it. The code is the same as with the bake; a copied
+/// range's own bytes are overwritten with the gap around them. A range that
+/// overlaps one applied in place, a `hoisted` one or an earlier copy is baked,
+/// so no source byte is mapped twice; an opener without room for this is baked
+/// as before.
+fn emit_opener_copying_tail(
+    str: &mut MagicString<'_>,
+    range_start: u32,
+    range_end: u32,
+    segments: Vec<Seg>,
+    hoisted: &[(u32, u32)],
+    source: &str,
+) {
+    // The first `Src` out of order, and the end of the last range before it,
+    // tracked as `bake_out_of_order_src` does.
+    let mut in_place_end = 0;
+    let mut tail_start = None;
+    for (index, seg) in segments.iter().enumerate() {
+        match seg {
+            Seg::Src(start, end) if start < end => {
+                if *start < in_place_end {
+                    tail_start = Some(index);
+                    break;
+                }
+                in_place_end = *end;
+            }
+            Seg::Drop(start, end) if *start >= in_place_end && start < end => in_place_end = *end,
+            _ => {}
+        }
+    }
+    // The last character stays a chunk of its own, after the copies.
+    let last = source
+        .get(..range_end as usize)
+        .and_then(|head| head.chars().next_back())
+        .map(|ch| range_end - ch.len_utf8() as u32);
+    let reserved_until = hoisted
+        .iter()
+        .map(|&(_, end)| end)
+        .fold(in_place_end, u32::max);
+    let (Some(tail_start), Some(last)) = (
+        tail_start,
+        last.filter(|&last| range_start < last && reserved_until < last),
+    ) else {
+        emit_segmented_overwrite_around(
+            str,
+            range_start,
+            range_end,
+            &bake_out_of_order_src(segments, source),
+            hoisted,
+        );
+        return;
+    };
+    let mut tail = segments;
+    let head = bake_out_of_order_src(tail.drain(..tail_start).collect(), source);
+    let mut taken: Vec<(u32, u32)> = head
+        .iter()
+        .filter_map(|seg| match seg {
+            Seg::Src(start, end) | Seg::Drop(start, end) => Some((*start, *end)),
+            _ => None,
+        })
+        .chain(hoisted.iter().copied())
+        .collect();
+    emit_segmented_overwrite_around(str, range_start, last, &head, hoisted);
+    let mut pending = String::new();
+    for seg in tail {
+        match seg {
+            Seg::Lit(text) | Seg::LitOpen(text) => pending.push_str(&text),
+            Seg::Src(start, end) => {
+                let free = range_start <= start
+                    && start < end
+                    && end <= last
+                    && !taken.iter().any(|&(s, e)| s < end && start < e);
+                if free {
+                    str.insert_copy(last, &pending, start, end, "");
+                    pending.clear();
+                    taken.push((start, end));
+                } else {
+                    pending.push_str(slice_src(source, start as usize, end as usize));
+                }
+            }
+            // Its bytes are inside a gap the in-place segments overwrite.
+            Seg::Drop(..) => {}
+        }
+    }
+    str.overwrite(last, range_end, &pending);
 }
 
 /// Apply a list of segments to a `MagicString`, overwriting `[start, end)`
