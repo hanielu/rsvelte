@@ -6,7 +6,9 @@
 //! server restarts tsgo for an overdue request only when this module says
 //! tsrs loops on it: a request that is merely slow (its document's check
 //! takes longer than the timeout) must not cost a restart, which rebuilds
-//! every project and throws the check away.
+//! every project and throws the check away. While one such request about a
+//! document is with tsgo, it answers the editor's others there that this
+//! module says tsrs loops on without sending them.
 //!
 //! What loops, as measured against tsrs (`tests/data/tsrs-lost-requests.json`:
 //! 356 requests, every loop among them found, and no request that is answered
@@ -82,8 +84,9 @@ pub fn request_loops(method: &str, text: &str, offset: usize) -> bool {
         previous
     };
     // `isPossiblyTypeArgumentPosition` walks again from the identifier the
-    // `<` follows, as long as it names no generic signature (taken here as
-    // never: an overdue request is answered either way).
+    // `<` follows, as long as it names no generic signature. That is taken as
+    // never: where one does, a request tsrs answers is counted as a loop, which
+    // costs only the editor's repeats of it while it is with tsgo.
     let mut called = HashSet::new();
     let mut end = walker.walk(context);
     loop {

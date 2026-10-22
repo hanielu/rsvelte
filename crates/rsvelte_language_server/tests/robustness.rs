@@ -1710,6 +1710,111 @@ fn a_looping_request_restarts_tsgo_only_after_a_pull_of_its_document() {
     server.shutdown();
 }
 
+/// tsrs never answers a request it loops on, and each one holds one of its
+/// few workers for good (review 5, loopstorm.mjs: with a signature help
+/// every 2 s at such a state, tsrs answered nothing else after three). While
+/// one such request about a document is with tsgo, the editor's others it
+/// would loop on there are answered at once without tsgo; other requests
+/// still reach tsgo; and once tsgo restarts, the next one is sent again.
+#[cfg(unix)]
+#[test]
+fn a_second_request_tsgo_would_loop_on_is_answered_without_it() {
+    let dir = TestDir::new("loop-once");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = one_project(&dir.0);
+    let mut server = Server::start_with_settings(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            (
+                "RSVELTE_TEST_TSGO_IGNORE",
+                Path::new("textDocument/signatureHelp"),
+            ),
+            ("RSVELTE_TSGO_REQUEST_TIMEOUT_MS", Path::new("2000")),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+    );
+    let x = file_uri(&root.join("X.svelte"));
+    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
+    hover(&mut server, &x);
+    let (lost_path, lost_text, at) = looping_buffer(&root);
+    let lost_uri = file_uri(&lost_path);
+    server.open_as(&lost_uri, "typescript", lost_text);
+    hover(&mut server, &lost_uri);
+    let signature_help = |server: &mut Server| {
+        server.request(
+            "textDocument/signatureHelp",
+            json!({ "textDocument": { "uri": lost_uri }, "position": at }),
+        )
+    };
+    let sent_to_tsgo = |log: &Path| {
+        traffic(log)
+            .iter()
+            .filter(|line| line.starts_with("textDocument/signatureHelp "))
+            .count()
+    };
+    let opened = |log: &Path| {
+        traffic(log)
+            .iter()
+            .filter(|line| **line == format!("textDocument/didOpen {shadow}"))
+            .count()
+    };
+    let first = signature_help(&mut server);
+    server.probe();
+    for _ in 0..3 {
+        let asked = Instant::now();
+        let again = signature_help(&mut server);
+        assert_eq!(
+            server.response(again, Duration::from_secs(10))["result"],
+            Value::Null
+        );
+        assert!(
+            asked.elapsed() < Duration::from_millis(1_000),
+            "a request tsgo would loop on again waited {:?}",
+            asked.elapsed()
+        );
+    }
+    assert!(
+        hover(&mut server, &lost_uri)
+            .to_string()
+            .contains("recorded")
+    );
+    assert_eq!(sent_to_tsgo(&log), 1, "{:?}", traffic(&log));
+    assert_eq!(
+        server.response(first, Duration::from_secs(10))["result"],
+        Value::Null
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while opened(&log) < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "tsgo was not restarted: {:?}",
+            traffic(&log)
+        );
+        server.probe();
+        thread::sleep(Duration::from_millis(100));
+    }
+    let after_restart = signature_help(&mut server);
+    server.probe();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sent_to_tsgo(&log) < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "not sent after the restart: {:?}",
+            traffic(&log)
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        server.response(after_restart, Duration::from_secs(10))["result"],
+        Value::Null
+    );
+    server.shutdown();
+}
+
 /// After tsgo restarts, the pulls it was asked for before were answered
 /// without it, so the editor is asked to pull again (review 4).
 #[cfg(unix)]

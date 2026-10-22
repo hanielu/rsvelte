@@ -454,10 +454,8 @@ struct SentRequest {
     method: String,
     /// The document it is about (`params.textDocument.uri`: a shadow's).
     document: Option<String>,
-    /// The text tsgo had for that document and the request's offset in it,
-    /// for a request tsrs could loop on there ([`tsgo_loop::text_can_loop`]);
-    /// read once the request is overdue.
-    loop_probe: Option<(String, usize)>,
+    /// Whether tsrs loops on it for good ([`TsgoRuntime::loops_on`]).
+    loops: bool,
     /// Answered without tsgo once overdue, and cancelled; still tracked
     /// because tsgo loops on it ([`tsgo_loop::request_loops`]), until the
     /// restart that ends the loop.
@@ -794,9 +792,7 @@ impl TsgoRuntime {
                         at: Instant::now(),
                         method: request.method.clone(),
                         document: document.map(str::to_string),
-                        loop_probe: document.and_then(|document| {
-                            self.loop_probe(&request.method, document, &request.params)
-                        }),
+                        loops: self.loops_on(&request.method, &request.params),
                         overdue: false,
                     },
                 ))
@@ -810,31 +806,57 @@ impl TsgoRuntime {
         Ok(())
     }
 
-    /// The shadow text a completion or signature help request is sent
-    /// against, with its offset, when tsrs could loop on such a request there
-    /// (a cheap check of the text; the walk itself runs only if the request
-    /// becomes overdue).
-    fn loop_probe(
-        &self,
-        method: &str,
-        document: &str,
-        params: &serde_json::Value,
-    ) -> Option<(String, usize)> {
+    /// Whether tsrs loops for good on a request (tsgo's half, in shadow
+    /// coordinates) in the text tsgo has for its document ([`tsgo_loop`]):
+    /// only a completion or signature help can, and the walk that says so
+    /// runs only for a text a few scans find it possible in.
+    fn loops_on(&self, method: &str, params: &serde_json::Value) -> bool {
         if !matches!(
             method,
             "textDocument/completion" | "textDocument/signatureHelp"
         ) {
-            return None;
+            return false;
         }
-        let position = serde_json::from_value::<Position>(params.get("position")?.clone()).ok()?;
-        let path = uri_to_path(document);
-        let (text, offset) = self.overlays.iter().find_map(|overlay| {
-            Some((
-                overlay.shadow_text(&path)?,
-                overlay.shadow_offset(&path, position)?,
-            ))
-        })?;
-        tsgo_loop::text_can_loop(text).then(|| (text.to_string(), offset))
+        let Some(path) = params
+            .pointer("/textDocument/uri")
+            .and_then(serde_json::Value::as_str)
+            .map(uri_to_path)
+        else {
+            return false;
+        };
+        let Some(position) = params
+            .get("position")
+            .and_then(|position| serde_json::from_value::<Position>(position.clone()).ok())
+        else {
+            return false;
+        };
+        self.overlays
+            .iter()
+            .find_map(|overlay| {
+                Some((
+                    overlay.shadow_text(&path)?,
+                    overlay.shadow_offset(&path, position)?,
+                ))
+            })
+            .is_some_and(|(text, offset)| {
+                tsgo_loop::text_can_loop(text) && tsgo_loop::request_loops(method, text, offset)
+            })
+    }
+
+    /// A request about the same document as `params` that tsgo has not
+    /// answered and loops on, when tsrs would loop on this one too
+    /// ([`Server::forward_tsgo_request_with_fallback`]).
+    fn looping_on_document(&self, method: &str, params: &serde_json::Value) -> Option<RequestId> {
+        let document = params
+            .pointer("/textDocument/uri")
+            .and_then(serde_json::Value::as_str)?;
+        let looping = self
+            .sent
+            .borrow()
+            .iter()
+            .find(|(_, sent)| sent.loops && sent.document.as_deref() == Some(document))
+            .map(|(id, _)| id.clone())?;
+        self.loops_on(method, params).then_some(looping)
     }
 
     /// Forget a request tsgo answered.
@@ -2833,6 +2855,25 @@ impl Server {
             completion_site_data,
         };
         let id = request.id.clone();
+        // tsrs never answers a request it loops on, and each one holds one of
+        // its few workers for good: with three or so looping, it answers
+        // nothing else until it restarts (review 5, loopstorm.mjs). One per
+        // document is sent, and restarts tsgo once overdue; the editor's
+        // others meanwhile (it asks again as the cursor moves) are answered
+        // at once without tsgo, as the first will be.
+        if let Some(looping) = runtime.looping_on_document(&request.method, &request.params) {
+            log::warn(format_args!(
+                "not sending {} ({id}) to tsgo, which loops on it and has not answered {looping}",
+                request.method
+            ));
+            self.respond(Response::new_ok(
+                id,
+                pending
+                    .fallback_result
+                    .unwrap_or_else(|| tsgo_unmapped_result(&pending.method)),
+            ));
+            return;
+        }
         if let Err(error) = runtime.forward(request.into()) {
             log::warn(format_args!("could not forward request to tsgo: {error}"));
             self.respond(Response::new_ok(
@@ -3359,10 +3400,7 @@ impl Server {
             runtime.cancel(&id);
             let warm_up = self.background.warming.as_ref() == Some(&id);
             let method = request.method.clone();
-            let loops = request
-                .loop_probe
-                .take()
-                .is_some_and(|(text, offset)| tsgo_loop::request_loops(&method, &text, offset));
+            let loops = request.loops;
             log::warn(format_args!(
                 "tsgo did not answer {method} ({id}) in {} ms; answering without it{}",
                 self.tsgo_answer_timeout.as_millis(),
