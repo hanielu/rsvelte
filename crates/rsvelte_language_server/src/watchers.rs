@@ -11,12 +11,18 @@
 //! kept, and registered with the editor only if the covering one goes away.
 //! A watcher into a `node_modules` or a dot directory always reaches the
 //! editor, though: that is what makes an editor scan an ignored directory
-//! and report its changes (a package install), as Zed does.
+//! and report its changes (a package install), as Zed does. One into a
+//! `node_modules` mirror link in the cache is registered on the directory
+//! the link points at: the editor reports changes under their real paths,
+//! which tsgo takes for the link's too, and scans each directory once.
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
 
 use serde_json::{Value, json};
 
+use crate::tsgo_overlay::is_cache_path;
 use crate::uri::uri_to_path;
 
 const WATCHED_FILES: &str = "workspace/didChangeWatchedFiles";
@@ -64,8 +70,17 @@ impl TsgoWatchers {
             let watchers = registration
                 .pointer("/registerOptions/watchers")
                 .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
+                .into_iter()
+                .flatten()
+                .map(|watcher| through_mirror_link(watcher).unwrap_or_else(|| watcher.clone()))
+                .collect::<Vec<_>>();
+            let mut registration = registration.clone();
+            if let Some(options) = registration
+                .pointer_mut("/registerOptions/watchers")
+                .filter(|options| options.is_array())
+            {
+                *options = Value::Array(watchers.clone());
+            }
             let forwarded = !watchers.iter().all(|watcher| self.covers(watcher));
             if forwarded {
                 forward.push(registration.clone());
@@ -73,7 +88,7 @@ impl TsgoWatchers {
             self.registrations.insert(
                 id.to_string(),
                 Registration {
-                    registration: registration.clone(),
+                    registration,
                     watchers,
                     forwarded,
                 },
@@ -176,6 +191,33 @@ impl TsgoWatchers {
                     })
             })
     }
+}
+
+/// A watcher whose literal base lies in an overlay cache, behind one of the
+/// `node_modules` mirror links there, rewritten onto the directory the link
+/// points at: an editor that scanned the link would scan the package
+/// directory a second time and still report its changes under their real
+/// paths, and two projects' links to one directory become one watcher.
+fn through_mirror_link(watcher: &Value) -> Option<Value> {
+    let (base, pattern) = glob_parts(watcher)?;
+    let literal = &pattern[..pattern.find(['*', '?', '[', '{']).unwrap_or(pattern.len())];
+    let split = literal.rfind('/').map_or(0, |slash| slash + 1);
+    let directory = format!("{base}{}", &pattern[..split]);
+    let directory = Path::new(directory.trim_end_matches('/'));
+    if !is_cache_path(directory) {
+        return None;
+    }
+    let target = fs::canonicalize(directory).ok()?;
+    if is_cache_path(&target) {
+        return None;
+    }
+    let mut translated = watcher.clone();
+    translated["globPattern"] = Value::String(format!(
+        "{}/{}",
+        target.to_string_lossy().trim_end_matches('/'),
+        &pattern[split..]
+    ));
+    Some(translated)
 }
 
 /// The directory a watcher's pattern starts from, up to its first wildcard,
@@ -373,6 +415,63 @@ mod tests {
                 ))
                 .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_watcher_into_a_mirror_link_watches_the_directory_it_points_at() {
+        let root = std::env::temp_dir().join(format!(
+            "rsvelte-watchers-mirror-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = {
+            fs::create_dir_all(root.join("app/node_modules")).unwrap();
+            fs::canonicalize(&root).unwrap()
+        };
+        let links = [
+            root.join(".svelte-rs/projects/app/node_modules"),
+            root.join(".svelte-rs/projects/app/tsgo/svelte/app/node_modules"),
+        ];
+        for link in &links {
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(root.join("app/node_modules"), link).unwrap();
+        }
+        let glob = |path: &Path| format!("{}/**/*", path.display());
+        let mut watchers = TsgoWatchers::default();
+        assert!(
+            watchers
+                .register(&watch("root", &[&format!("{}/**/*", root.display())]))
+                .is_some()
+        );
+        let forwarded = watchers
+            .register(&watch("auto-import 11.0", &[&glob(&links[0])]))
+            .expect("a package directory reaches the editor");
+        assert_eq!(
+            forwarded["registrations"][0]["registerOptions"]["watchers"][0]["globPattern"],
+            glob(&root.join("app/node_modules")),
+            "on the directory the link points at"
+        );
+        assert!(
+            watchers
+                .register(&watch("auto-import 11.1", &[&glob(&links[1])]))
+                .is_none(),
+            "the other project's link is the same directory"
+        );
+        // A cache directory that is not a link stays as it is.
+        let cache = root.join(".svelte-rs/tsgo");
+        fs::create_dir_all(&cache).unwrap();
+        let kept = watchers
+            .register(&watch("cache", &[&glob(&cache)]))
+            .expect("a dot directory reaches the editor");
+        assert_eq!(
+            kept["registrations"][0]["registerOptions"]["watchers"][0]["globPattern"],
+            glob(&cache)
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
