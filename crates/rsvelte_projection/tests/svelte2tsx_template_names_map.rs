@@ -226,3 +226,28 @@ fn an_each_blocks_key_keeps_its_place() {
         assert_maps_in_place(&artifact, source, at, len);
     }
 }
+
+#[test]
+fn a_class_or_style_shorthand_keeps_its_name_in_place() {
+    let source = "<script lang=\"ts\">\n\tlet active = $state(false);\n\tlet color = $state(\"red\");\n</script>\n<p class:active>y</p>\n<p style:color>x</p>\n<p style:color|important>z</p>\n<svelte:element this={\"div\"} class:active style:color>v</svelte:element>\n";
+    let artifact = project(source);
+    assert_code_contains(
+        &artifact,
+        &[
+            " { svelteHTML.createElement(\"p\", { });active;  }\n",
+            " { svelteHTML.createElement(\"p\", { });__sveltets_2_ensureType(String, Number, color);  }\n { svelteHTML.createElement(\"p\", { });__sveltets_2_ensureType(String, Number, color);  }\n",
+            "active;__sveltets_2_ensureType(String, Number, color);",
+        ],
+    );
+    for (name, nth) in [
+        ("active>", 0),
+        ("color>", 0),
+        ("color|", 0),
+        ("active style", 0),
+        ("color>v", 0),
+    ] {
+        let at = nth_offset(source, name, nth, 0);
+        let len = source[at..].find(|c: char| !c.is_alphanumeric()).unwrap();
+        assert_maps_in_place(&artifact, source, at, len);
+    }
+}
