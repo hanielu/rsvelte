@@ -91,3 +91,51 @@ fn the_generated_text_is_unchanged() {
     );
     assert!(result.code.contains("\"title\":hue,"), "{}", result.code);
 }
+
+/// The extension swallows one *character*, which upstream counts in UTF-16
+/// units and rsvelte in bytes: a no-break space (Option+Space) or U+2028 after
+/// the separating whitespace was cut after its first byte, and MagicString
+/// panicked slicing the source inside it (round-2 review fuzzing). Columns are
+/// official svelte2tsx 0.7.61's.
+#[test]
+fn a_multibyte_character_is_swallowed_whole() {
+    for source in [
+        "<Comp \u{a0}title={hue} />\n",
+        "<Comp \u{2028}title={hue} />\n",
+    ] {
+        let columns = mapped_columns(source, 0);
+        for column in [5, 6] {
+            assert!(
+                !columns.contains(&column),
+                "{source:?} column {column}: {columns:?}"
+            );
+        }
+        for column in [1, 2, 3, 4, 7, 8] {
+            assert!(
+                columns.contains(&column),
+                "{source:?} column {column}: {columns:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_unfinished_tag_followed_by_a_multibyte_space() {
+    for (source, props) in [
+        ("<D\n\u{a0}f", "props: {\"f\":true,}});}};"),
+        ("<B \u{2028}}", "props: {\"}\":true,}});}};"),
+    ] {
+        let code = svelte2tsx(
+            source,
+            Svelte2TsxOptions {
+                filename: "Input.svelte".to_string(),
+                is_ts_file: true,
+                emit_on_template_error: true,
+                ..Default::default()
+            },
+        )
+        .expect("loose parsing projects an unfinished tag")
+        .code;
+        assert!(code.contains(props), "{source:?}\n{code}");
+    }
+}

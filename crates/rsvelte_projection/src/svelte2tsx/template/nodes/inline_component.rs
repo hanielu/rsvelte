@@ -389,10 +389,19 @@ pub fn handle_component(
         });
         // `transform`'s one-character extension (`node-utils.ts:56-71`) then
         // swallows the character after it, unless a kept range starts there.
+        // That character is whole here, however many bytes it takes: a
+        // no-break space or U+2028 after `<Child\n` is one UTF-16 unit
+        // upstream, and a drop that ends inside it splits it.
+        let next_end = source
+            .get(tag_name_end as usize + 1..)
+            .and_then(|rest| rest.chars().next())
+            .map_or(tag_name_end + 2, |next| {
+                tag_name_end + 1 + source_offset(next.len_utf8())
+            });
         let drop_end = if next_src.is_some_and(|start| start > tag_name_end + 1)
-            && tag_name_end + 1 < opening_tag_end.saturating_sub(1)
+            && next_end < opening_tag_end
         {
-            tag_name_end + 2
+            next_end
         } else {
             tag_name_end + 1
         };
@@ -584,6 +593,7 @@ pub fn handle_component(
             str.append_left(closing_tag_start, &inline_block);
         }
         let spaces = " ".repeat(closing_tag_spacing(
+            source,
             closing_tag_start,
             comp.end,
             component_closing_name_range(&comp.name, closing_tag_start, comp.end),
@@ -937,7 +947,12 @@ pub fn handle_svelte_component(
     if closing_tag_start < comp.end {
         // `svelte:component` keeps no name mapping on its closing tag, so its
         // collapsed gaps are all that precede the closers.
-        let spaces = " ".repeat(closing_tag_spacing(closing_tag_start, comp.end, None));
+        let spaces = " ".repeat(closing_tag_spacing(
+            source,
+            closing_tag_start,
+            comp.end,
+            None,
+        ));
         str.overwrite_fmt(
             closing_tag_start,
             comp.end,
@@ -1308,7 +1323,7 @@ pub fn handle_svelte_self(
     };
     // `svelte:self` keeps no name mapping on its closing tag, so its collapsed
     // gaps are all that precede the closers.
-    let spaces = " ".repeat(closing_tag_spacing(closing_tag_start, el.end, None));
+    let spaces = " ".repeat(closing_tag_spacing(source, closing_tag_start, el.end, None));
     str.overwrite_fmt(
         closing_tag_start,
         el.end,
