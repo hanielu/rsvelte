@@ -78,6 +78,7 @@ pub fn lint_actions(
     path: &std::path::Path,
     uri: &Uri,
     config: &rsvelte_lint::LintConfig,
+    compile: &rsvelte_core::CompileOptions,
     diagnostics: &[Diagnostic],
     include_fixes: bool,
     include_suggestions: bool,
@@ -85,7 +86,7 @@ pub fn lint_actions(
 ) -> Vec<CodeActionOrCommand> {
     let options = rsvelte_core::CompileOptions {
         filename: Some(path.display().to_string()),
-        ..rsvelte_core::CompileOptions::default()
+        ..compile.clone()
     };
     let messages = rsvelte_lint::lint_source_messages(source, path, &options, config);
     let index = LineIndex::new(source);
@@ -759,6 +760,7 @@ mod tests {
             std::path::Path::new("App.svelte"),
             &uri(),
             &config,
+            &rsvelte_core::CompileOptions::default(),
             &[diagnostic],
             false,
             true,
@@ -789,6 +791,7 @@ mod tests {
             std::path::Path::new("App.svelte"),
             &uri(),
             &config,
+            &rsvelte_core::CompileOptions::default(),
             &[diagnostic],
             true,
             false,

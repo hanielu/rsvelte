@@ -334,6 +334,12 @@ fn temp_dir(case: &str) -> PathBuf {
     dir
 }
 
+/// An `rsvelte-lint.json` with the recommended preset: without one only the
+/// compiler's own diagnostics are reported.
+fn opt_into_lint(dir: &Path) {
+    std::fs::write(dir.join("rsvelte-lint.json"), "{}").unwrap();
+}
+
 fn temp_component() -> PathBuf {
     temp_dir("format").join("App.svelte")
 }
@@ -485,6 +491,8 @@ fn did_open(server: &mut Server, uri: &str, text: &str) {
 fn serves_diagnostics_and_formatting() {
     let path = temp_component();
     let uri = file_uri(&path);
+    // Lint rules run only for a project that opts in; this one does.
+    opt_into_lint(path.parent().unwrap());
 
     let mut server = Server::start();
     let id = server.request(
@@ -1387,6 +1395,7 @@ fn compiler_warning_settings_reach_the_published_diagnostics() {
 #[test]
 fn a_pathological_document_does_not_take_the_session_down() {
     let dir = temp_dir("pathological");
+    opt_into_lint(&dir);
     let mut server = initialized_server();
 
     for (name, text) in [
@@ -1487,6 +1496,7 @@ fn cancellation_returns_the_lsp_cancelled_error() {
 #[test]
 fn a_config_change_invalidates_the_resolved_lint_config() {
     let dir = temp_dir("lint-config");
+    opt_into_lint(&dir);
     let uri = file_uri(&dir.join("App.svelte"));
     let mut server = initialized_server();
 
@@ -1519,6 +1529,7 @@ fn a_config_change_invalidates_the_resolved_lint_config() {
 #[test]
 fn a_watched_config_change_invalidates_the_resolved_lint_config() {
     let dir = temp_dir("watched-lint-config");
+    opt_into_lint(&dir);
     let uri = file_uri(&dir.join("App.svelte"));
     let config_uri = file_uri(&dir.join("rsvelte-lint.json"));
     let mut server = initialized_server();
@@ -1541,6 +1552,67 @@ fn a_watched_config_change_invalidates_the_resolved_lint_config() {
         json!({ "changes": [{ "uri": config_uri, "type": 2 }] }),
     );
     server.diagnostics_matching(&uri, |diagnostics| !reports_at_html(diagnostics));
+    assert_eq!(server.shutdown(), Some(0));
+}
+
+/// Without an `rsvelte-lint.json` a document gets what `svelte-language-server`
+/// reports: the compiler's warnings, and no lint rules.
+#[test]
+fn without_a_lint_config_only_compiler_diagnostics_are_reported() {
+    let dir = temp_dir("no-lint-config");
+    let uri = file_uri(&dir.join("App.svelte"));
+    let mut server = initialized_server();
+    did_open(
+        &mut server,
+        &uri,
+        "<div>{@html value}</div>\n<img src=\"x.png\" />\n{#each [1, 2] as n}{n}{/each}\n",
+    );
+    let diagnostics = server.diagnostics_matching(&uri, |diagnostics| {
+        diagnostics
+            .iter()
+            .any(|d| d["code"] == "a11y_missing_attribute")
+    });
+    assert!(
+        diagnostics.iter().all(|d| !d["code"]
+            .as_str()
+            .is_some_and(|code| code.starts_with("svelte/"))),
+        "no lint rule may run without a config: {diagnostics:?}"
+    );
+    assert_eq!(server.shutdown(), Some(0));
+}
+
+/// `compilerOptions.experimental.async` from `svelte.config.js` reaches the
+/// compiler, so top-level `await` is not an `experimental_async` error.
+#[test]
+fn the_svelte_config_compiler_options_reach_the_compiler() {
+    let dir = temp_dir("async-config");
+    let uri = file_uri(&dir.join("App.svelte"));
+    let source = "<script>\n\tconst value = await Promise.resolve(1);\n</script>\n\n<p>{value}</p>\n<img src=\"x.png\" />\n";
+    let reports_async = |diagnostics: &[Value]| {
+        diagnostics
+            .iter()
+            .any(|d| d["code"] == "experimental_async")
+    };
+
+    let mut server = initialized_server();
+    did_open(&mut server, &uri, source);
+    server.diagnostics_matching(&uri, reports_async);
+    assert_eq!(server.shutdown(), Some(0));
+
+    std::fs::write(
+        dir.join("svelte.config.js"),
+        "export default { compilerOptions: { experimental: { async: true } } };\n",
+    )
+    .unwrap();
+    let mut server = initialized_server();
+    did_open(&mut server, &uri, source);
+    // The image's warning proves the compile ran; `experimental_async` is gone.
+    let diagnostics = server.diagnostics_matching(&uri, |diagnostics| {
+        diagnostics
+            .iter()
+            .any(|d| d["code"] == "a11y_missing_attribute")
+    });
+    assert!(!reports_async(&diagnostics), "{diagnostics:?}");
     assert_eq!(server.shutdown(), Some(0));
 }
 

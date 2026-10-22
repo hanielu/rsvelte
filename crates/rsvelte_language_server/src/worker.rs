@@ -357,7 +357,9 @@ fn run(jobs: &Receiver<Job>, outcomes: &Sender<Outcome>, stopping: &AtomicBool) 
                 svelte_diagnostics,
                 css_diagnostics,
             } => {
-                let config = lint_configs.get(path.parent().unwrap_or(Path::new(".")));
+                let dir = path.parent().unwrap_or(Path::new("."));
+                let config = lint_configs.get(dir);
+                let compile = lint_configs.compile_options(dir);
                 let diagnostics = guard("lint", &path, || {
                     let mut diagnostics = if svelte_diagnostics {
                         lint_with_preprocessor(
@@ -365,6 +367,7 @@ fn run(jobs: &Receiver<Job>, outcomes: &Sender<Outcome>, stopping: &AtomicBool) 
                             &text,
                             preprocessed.as_ref(),
                             &config,
+                            &compile,
                             &warnings,
                         )
                     } else {
@@ -468,7 +471,9 @@ fn run(jobs: &Receiver<Job>, outcomes: &Sender<Outcome>, stopping: &AtomicBool) 
                 suggestions,
                 fix_all,
             } => {
-                let config = lint_configs.get(path.parent().unwrap_or(Path::new(".")));
+                let dir = path.parent().unwrap_or(Path::new("."));
+                let config = lint_configs.get(dir);
+                let compile = lint_configs.compile_options(dir);
                 let actions = guard("code action", &path, || {
                     let mut actions = if quickfix {
                         crate::code_actions::quickfixes(&text, &uri, &diagnostics)
@@ -480,6 +485,7 @@ fn run(jobs: &Receiver<Job>, outcomes: &Sender<Outcome>, stopping: &AtomicBool) 
                         &path,
                         &uri,
                         &config,
+                        &compile,
                         &diagnostics,
                         quickfix,
                         suggestions,
@@ -490,13 +496,16 @@ fn run(jobs: &Receiver<Job>, outcomes: &Sender<Outcome>, stopping: &AtomicBool) 
                 .unwrap_or_default();
                 Outcome::CodeActions { id, actions }
             }
-            Job::CodeLens { id, path, text } => Outcome::CodeLenses {
-                id,
-                lenses: guard("code lens", &path, || {
-                    crate::code_lens::code_lenses(&text, &path)
-                })
-                .unwrap_or_default(),
-            },
+            Job::CodeLens { id, path, text } => {
+                let compile = lint_configs.compile_options(path.parent().unwrap_or(Path::new(".")));
+                Outcome::CodeLenses {
+                    id,
+                    lenses: guard("code lens", &path, || {
+                        crate::code_lens::code_lenses_with(&text, &path, &compile)
+                    })
+                    .unwrap_or_default(),
+                }
+            }
             Job::ExtractComponent {
                 id,
                 uri,
@@ -557,7 +566,9 @@ fn run(jobs: &Receiver<Job>, outcomes: &Sender<Outcome>, stopping: &AtomicBool) 
                 svelte_diagnostics,
                 css_diagnostics,
             } => {
-                let config = lint_configs.get(path.parent().unwrap_or(Path::new(".")));
+                let dir = path.parent().unwrap_or(Path::new("."));
+                let config = lint_configs.get(dir);
+                let compile = lint_configs.compile_options(dir);
                 let diagnostics = guard("pull diagnostics", &path, || {
                     let mut diagnostics = if svelte_diagnostics {
                         lint_with_preprocessor(
@@ -565,6 +576,7 @@ fn run(jobs: &Receiver<Job>, outcomes: &Sender<Outcome>, stopping: &AtomicBool) 
                             &text,
                             preprocessed.as_ref(),
                             &config,
+                            &compile,
                             &warnings,
                         )
                     } else {
@@ -610,9 +622,10 @@ fn lint_with_preprocessor(
     raw: &str,
     preprocessed: Option<&PreprocessedAnalysis>,
     config: &rsvelte_lint::LintConfig,
+    compile: &rsvelte_core::CompileOptions,
     warnings: &CompilerWarnings,
 ) -> Vec<Diagnostic> {
-    let mut diagnostics = crate::lint::lint(path, raw, config)
+    let mut diagnostics = crate::lint::lint_with(path, raw, config, compile)
         .iter()
         .filter_map(|diagnostic| {
             let compiler = diagnostic
@@ -630,7 +643,7 @@ fn lint_with_preprocessor(
     let Some(preprocessed) = preprocessed else {
         return diagnostics;
     };
-    let processed_diagnostics = crate::lint::lint(path, &preprocessed.text, config);
+    let processed_diagnostics = crate::lint::lint_with(path, &preprocessed.text, config, compile);
     let mapped = processed_diagnostics
         .into_iter()
         .filter(|diagnostic| {

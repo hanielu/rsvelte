@@ -10,10 +10,20 @@ const LEGACY_OVERVIEW: &str = "https://svelte.dev/docs/svelte/legacy-overview";
 /// Mirror Svelte's mode CodeLens. A failed compile deliberately keeps an empty
 /// lens so an editor does not shift surrounding lenses while the user is typing.
 pub fn code_lenses(source: &str, path: &Path) -> Vec<CodeLens> {
+    code_lenses_with(source, path, &rsvelte_core::CompileOptions::default())
+}
+
+/// [`code_lenses`] with the project's compiler options (a forced `runes`
+/// changes the mode the lens names).
+pub fn code_lenses_with(
+    source: &str,
+    path: &Path,
+    base: &rsvelte_core::CompileOptions,
+) -> Vec<CodeLens> {
     let range = Range::new(Position::new(0, 0), Position::new(0, 0));
     let mut options = rsvelte_core::CompileOptions {
         filename: Some(path.display().to_string()),
-        ..rsvelte_core::CompileOptions::default()
+        ..base.clone()
     };
     options.generate = rsvelte_core::GenerateMode::None;
 
