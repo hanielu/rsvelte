@@ -251,7 +251,7 @@ impl<'a> Parser<'a> {
         let attributes_result = self.parse_attributes();
         self.in_svelte_options = prev_in_svelte_options;
         self.in_root_script_or_style = prev_in_root_script_or_style;
-        let attributes = attributes_result?;
+        let mut attributes = attributes_result?;
 
         // Track position after attributes for unclosed elements at EOF
         let pos_after_attrs = self.index;
@@ -359,6 +359,7 @@ impl<'a> Parser<'a> {
         // If not self-closing and not void, parse children
         // But only if we found the closing bracket '>' - otherwise the element is malformed
         if !self_closing && !is_void && has_closing_bracket {
+            let warnings_before_children = self.parse_warnings.len();
             self.stack.push(StackEntry::Element {
                 name: name.clone(),
                 start: start as u32,
@@ -443,6 +444,24 @@ impl<'a> Parser<'a> {
                     {
                         self.last_auto_closed_tag = None;
                     }
+                } else if self.options.loose
+                    && matches!(
+                        attributes.last(),
+                        Some(crate::ast::Attribute::Attribute(last))
+                            if last.name.strip_prefix('<') == Some(closing_name)
+                    )
+                {
+                    // element.js L95-104: an opening tag still being typed
+                    // (`<div class="x"` above `<p>…</p>`) read the next opening
+                    // tag as an attribute; loose mode backtracks to it, so it
+                    // becomes a sibling. Upstream keeps the children read past
+                    // it, which then belong to both; they are read again as its.
+                    if let Some(crate::ast::Attribute::Attribute(last)) = attributes.pop() {
+                        self.index = last.start as usize;
+                    }
+                    fragment.nodes.clear();
+                    self.parse_warnings.truncate(warnings_before_children);
+                    found_closing_tag = true;
                 } else {
                     // Mismatched close tag. Upstream's close() while-loop:
                     // a *RegularElement* parent is implicitly closed with an
