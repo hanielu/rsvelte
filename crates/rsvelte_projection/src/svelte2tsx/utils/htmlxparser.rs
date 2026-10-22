@@ -519,6 +519,68 @@ fn only_has_script_candidates_in_ranges(
     true
 }
 
+/// JavaScript's `\s`: Unicode white space without U+0085, plus U+FEFF.
+fn is_js_whitespace(c: char) -> bool {
+    (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}'
+}
+
+/// The offset just past the `>` that ends the opening tag of the `<script`
+/// right before `from`, as upstream's `scriptRegex` reads it:
+/// `<script(?:\s+NAME=VALUE|\s+NAME)*\s*>`, with NAME `[^=>'"\/\s]+` and
+/// VALUE `"[^"]*"`, `'[^']*'` or `[^>\s]+`, tried in that order. The regex
+/// backtracks into those choices when no `</script>` follows the `>` it
+/// reached, so a `>` counts only if `accept` takes the offset after it. Positions
+/// already explored are not explored again, which keeps the search linear.
+fn script_opening_tag_end(
+    source: &str,
+    from: usize,
+    accept: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let char_at = |at: usize| source.get(at..).and_then(|rest| rest.chars().next());
+    let run = |mut at: usize, keep: &dyn Fn(char) -> bool| {
+        while let Some(c) = char_at(at).filter(|&c| keep(c)) {
+            at += c.len_utf8();
+        }
+        at
+    };
+    let is_name = |c: char| !matches!(c, '=' | '>' | '\'' | '"' | '/') && !is_js_whitespace(c);
+    let mut explored = std::collections::HashSet::new();
+    // Offsets after `<script` or after an attribute, most preferred last.
+    let mut pending = vec![from];
+    while let Some(at) = pending.pop() {
+        if !explored.insert(at) {
+            continue;
+        }
+        let name = run(at, &is_js_whitespace);
+        if char_at(name) == Some('>') {
+            if accept(name + 1) {
+                return Some(name + 1);
+            }
+            continue;
+        }
+        // Another attribute needs whitespace before its name.
+        let equals = run(name, &is_name);
+        if name == at || equals == name {
+            continue;
+        }
+        if char_at(equals) != Some('=') {
+            pending.push(equals);
+            continue;
+        }
+        let value = equals + 1;
+        let unquoted = run(value, &|c| c != '>' && !is_js_whitespace(c));
+        if unquoted > value {
+            pending.push(unquoted);
+        }
+        if let Some(quote @ ('"' | '\'')) = char_at(value)
+            && let Some(close) = source[value + 1..].find(quote)
+        {
+            pending.push(value + 1 + close + 1);
+        }
+    }
+    None
+}
+
 fn find_orphan_scripts(ast: &Root, source: &str) -> Vec<(u32, u32, String)> {
     if only_has_top_level_script_candidates(ast, source) {
         return Vec::new();
@@ -548,9 +610,13 @@ fn find_orphan_scripts(ast: &Root, source: &str) -> Vec<(u32, u32, String)> {
     let mut html_tag_ranges: Vec<(u32, u32)> = Vec::new();
     collect_html_tag_ranges(&ast.fragment, &mut html_tag_ranges);
 
-    // 3. Scan the source for `<script` occurrences.
+    // 3. Scan the source for `<script` occurrences. A match needs a
+    // `</script>` after its opening tag.
     let bytes = source.as_bytes();
     let mut result: Vec<(u32, u32, String)> = Vec::new();
+    let Some(last_close) = source.rfind("</script>") else {
+        return result;
+    };
     let mut search: usize = 0;
 
     while search < source.len() {
@@ -595,19 +661,22 @@ fn find_orphan_scripts(ast: &Root, source: &str) -> Vec<(u32, u32, String)> {
             continue;
         }
 
-        // Find the matching `</script>`.
-        let Some(close_abs) = find_bytes(bytes, tag_start as usize, b"</script>") else {
-            break; // unterminated — skip
+        // The opening tag ends where upstream's `scriptRegex` ends it, and the
+        // content at the first `</script>` after that. A `>` of a `</script>`
+        // never ends it (`<script </script>` in an attribute value, or a tag
+        // being typed), which once started the content after its own end.
+        let Some(open_gt) = script_opening_tag_end(source, after_pos, |end| end <= last_close)
+        else {
+            search = after_pos;
+            continue;
         };
-        let close_rel = close_abs - tag_start as usize;
-        let tag_end = tag_start + source_offset(close_rel) + 9; // 9 = len("</script>")
+        let close_abs = find_bytes(bytes, open_gt, b"</script>")
+            .expect("a `</script>` follows an accepted opening tag");
+        let tag_end = source_offset(close_abs) + 9; // 9 = len("</script>")
 
-        // Extract the inner content: everything between `>` of the open tag and
-        // `<` of `</script>`.
-        let open_gt = slice_src(source, tag_start as usize, tag_end as usize)
-            .find('>')
-            .map_or(tag_start as usize + 8, |p| tag_start as usize + p + 1); // fallback: after "<script>"
-        let inner = source[open_gt..tag_start as usize + close_rel].to_string();
+        // The inner content: everything between `>` of the open tag and `<`
+        // of `</script>`.
+        let inner = source[open_gt..close_abs].to_string();
 
         result.push((tag_start, tag_end, inner));
         search = tag_end as usize;
@@ -777,6 +846,44 @@ const instance_marker = `<script data-marker>`;
         // Upstream's `findNextVerbatimElement` regex opens with a `(<!--[^]*?-->)`
         // arm and skips any match that starts with it, so this is not a script.
         assert!(orphans(comment).is_empty());
+    }
+
+    /// Where upstream's `scriptRegex` (svelte2tsx 0.7.61) ends the opening
+    /// tag, or `None` where it finds no script at that `<script`.
+    #[test]
+    fn an_opening_tag_ends_where_upstreams_script_regex_ends_it() {
+        let open_end = |source: &str| {
+            script_opening_tag_end(source, "<script".len(), |end| {
+                source[end..].contains("</script>")
+            })
+        };
+        assert_eq!(open_end("<script>x</script>"), Some(8));
+        assert_eq!(
+            open_end("<script lang=\"ts\" a='>' b=c d>x</script>"),
+            Some(30)
+        );
+        assert_eq!(open_end("<script\u{a0}a>x</script>"), Some(11));
+        // A `>` with no `</script>` after it ends nothing.
+        assert_eq!(open_end("<script </script>"), None);
+        assert_eq!(open_end("<script a </script> b </script>"), None);
+        assert_eq!(open_end("<script a=\"x>\" b>"), None);
+        assert_eq!(open_end("<script a/>x</script>"), None);
+        // A quoted value first, an unquoted one when the rest fails after it.
+        assert_eq!(open_end("<script a=\"x>\" b>x</script>"), Some(17));
+        assert_eq!(open_end("<script a=\"x\"b>x</script>"), Some(15));
+        assert_eq!(open_end("<script a=\"x>\"b> </script>"), Some(13));
+        assert_eq!(open_end("<script a=\"x>y</script>"), Some(13));
+        assert_eq!(open_end("<script a=\"<script></script>\">"), Some(19));
+    }
+
+    #[test]
+    fn a_script_tag_inside_an_attribute_value_is_not_cut_at_its_closing_tag() {
+        assert!(orphans("<div title=\"<script </script>\"></div>").is_empty());
+        assert!(orphans("<div title=\"<script a </script> b </script>\"></div>").is_empty());
+        assert_eq!(
+            orphans("<div title=\"<script a> b </script>\"></div>"),
+            vec![(12, 34, " b ".to_string())]
+        );
     }
 
     #[test]
