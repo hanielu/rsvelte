@@ -151,3 +151,23 @@ fn a_member_access_in_the_module_script() {
         "///<reference types=\"svelte\" />\n;\n\timport { writable } from \"svelte/store\";\n\texport const count = writable(0)/*Ωignore_startΩ*/;let $count = __sveltets_2_store_get(count);/*Ωignore_endΩ*/;\n\tcount.\n;;function $$render() {\nasync () => {\n\n { svelteHTML.createElement(\"p\", {});$count; }\n};\nreturn { props: /** @type {Record<string, never>} */ ({}), exports: {}, bindings: \"\", slots: {}, events: {} }}\nexport const Test__SvelteComponent_ = __sveltets_2_isomorphic_component(__sveltets_2_partial(__sveltets_2_with_any_event($$render())));\n/*Ωignore_startΩ*//** @typedef {InstanceType<typeof Test__SvelteComponent_>} Test__SvelteComponent_ */\n/*Ωignore_endΩ*/export default Test__SvelteComponent_;"
     );
 }
+
+/// A no-break space (Option+Space on a Mac) or an ideographic space typed
+/// into an unfinished construct: recovery blanked it and wrote the closer into
+/// its second byte, so the program had a span ending inside the character and
+/// MagicString panicked slicing the source there (round-2 review fuzzing).
+#[test]
+fn multibyte_whitespace_in_an_unfinished_construct() {
+    for script in [
+        "\n\tlet { b = $bindable() } = $props(\u{a0}",
+        "\n\tlet { b } = $props(\u{3000}",
+        "\n\tlet { b } = $props(\u{a0}\n",
+        "\n\tlet x = \u{3000}",
+        "\n\tconst o = {\u{a0}",
+        "\n\tfoo(\u{a0}\u{3000}\nlet y = `${a.\u{a0}",
+    ] {
+        let source = format!("<script lang=\"ts\">{script}</script>\n<p>{{1}}</p>\n");
+        let code = convert(&source);
+        assert!(code.contains("export default"), "{source:?}\n{code}");
+    }
+}

@@ -15,7 +15,10 @@
 //! name, operand or closing bracket is written into the whitespace where
 //! TypeScript would put its zero-width missing node, so the construct keeps
 //! its extent; anything else unfinished is blanked to spaces (line breaks
-//! kept), which only hides it from the transforms.
+//! kept), which only hides it from the transforms. A byte is filled only
+//! where the author's text has an ASCII byte: a token written into a blanked
+//! multibyte character (a no-break space, say) would give the program a span
+//! that ends inside that character, which MagicString cannot slice.
 
 use std::ops::Range;
 
@@ -58,7 +61,7 @@ pub(super) fn recover(
     for _ in 0..MAX_REPAIRS {
         let planned = rounds_before_cut.checked_sub(1).and_then(|left| {
             rounds_before_cut = left;
-            state.plan(&text, &fault)
+            state.plan(source.as_bytes(), &text, &fault)
         });
         let outcome = match planned {
             None => {
@@ -244,7 +247,7 @@ struct State {
 }
 
 impl State {
-    fn plan(&mut self, text: &str, fault: &Fault) -> Option<Repair> {
+    fn plan(&mut self, original: &[u8], text: &str, fault: &Fault) -> Option<Repair> {
         let bytes = text.as_bytes();
         let tokens = tokens(bytes);
         let anchor = fault.anchor.min(bytes.len());
@@ -313,7 +316,8 @@ impl State {
             && fault
                 .opened
                 .is_none_or(|opened| Some(line_start(bytes, opened)) == culprit_line)
-            && let Some(at) = self.fillable(bytes, culprit.map_or(0, |token| token.range.end))
+            && let Some(at) =
+                self.fillable(original, bytes, culprit.map_or(0, |token| token.range.end))
         {
             return Some(Repair::Fill {
                 at,
@@ -347,7 +351,7 @@ impl State {
         }
         if culprit.kind == Kind::Punct
             && takes_operand(&bytes[culprit.range.clone()])
-            && let Some(at) = self.fillable(bytes, culprit.range.end)
+            && let Some(at) = self.fillable(original, bytes, culprit.range.end)
         {
             return Some(Repair::Fill {
                 at,
@@ -358,10 +362,12 @@ impl State {
         Some(Repair::Rewrite(culprit.range.clone(), Edit::Blank))
     }
 
-    /// The whitespace byte right at `offset`, unless filling it would join the
-    /// filled byte to a following word or it was filled before.
-    fn fillable(&self, bytes: &[u8], offset: usize) -> Option<usize> {
+    /// The whitespace byte right at `offset`, unless it was part of a
+    /// multibyte character in the `original` text, filling it would join the
+    /// filled byte to a following word, or it was filled before.
+    fn fillable(&self, original: &[u8], bytes: &[u8], offset: usize) -> Option<usize> {
         (bytes.get(offset).is_some_and(u8::is_ascii_whitespace)
+            && original.get(offset).is_some_and(u8::is_ascii)
             && !bytes
                 .get(offset + 1)
                 .is_some_and(|&byte| is_word_byte(byte))
@@ -511,13 +517,17 @@ fn open_brackets(bytes: &[u8], tokens: &[Token]) -> Vec<(usize, &'static str)> {
 }
 
 /// `source` with everything from `cut` on blanked, and the brackets the code
-/// before `cut` leaves open closed in the blanked space.
+/// before `cut` leaves open closed in the blanked space (never in a blanked
+/// multibyte character).
 fn cut_tail(source: &str, cut: usize, filled: &mut Vec<usize>) -> Option<String> {
     let blanked = rewrite(source, cut..source.len(), Edit::Blank)?;
     let mut bytes = blanked.into_bytes();
     let open = open_brackets(&bytes, &tokens(&bytes[..cut]));
     let closers = open.iter().rev().flat_map(|(_, closer)| closer.bytes());
-    let spaces: Vec<usize> = (cut..bytes.len()).filter(|&at| bytes[at] == b' ').collect();
+    let original = source.as_bytes();
+    let spaces: Vec<usize> = (cut..bytes.len())
+        .filter(|&at| bytes[at] == b' ' && original[at].is_ascii())
+        .collect();
     for (at, closer) in spaces.into_iter().zip(closers) {
         bytes[at] = closer;
         filled.push(at);
@@ -883,5 +893,22 @@ mod tests {
     fn multibyte_text_is_blanked_byte_for_byte() {
         assert_eq!(recovered("const é = ü."), "const é = ü ");
         assert_eq!(recovered("const s = 'ü\n"), "const s =_   \n");
+    }
+
+    #[test]
+    fn nothing_is_written_into_a_blanked_multibyte_character() {
+        // A no-break space (Option+Space) or an ideographic space typed after
+        // `$props(`: the closer goes into ASCII space or nowhere.
+        assert_eq!(
+            recovered("let { b } = $props(\u{a0}\n"),
+            "let { b } = $props(\u{a0})"
+        );
+        assert_eq!(recovered("foo(\u{a0}\u{3000}\n"), "foo(\u{a0}\u{3000})");
+        assert_eq!(
+            recovered("let { b = $bindable() } = $props(\u{a0}"),
+            "let { b = $bindable() } = $props   "
+        );
+        assert_eq!(recovered("let x = \u{3000}"), "let x =_   ");
+        assert_eq!(recovered("let o = {\u{a0}"), "let o =_   ");
     }
 }
