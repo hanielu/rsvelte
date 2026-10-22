@@ -281,3 +281,35 @@ fn a_class_or_style_directive_before_a_later_attribute_keeps_its_mapping() {
         }
     }
 }
+
+#[test]
+fn a_snippets_type_parameters_keep_their_place() {
+    let source = "<script lang=\"ts\">\n\ttype Size = \"sm\" | \"lg\";\n\ttype Row = { id: string };\n</script>\n{#snippet pair<T extends Size>(a: T, b: Row)}<i>{a}{b.id}</i>{/snippet}\n{#snippet keyed< K extends keyof Row , V = Map<K, Size> >()}{/snippet}\n{#snippet quoted<T extends '>' | \"<\">(q: T)}{q}{/snippet}\n{@render pair(\"sm\", { id: \"x\" })}\n";
+    let artifact = project(source);
+    assert_code_contains(
+        &artifact,
+        &[
+            " const pair/*\u{03A9}ignore_position\u{03A9}*/ = <T extends Size>(a: T, b: Row)/*\u{03A9}ignore_start\u{03A9}*/",
+            " const keyed/*\u{03A9}ignore_position\u{03A9}*/ = <K extends keyof Row , V = Map<K, Size>>()/*\u{03A9}ignore_start\u{03A9}*/: ReturnType<import('svelte').Snippet>/*\u{03A9}ignore_end\u{03A9}*/ => { async ()/*\u{03A9}ignore_position\u{03A9}*/ => {};return __sveltets_2_any(0)};",
+            " const quoted/*\u{03A9}ignore_position\u{03A9}*/ = <T extends '>' | \"<\">(q: T)/*\u{03A9}ignore_start\u{03A9}*/",
+        ],
+    );
+    for type_params in [
+        "T extends Size",
+        "K extends keyof Row , V = Map<K, Size>",
+        "T extends '>' | \"<\"",
+    ] {
+        assert_maps_in_place(
+            &artifact,
+            source,
+            nth_offset(source, type_params, 0, 0),
+            type_params.len(),
+        );
+    }
+    assert_maps_in_place(
+        &artifact,
+        source,
+        nth_offset(source, "a: T, b: Row", 0, 0),
+        12,
+    );
+}

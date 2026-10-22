@@ -134,44 +134,73 @@ fn params_text<'a>(block: &SnippetBlock, source: &'a str) -> &'a str {
 fn params_open_paren(block: &SnippetBlock, source: &str) -> Option<usize> {
     let (_, name_end) = get_expression_range(&block.expression)?;
     let bytes = source.as_bytes();
-    let mut index = name_end as usize;
-    let skip_whitespace = |index: &mut usize| {
-        while bytes.get(*index).is_some_and(u8::is_ascii_whitespace) {
-            *index += 1;
-        }
-    };
-    skip_whitespace(&mut index);
+    let mut index = skip_whitespace(bytes, name_end as usize);
     if bytes.get(index) == Some(&b'<') {
-        let mut depth = 0u32;
-        while let Some(&byte) = bytes.get(index) {
-            match byte {
-                b'\'' | b'"' => {
+        index = skip_whitespace(
+            bytes,
+            type_params_close(bytes, index).map_or(bytes.len(), |close| close + 1),
+        );
+    }
+    (bytes.get(index) == Some(&b'(')).then_some(index)
+}
+
+fn skip_whitespace(bytes: &[u8], mut index: usize) -> usize {
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    index
+}
+
+/// The `>` that closes the type-parameter list opened by the `<` at `open`,
+/// skipping quoted strings, as the parser reads it.
+fn type_params_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut index = open;
+    let mut depth = 0u32;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'\'' | b'"' => {
+                index += 1;
+                while let Some(&inner) = bytes.get(index) {
                     index += 1;
-                    while let Some(&inner) = bytes.get(index) {
+                    if inner == b'\\' {
                         index += 1;
-                        if inner == b'\\' {
-                            index += 1;
-                        } else if inner == byte {
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                b'<' => depth += 1,
-                b'>' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        index += 1;
+                    } else if inner == byte {
                         break;
                     }
                 }
-                _ => {}
+                continue;
             }
-            index += 1;
+            b'<' => depth += 1,
+            b'>' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
         }
-        skip_whitespace(&mut index);
+        index += 1;
     }
-    (bytes.get(index) == Some(&b'(')).then_some(index)
+    None
+}
+
+/// The snippet's type parameters in the source (`T extends Size` in
+/// `{#snippet pair<T extends Size>(…)}`), when they read as the parser read them.
+fn type_params_range(block: &SnippetBlock, source: &str) -> Option<(u32, u32)> {
+    let type_params = block.type_params.as_deref()?;
+    let (_, name_end) = get_expression_range(&block.expression)?;
+    let bytes = source.as_bytes();
+    let open = skip_whitespace(bytes, name_end as usize);
+    if bytes.get(open) != Some(&b'<') {
+        return None;
+    }
+    let close = type_params_close(bytes, open)?;
+    let inner = source.get(open + 1..close)?;
+    let start = open + 1 + (inner.len() - inner.trim_start().len());
+    let end = close - (inner.len() - inner.trim_end().len());
+    (start < end && source.get(start..end) == Some(type_params))
+        .then(|| Some((u32::try_from(start).ok()?, u32::try_from(end).ok()?)))
+        .flatten()
 }
 
 /// Upstream reaches the standalone form through `transform()`, which overwrites
@@ -271,23 +300,26 @@ pub fn handle_snippet_block_inner(
     // — mirroring upstream's `addImplicitSnippetProp` transforms — and closes
     // with a trailing `,` so it slots into the component `props` object literal.
     //
-    // The header is `{lead}{name}{mid}{params}{tail}`.
-    let (lead, mid, tail) = if as_component_prop {
+    // The header is `{lead}{name}{mid_head}{type_params}({params}{tail}`.
+    let (lead, mid_head, type_params_text, tail) = if as_component_prop {
         (
             String::new(),
-            ":(".to_string(),
+            ":",
+            "",
             ") => { async ()/*\u{03A9}ignore_position\u{03A9}*/ => {",
         )
     } else if use_ts_syntax {
         (
             format!("{}const ", opener_pad(block, source)),
-            format!("/*\u{03A9}ignore_position\u{03A9}*/ = {type_params_str}("),
+            "/*\u{03A9}ignore_position\u{03A9}*/ = ",
+            type_params_str.as_str(),
             ")/*\u{03A9}ignore_start\u{03A9}*/: ReturnType<import('svelte').Snippet>/*\u{03A9}ignore_end\u{03A9}*/ => { async ()/*\u{03A9}ignore_position\u{03A9}*/ => {",
         )
     } else {
         (
             format!("{}const ", opener_pad(block, source)),
-            "/*\u{03A9}ignore_position\u{03A9}*/ = /** @returns {ReturnType<import('svelte').Snippet>} */ (".to_string(),
+            "/*\u{03A9}ignore_position\u{03A9}*/ = /** @returns {ReturnType<import('svelte').Snippet>} */ ",
+            "",
             ") => { async ()/*\u{03A9}ignore_position\u{03A9}*/ => {",
         )
     };
@@ -303,28 +335,48 @@ pub fn handle_snippet_block_inner(
     } else {
         (block.end, format!("{tail}{closing}"))
     };
-    match header_in_place(block, source, header_end) {
-        Some(((name_start, name_end), params)) => {
+    let keep_type_params = !type_params_text.is_empty();
+    match header_in_place(block, source, header_end, keep_type_params) {
+        Some(HeaderRanges {
+            name: (name_start, name_end),
+            type_params,
+            params,
+        }) => {
             // Upstream overwrites the block's opening around the snippet's name
             // and its parameter list, which keep their own mappings: a rename of
             // the snippet, or of a type its parameters use, lands on the
-            // author's text.
+            // author's text. The type parameters stay in place too (upstream
+            // writes them out, so a rename there corrupts the opening).
             str.overwrite(block.start, name_start, &lead);
-            match params {
-                Some((params_start, params_end)) => {
-                    str.overwrite(name_end, params_start, &mid);
-                    str.overwrite(params_end, header_end, &header_tail);
+            let mut cursor = name_end;
+            let mut text = mid_head.to_string();
+            match type_params {
+                Some((start, end)) => {
+                    text.push('<');
+                    str.overwrite(cursor, start, &text);
+                    cursor = end;
+                    text = ">(".to_string();
                 }
                 None => {
-                    str.overwrite_fmt(name_end, header_end, format_args!("{mid}{header_tail}"));
+                    text.push_str(type_params_text);
+                    text.push('(');
                 }
             }
+            if let Some((start, end)) = params {
+                str.overwrite(cursor, start, &text);
+                cursor = end;
+                text.clear();
+            }
+            text.push_str(&header_tail);
+            str.overwrite(cursor, header_end, &text);
         }
         None => {
             str.overwrite_fmt(
                 block.start,
                 header_end,
-                format_args!("{lead}{name_text}{mid}{params_text}{header_tail}"),
+                format_args!(
+                    "{lead}{name_text}{mid_head}{type_params_text}({params_text}{header_tail}"
+                ),
             );
         }
     }
@@ -349,27 +401,43 @@ pub fn handle_snippet_block_inner(
     }
 }
 
-/// The ranges of the snippet's name and, if it has any, its parameter list,
-/// when the header can be written around them: each lies inside the block's
-/// opening, in order, with generated text to go before, between and after them.
+/// The ranges in a snippet's opening that the header keeps in place.
+struct HeaderRanges {
+    name: (u32, u32),
+    type_params: Option<(u32, u32)>,
+    params: Option<(u32, u32)>,
+}
+
+/// The ranges of the snippet's name, its type parameters (when
+/// `keep_type_params`) and its parameter list, when the header can be written
+/// around them: each lies inside the block's opening, in order, with generated
+/// text to go before, between and after them.
 fn header_in_place(
     block: &SnippetBlock,
     source: &str,
     header_end: u32,
-) -> Option<((u32, u32), Option<(u32, u32)>)> {
+    keep_type_params: bool,
+) -> Option<HeaderRanges> {
     let (name_start, name_end) = get_expression_range(&block.expression)?;
     if !(block.start < name_start && name_start < name_end && name_end < header_end) {
         return None;
     }
+    let type_params = type_params_range(block, source)
+        .filter(|&(start, end)| keep_type_params && name_end < start && end < header_end);
+    let after_type_params = type_params.map_or(name_end, |(_, end)| end);
     let params = match params_range(block, source) {
         Some((start, end)) if start < end => {
             let (start, end) = (u32::try_from(start).ok()?, u32::try_from(end).ok()?);
-            if !(name_end < start && end < header_end) {
+            if !(after_type_params < start && end < header_end) {
                 return None;
             }
             Some((start, end))
         }
         _ => None,
     };
-    Some(((name_start, name_end), params))
+    Some(HeaderRanges {
+        name: (name_start, name_end),
+        type_params,
+        params,
+    })
 }
