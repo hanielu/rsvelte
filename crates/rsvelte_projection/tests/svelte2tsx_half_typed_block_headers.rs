@@ -120,3 +120,34 @@ fn every_keystroke_of_an_each_block_with_an_auto_closed_brace() {
             .contains("  for(let item of __sveltets_2_ensureArray(items)){\n"),
     );
 }
+
+#[test]
+fn an_await_block_with_nothing_typed_after_await() {
+    // Found by fuzzing: an empty promise in front of a pending block was
+    // relocated with `move_range`, which panicked on the empty range.
+    let code = convert(
+        &[
+            HEAD,
+            "{#await }\n\t<p>loading</p>\n{:then value}\n\t<p>{value}</p>\n{/await}\n",
+        ]
+        .concat(),
+    );
+    assert!(code.contains("await ()"), "{code}");
+    assert!(code.contains("const value = $$_value;"), "{code}");
+    convert("{#await }\n{:then ");
+}
+
+#[test]
+fn every_keystroke_of_an_await_block_with_an_auto_closed_brace() {
+    type_out(
+        "",
+        "{#await p",
+        "}\n\t<p>loading</p>\n{:then value}\n\t<p>done</p>\n{/await}\n",
+    );
+    type_out(
+        "",
+        "{#await p",
+        "}\n\t<p>loading</p>\n{:catch error}\n\t<p>done</p>\n{/await}\n",
+    );
+    type_out("", "{#await p catch error", "}\n\t<p>done</p>\n{/await}\n");
+}
