@@ -751,7 +751,8 @@ fn main() {
         } else if message.contains(r#""method":"textDocument/didOpen""#) {
             let uri = message.split_once(r#""uri":""#).unwrap().1.split('"').next().unwrap().to_string();
             let mut file = OpenOptions::new().create(true).append(true).open(&log).unwrap();
-            writeln!(file, "didOpen {uri}").unwrap();
+            // One write per line: a restarted tsgo appends to the same log.
+            file.write_all(format!("didOpen {uri}\n").as_bytes()).unwrap();
         } else if message.contains(r#""method":"textDocument/hover""#) {
             let id = json_id(&message);
             write_message(&mut output, &format!(
@@ -2009,7 +2010,9 @@ fn main() {
         if !method.is_empty() && method != "initialize" && method != "initialized" {
             let mut file = OpenOptions::new().create(true).append(true).open(&log).unwrap();
             let marked = if message.contains(&marker) { " marked" } else { "" };
-            writeln!(file, "{method} {uri}{marked}").unwrap();
+            // One write per line (`writeln!` writes each piece on its own): a
+            // restarted tsgo appends to the same log while the old one ends.
+            file.write_all(format!("{method} {uri}{marked}\n").as_bytes()).unwrap();
         }
         if method == "initialize" {
             let id = json_id(&message);
