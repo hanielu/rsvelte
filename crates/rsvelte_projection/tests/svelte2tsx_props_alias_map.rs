@@ -150,3 +150,97 @@ fn an_alias_of_a_non_object_annotation_maps_back_to_it() {
         ";type $$ComponentProps =  HTMLButtonAttributes & { kind: 'a' | 'b' };function $$render() {",
     );
 }
+
+/// The alias of an annotation that script recovery repaired holds the repaired
+/// text, `alias_line` ends a line of the code, and every byte the author wrote
+/// in `annotation` maps exactly to the same byte in the alias, both ways,
+/// except the bytes `repaired` marks with `^`, which recovery replaced.
+fn assert_repaired_alias_maps_the_authors_bytes(
+    source: &str,
+    annotation: &str,
+    repaired: &str,
+    alias_line: &str,
+) {
+    assert_eq!(annotation.len(), repaired.len());
+    let artifact = project(source);
+    let code = &artifact.code;
+    assert!(
+        code.lines().any(|line| line.ends_with(alias_line)),
+        "no line ending in {alias_line:?}:\n{code}"
+    );
+    let original = source
+        .find(&format!(": {annotation} = $props()"))
+        .expect("annotation")
+        + 2;
+    let map = artifact.exact_mappings.as_ref().expect("exact mappings");
+    let alias = code.find(";type $$ComponentProps =  ").expect("alias");
+    for (index, mark) in repaired.bytes().enumerate() {
+        let at = (original + index) as u32;
+        let generated = map.source_range_to_generated(ByteRange::new(at, at + 1).unwrap());
+        if mark == b'^' {
+            assert_eq!(
+                generated,
+                vec![],
+                "byte {index} of {annotation:?} was repaired"
+            );
+            continue;
+        }
+        assert_eq!(generated.len(), 1, "byte {index} of {annotation:?}");
+        let generated = generated[0];
+        assert!(
+            generated.start() as usize > alias,
+            "byte {index} maps into the alias"
+        );
+        assert_eq!(
+            code.as_bytes()[generated.start() as usize],
+            annotation.as_bytes()[index]
+        );
+        assert_eq!(
+            map.generated_to_source(generated.start()),
+            Some(at),
+            "byte {index} maps back"
+        );
+    }
+    // The alias's name maps to the annotation, not to the `<script` tag.
+    let source_map =
+        sourcemap::SourceMap::from_slice(artifact.source_map.as_deref().unwrap().as_bytes())
+            .expect("source map");
+    let (line, column) = line_column(code, alias + 1);
+    let token = source_map.lookup_token(line, column).expect("token");
+    assert_eq!(
+        (token.get_src_line(), token.get_src_col()),
+        line_column(source, original)
+    );
+}
+
+#[test]
+fn an_alias_of_a_repaired_annotation_maps_what_the_author_wrote() {
+    // Recovery writes a placeholder where a type is missing; the placeholder is
+    // generated code, so TypeScript's "Cannot find name '_'" is not reported.
+    assert_repaired_alias_maps_the_authors_bytes(
+        "<script lang=\"ts\">\n\tlet { a }: { a: string; b: } = $props();\n</script>\n<p>{a}</p>\n",
+        "{ a: string; b: }",
+        "               ^ ",
+        ";type $$ComponentProps =  { a: string; b:/*\u{3a9}ignore_start\u{3a9}*/_/*\u{3a9}ignore_end\u{3a9}*/};function $$render() {",
+    );
+    // It blanks what it cannot finish.
+    assert_repaired_alias_maps_the_authors_bytes(
+        "<script lang=\"ts\">\n\tlet { a }: { a: Array<string } = $props();\n</script>\n<p>{a}</p>\n",
+        "{ a: Array<string }",
+        "          ^^^^^^^  ",
+        ";type $$ComponentProps =  { a: Array        };function $$render() {",
+    );
+    assert_repaired_alias_maps_the_authors_bytes(
+        "<script lang=\"ts\">\n\tlet { a }: { a: [string, { b: number ] } = $props();\n</script>\n<p>{a}</p>\n",
+        "{ a: [string, { b: number ] }",
+        "              ^ ^^ ^^^^^^    ",
+        ";type $$ComponentProps =  { a: [string,             ] };function $$render() {",
+    );
+    // Kept inside `$$render` by a generic.
+    assert_repaired_alias_maps_the_authors_bytes(
+        "<script lang=\"ts\" generics=\"T\">\n\tlet { a, b }: { a: T; b: } = $props();\n</script>\n<p>{a}</p>\n",
+        "{ a: T; b: }",
+        "          ^ ",
+        ";type $$ComponentProps =  { a: T; b:/*\u{3a9}ignore_start\u{3a9}*/_/*\u{3a9}ignore_end\u{3a9}*/};",
+    );
+}
