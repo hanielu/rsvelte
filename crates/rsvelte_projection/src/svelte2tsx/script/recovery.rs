@@ -334,6 +334,9 @@ impl State {
             && opened < anchor
             && matches!(bytes.get(opened), Some(b'(' | b'[' | b'{'))
         {
+            if let Some(body) = type_body_declaration(bytes, &tokens, opened) {
+                return Some(self.end_type_body(original, bytes, &tokens, anchor, opened, &body));
+            }
             return Some(Repair::Rewrite(opened..opened + 1, Edit::Blank));
         }
 
@@ -360,6 +363,48 @@ impl State {
             });
         }
         Some(Repair::Rewrite(culprit.range.clone(), Edit::Blank))
+    }
+
+    /// The body of an interface or a type alias (`opened`) that swallowed the
+    /// declaration starting the line that holds `anchor`. TypeScript ends the
+    /// body before that line, where oxc read the line as members (`type T = {`
+    /// above a function made the function a type and broke what followed);
+    /// the body is closed there, in the line break before it, so the
+    /// declaration keeps the members typed so far and is hoisted like
+    /// official's. A type alias also needs a line break after the closer,
+    /// which the line's indentation provides; without one its body becomes a
+    /// placeholder. If the parser does not get further with the closer, or
+    /// there is no room for it, the bracket is blanked as any other, or for an
+    /// interface the whole declaration.
+    fn end_type_body(
+        &self,
+        original: &[u8],
+        bytes: &[u8],
+        tokens: &[Token],
+        anchor: usize,
+        opened: usize,
+        body: &TypeBody,
+    ) -> Repair {
+        let line = line_start(bytes, anchor);
+        let dropped = if body.interface { body.start } else { opened };
+        let at = line.saturating_sub(1);
+        let room = at > opened
+            && starts_declaration(bytes, tokens, line)
+            && bytes[at].is_ascii_whitespace()
+            && original.get(at).is_some_and(u8::is_ascii)
+            && !self.filled.contains(&at);
+        if room && (body.interface || matches!(bytes.get(line), Some(b' ' | b'\t'))) {
+            return Repair::Fill {
+                at,
+                byte: b'}',
+                otherwise: Some(dropped..opened + 1),
+            };
+        }
+        if body.interface {
+            Repair::Rewrite(dropped..opened + 1, Edit::Blank)
+        } else {
+            Repair::Rewrite(opened..opened + 1, Edit::Fill(PLACEHOLDER))
+        }
     }
 
     /// The whitespace byte right at `offset`, unless it was part of a
@@ -407,25 +452,10 @@ fn unfinished_import(bytes: &[u8], tokens: &[Token], offset: usize) -> Option<Ra
 /// block, so the declaration cannot belong inside it.
 fn swallowing_literal(bytes: &[u8], tokens: &[Token], anchor: usize) -> Option<usize> {
     let line = line_start(bytes, anchor);
-    let first = tokens.partition_point(|token| token.range.start < line);
-    let keyword = tokens.get(first)?;
-    if !matches!(
-        &bytes[keyword.range.clone()],
-        b"const"
-            | b"let"
-            | b"var"
-            | b"function"
-            | b"class"
-            | b"import"
-            | b"export"
-            | b"if"
-            | b"for"
-            | b"while"
-            | b"return"
-            | b"interface"
-    ) {
+    if !starts_declaration(bytes, tokens, line) {
         return None;
     }
+    let first = tokens.partition_point(|token| token.range.start < line);
     let mut open: Vec<usize> = Vec::new();
     for (index, token) in tokens[..first].iter().enumerate() {
         match &bytes[token.range.clone()] {
@@ -438,7 +468,9 @@ fn swallowing_literal(bytes: &[u8], tokens: &[Token], anchor: usize) -> Option<u
     }
     let innermost = *open.last()?;
     let bracket = &tokens[innermost];
-    if bytes[bracket.range.start] != b'{' {
+    if bytes[bracket.range.start] != b'{'
+        || type_body_declaration(bytes, tokens, bracket.range.start).is_some()
+    {
         return Some(bracket.range.start);
     }
     let before = innermost
@@ -449,6 +481,68 @@ fn swallowing_literal(bytes: &[u8], tokens: &[Token], anchor: usize) -> Option<u
         Some(b"=" | b":" | b"(" | b"," | b"[" | b"?" | b"|" | b"&" | b"!" | b"return")
     )
     .then_some(bracket.range.start)
+}
+
+/// Whether the line starting at `line` starts a declaration or a statement
+/// that no bracket left open before it can hold.
+fn starts_declaration(bytes: &[u8], tokens: &[Token], line: usize) -> bool {
+    let first = tokens.partition_point(|token| token.range.start < line);
+    tokens.get(first).is_some_and(|keyword| {
+        matches!(
+            &bytes[keyword.range.clone()],
+            b"const"
+                | b"let"
+                | b"var"
+                | b"function"
+                | b"class"
+                | b"import"
+                | b"export"
+                | b"if"
+                | b"for"
+                | b"while"
+                | b"return"
+                | b"interface"
+        )
+    })
+}
+
+/// The declaration of an interface or a type alias whose body a bracket opens.
+struct TypeBody {
+    /// Where the declaration starts (`export` included).
+    start: usize,
+    interface: bool,
+}
+
+/// The declaration whose body `bracket` opens, when `bracket` is the first
+/// bracket on a line that declares an interface or a type alias
+/// (`interface I<T> extends J {`, `export type T = {`).
+fn type_body_declaration(bytes: &[u8], tokens: &[Token], bracket: usize) -> Option<TypeBody> {
+    if bytes.get(bracket) != Some(&b'{') {
+        return None;
+    }
+    let line = line_start(bytes, bracket);
+    let first = tokens.partition_point(|token| token.range.start < line);
+    let end = tokens.partition_point(|token| token.range.start < bracket);
+    let header = tokens.get(first..end)?;
+    let text = |token: &Token| &bytes[token.range.clone()];
+    let keyword = header
+        .iter()
+        .position(|token| !matches!(text(token), b"export" | b"declare"))?;
+    let name = header.get(keyword + 1)?;
+    let interface = match text(&header[keyword]) {
+        b"interface" => true,
+        b"type" if header.iter().any(|token| text(token) == b"=") => false,
+        _ => return None,
+    };
+    (name.kind == Kind::Word
+        && header[keyword + 1..].iter().all(|token| {
+            matches!(token.kind, Kind::Word | Kind::Punct)
+                && !matches!(text(token), b"(" | b")" | b"[" | b"]" | b"{" | b"}")
+        }))
+    .then_some(TypeBody {
+        start: header[0].range.start,
+        interface,
+    })
 }
 
 /// Punctuation that leaves an expression or a member name unfinished.
@@ -915,6 +1009,40 @@ mod tests {
     fn multibyte_text_is_blanked_byte_for_byte() {
         assert_eq!(recovered("const é = ü."), "const é = ü ");
         assert_eq!(recovered("const s = 'ü\n"), "const s =_   \n");
+    }
+
+    #[test]
+    fn a_type_body_ends_before_the_declaration_it_swallowed() {
+        assert_eq!(
+            recovered("type T = {\n\tfunction go() {}\n"),
+            "type T = {}\nfunction go() {}\n"
+        );
+        assert_eq!(
+            recovered("type T = {\n\ta: string;\n\tconst x = 1;\n"),
+            "type T = {\n\ta: string;}\nconst x = 1;\n"
+        );
+        assert_eq!(
+            recovered("export type T<A> = A & {\n\tconst x = 1;\n"),
+            "export type T<A> = A & {}\nconst x = 1;\n"
+        );
+        assert_eq!(
+            recovered("interface I {\n\ta: string;\n\tfunction go() {}\n"),
+            "interface I {\n\ta: string;}\tfunction go() {}\n"
+        );
+        assert_eq!(
+            recovered("declare interface I extends J<K> {\n  let y = 2;\n"),
+            "declare interface I extends J<K> {}  let y = 2;\n"
+        );
+        // An interface needs no line break after its body; a type alias with
+        // no indentation to break gets a placeholder for its body.
+        assert_eq!(
+            recovered("interface I {\nfunction go() {}\n"),
+            "interface I {}function go() {}\n"
+        );
+        assert_eq!(
+            recovered("type T = {\nfunction go() {}\n"),
+            "type T = _\nfunction go() {}\n"
+        );
     }
 
     #[test]

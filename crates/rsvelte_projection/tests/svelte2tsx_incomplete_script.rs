@@ -213,3 +213,40 @@ fn a_hoisted_declaration_left_open_is_closed_after_the_authors_text() {
         "{code}"
     );
 }
+
+/// A type alias or an interface being typed above a function. oxc read the
+/// function's line as members of the open body (`type T = {` made `function` a
+/// type), so the function was lost from the program and hoisted, broken, with
+/// the type: TypeScript reported the function's text as errors and the
+/// template's calls to it as unknown names. TypeScript ends the body before
+/// the function; recovery now closes it there, so the type is hoisted with
+/// the members typed so far and the function stays in `$$render()`.
+#[test]
+fn a_type_body_left_open_above_a_function_ends_before_it() {
+    let head = "<script lang=\"ts\">\n\timport Child from \"./Child.svelte\";\n\tlet { title }: { title: T } = $props();\n";
+    let tail = "\n\tfunction go(x: number) { return x * 2; }\n</script>\n\n<Child label={title} />\n<p>{go(1)}</p>\n";
+    for (typed, hoisted) in [
+        ("\ttype T = {", ";\n\ttype T = {\n};\n"),
+        (
+            "\ttype T = {\n\t\ta: string;",
+            ";\n\ttype T = {\n\t\ta: string;\n};\n",
+        ),
+        ("\tinterface T {", ";\n\tinterface T {\n};\n"),
+        (
+            "\tinterface T {\n\t\ta: string;",
+            ";\n\tinterface T {\n\t\ta: string;\n};\n",
+        ),
+    ] {
+        let code = convert(&format!("{head}{typed}{tail}"));
+        let expected = format!(
+            "import Child from \"./Child.svelte\";\n{hoisted};type $$ComponentProps =  {{ title: T }};function $$render() {{"
+        );
+        assert!(code.contains(&expected), "{typed:?}\n{code}");
+        assert!(
+            code.contains(
+                "= $props();\n\tfunction go(x: number) { return x * 2; }\n;\nasync () => {"
+            ),
+            "{typed:?}\n{code}"
+        );
+    }
+}
