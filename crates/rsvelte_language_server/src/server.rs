@@ -4720,6 +4720,11 @@ impl Server {
                     if method == "textDocument/diagnostic" {
                         fill_diagnostic_tags(result);
                         adjust_diagnostic_messages(result);
+                        if let Some(document) =
+                            source_uri.as_ref().and_then(|uri| self.documents.get(uri))
+                        {
+                            drop_syntax_errors_in_script_tags(result, document.text());
+                        }
                         let javascript = source_path.as_deref().is_some_and(|source| {
                             self.tsgo
                                 .as_ref()
@@ -5964,6 +5969,49 @@ fn adjust_diagnostic_messages(result: &mut serde_json::Value) {
     }
 }
 
+/// Drop TypeScript's syntax errors that map into a `<script …>` opening tag.
+/// No script text is there: the shadow overwrites the tag with the render
+/// function's header (`;type $$ComponentProps = …;function $$render() {`),
+/// which maps to the tag as a whole, and TypeScript reports a syntax error in
+/// that generated header only when a half-typed statement hoisted above it
+/// (`import {`, `type T = {`) left a bracket open and swallowed it. The
+/// author's own error is reported where it was typed. Semantic errors there
+/// are kept: one in the props type the header copies is the author's.
+fn drop_syntax_errors_in_script_tags(result: &mut serde_json::Value, text: &str) {
+    let Some(items) = result
+        .get_mut("items")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    let opening_tags = crate::context::EmbeddedRegions::new(text)
+        .scripts()
+        .iter()
+        .filter_map(|body| {
+            let open = text.get(..body.start)?.rfind("<script")?;
+            Some(open..body.start)
+        })
+        .collect::<Vec<_>>();
+    if opening_tags.is_empty() {
+        return;
+    }
+    let index = LineIndex::new(text);
+    items.retain(|item| {
+        let syntax = item
+            .get("code")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|code| (1000..2000).contains(&code));
+        let Some(start) = item
+            .pointer("/range/start")
+            .and_then(|start| serde_json::from_value::<Position>(start.clone()).ok())
+        else {
+            return true;
+        };
+        let offset = index.offset(text, start);
+        !(syntax && opening_tags.iter().any(|tag| tag.contains(&offset)))
+    });
+}
+
 fn fill_diagnostic_tags(result: &mut serde_json::Value) {
     fn tag_items(value: &mut serde_json::Value) {
         let Some(items) = value
@@ -6284,7 +6332,50 @@ fn might_be_at_start_tag_whitespace(text: &str, offset: usize) -> bool {
 
 #[cfg(test)]
 mod diagnostic_message_tests {
-    use super::{COMPONENT_CONSTRUCTOR_HINT, DECLARE_STATEMENT_HINT, adjust_diagnostic_messages};
+    use super::{
+        COMPONENT_CONSTRUCTOR_HINT, DECLARE_STATEMENT_HINT, adjust_diagnostic_messages,
+        drop_syntax_errors_in_script_tags,
+    };
+
+    /// `import {` typed above the props leaves the hoisted import open, so
+    /// TypeScript reads the render header after it as an import clause and
+    /// reports syntax errors there, which map to the `<script>` tag (0:1,
+    /// on `script`). Those go; the error where the author typed, and a
+    /// semantic error that maps to the tag (an unknown type in the props type
+    /// the header copies), stay.
+    #[test]
+    fn syntax_errors_in_a_script_opening_tag_are_dropped() {
+        let text = "<script lang=\"ts\">\n\timport {\n\tlet { a }: { a: Foo } = $props();\n</script>\n<p>{a}</p>\n";
+        let item = |code: i64, line: u32, character: u32| {
+            serde_json::json!({
+                "code": code,
+                "message": format!("{code}"),
+                "range": {
+                    "start": { "line": line, "character": character },
+                    "end": { "line": line, "character": character },
+                },
+            })
+        };
+        let mut result = serde_json::json!({
+            "kind": "full",
+            "items": [item(1003, 1, 9), item(1003, 0, 1), item(1005, 0, 1), item(1141, 0, 17), item(2304, 0, 1), item(1005, 4, 3)],
+        });
+        drop_syntax_errors_in_script_tags(&mut result, text);
+        let kept = result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                format!(
+                    "{}@{}:{}",
+                    item["code"],
+                    item["range"]["start"]["line"],
+                    item["range"]["start"]["character"]
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kept, ["1003@1:9", "2304@0:1", "1005@4:3"]);
+    }
 
     fn messages(items: serde_json::Value) -> Vec<String> {
         let mut result = serde_json::json!({ "kind": "full", "items": items });
