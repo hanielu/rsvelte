@@ -9,6 +9,9 @@
 //! the same patterns again. Once the editor watches `<root>/**/*` for every
 //! kind of change, a watcher below it adds no event: it is answered here and
 //! kept, and registered with the editor only if the covering one goes away.
+//! A watcher into a `node_modules` or a dot directory always reaches the
+//! editor, though: that is what makes an editor scan an ignored directory
+//! and report its changes (a package install), as Zed does.
 
 use std::collections::BTreeMap;
 
@@ -150,6 +153,13 @@ impl TsgoWatchers {
     }
 
     /// Whether a watcher the editor has reports every event `watcher` would.
+    ///
+    /// A recursive watcher covers what lies beneath it, except inside a
+    /// `node_modules` or a dot directory (the cache's mirror links): an
+    /// editor need not scan an ignored directory until a watcher's literal
+    /// prefix points into it, and drops the events of one it has not
+    /// scanned. Zed does both (`add_path_prefix_to_scan`), so without
+    /// tsgo's own `node_modules` watchers it never reports an install.
     fn covers(&self, watcher: &Value) -> bool {
         let Some(base) = literal_base(watcher) else {
             return false;
@@ -160,8 +170,10 @@ impl TsgoWatchers {
             .flat_map(|registration| &registration.watchers)
             .any(|forwarded| {
                 forwarded == watcher
-                    || recursive_base(forwarded)
-                        .is_some_and(|recursive| same_case_prefix(&base, &recursive))
+                    || recursive_base(forwarded).is_some_and(|recursive| {
+                        relative_below(&base, &recursive)
+                            .is_some_and(|relative| !enters_an_ignored_directory(relative))
+                    })
             })
     }
 }
@@ -218,15 +230,25 @@ fn glob_parts(watcher: &Value) -> Option<(String, String)> {
     }
 }
 
-/// Whether `path` lies under `directory`, comparing as the file system does:
-/// tsgo spells some paths in lower case, which on a case-insensitive system
-/// name the same directory.
-fn same_case_prefix(path: &str, directory: &str) -> bool {
-    if cfg!(any(target_os = "macos", target_os = "windows")) {
-        path.to_lowercase().starts_with(&directory.to_lowercase())
+/// `path` relative to `directory` when it lies under it, comparing as the
+/// file system does: tsgo spells some paths in lower case, which on a
+/// case-insensitive system name the same directory.
+fn relative_below<'a>(path: &'a str, directory: &str) -> Option<&'a str> {
+    let head = path.get(..directory.len())?;
+    let same = if cfg!(any(target_os = "macos", target_os = "windows")) {
+        head == directory || head.to_lowercase() == directory.to_lowercase()
     } else {
-        path.starts_with(directory)
-    }
+        head == directory
+    };
+    same.then(|| &path[directory.len()..])
+}
+
+/// Whether a relative directory path enters a `node_modules` or a dot
+/// directory, which editors leave unscanned until asked (gitignored).
+fn enters_an_ignored_directory(relative: &str) -> bool {
+    relative
+        .split('/')
+        .any(|component| component == "node_modules" || component.starts_with('.'))
 }
 
 #[cfg(test)]
@@ -256,19 +278,16 @@ mod tests {
         );
         assert!(
             watchers
-                .register(&watch(
-                    "auto-import 11.0",
-                    &["/ws/.svelte-rs/projects/admin/node_modules/**/*"]
-                ))
+                .register(&watch("failed lookups 11.0", &["/ws/admin/src/**/*"]))
                 .is_none()
         );
         assert!(
             watchers
-                .register(&watch("auto-import 11.2", &["/ws/node_modules/**/*"]))
+                .register(&watch("failed lookups 11.2", &["/ws/packages/ui/*.json"]))
                 .is_none()
         );
         assert_eq!(
-            watchers.unregister(&unwatch("auto-import 11.0")),
+            watchers.unregister(&unwatch("failed lookups 11.0")),
             (None, None)
         );
         assert!(
@@ -303,7 +322,7 @@ mod tests {
             .map(|registration| registration["id"].as_str().unwrap())
             .collect::<Vec<_>>();
         assert!(ids.contains(&"program files 12.1"));
-        assert_eq!(ids.len(), 1, "it covers the auto-import one again: {ids:?}");
+        assert_eq!(ids.len(), 1, "it covers the other one again: {ids:?}");
 
         assert_eq!(
             watchers.reset(),
@@ -311,6 +330,48 @@ mod tests {
                 { "id": "program files 12.0", "method": WATCHED_FILES },
                 { "id": "program files 12.1", "method": WATCHED_FILES },
             ] }))
+        );
+    }
+
+    #[test]
+    fn a_watcher_into_node_modules_or_a_dot_directory_reaches_the_editor() {
+        // Zed scans a gitignored directory only when a watcher's literal
+        // prefix points into it, and drops events in one it has not scanned:
+        // without these, a `bun add` is never reported (round-2 review).
+        let mut watchers = TsgoWatchers::default();
+        assert!(watchers.register(&watch("root", &["/ws/**/*"])).is_some());
+        for (id, glob) in [
+            ("auto-import 10.0", "/ws/node_modules/**/*"),
+            ("nested package", "/ws/app/node_modules/**/*"),
+            ("a package elsewhere", "/ws/lib/node_modules/dep/*.json"),
+            (
+                "mirror link",
+                "/ws/.svelte-rs/projects/admin/node_modules/**/*",
+            ),
+            ("dot directory", "/ws/.config/**/*"),
+        ] {
+            assert!(watchers.register(&watch(id, &[glob])).is_some(), "{id}");
+        }
+        // An exact repeat of what the editor has still stays here.
+        assert!(
+            watchers
+                .register(&watch("auto-import 11.0", &["/ws/node_modules/**/*"]))
+                .is_none()
+        );
+        // And the editor's own `node_modules` watcher covers what is in it.
+        assert!(
+            watchers
+                .register(&watch("under it", &["/ws/node_modules/dep/**/*"]))
+                .is_none()
+        );
+        // Only a directory *named* `node_modules` or starting with a dot.
+        assert!(
+            watchers
+                .register(&watch(
+                    "lookalikes",
+                    &["/ws/my_node_modules.d/x/**/*", "/ws/a.b/**/*"]
+                ))
+                .is_none()
         );
     }
 
