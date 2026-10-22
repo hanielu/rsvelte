@@ -188,6 +188,15 @@ impl From<io::Error> for TsgoOverlayError {
     }
 }
 
+/// The text a panic was raised with, for the log.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("(no message)")
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MappingToken {
     generated_line: u32,
@@ -711,13 +720,27 @@ impl TsgoOverlay {
         preprocess_map: Option<&str>,
         version: i32,
     ) -> Result<ShadowDocument, TsgoOverlayError> {
-        let state = self.project_state(
-            source_path,
-            original_text,
-            preprocessed_text,
-            preprocess_map,
-            version,
-        )?;
+        // The projection itself falls back on a panic; this guards the source
+        // map composition around it, so a bug there is this document's error
+        // (its previous shadow stays: `project_state` changes nothing in the
+        // overlay) rather than the end of the server.
+        let state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.project_state(
+                source_path,
+                original_text,
+                preprocessed_text,
+                preprocess_map,
+                version,
+            )
+        }))
+        .unwrap_or_else(|payload| {
+            let message = format!("projection panicked: {}", panic_message(payload.as_ref()));
+            crate::log::warn(format_args!("{message} on {}", source_path.display()));
+            Err(TsgoOverlayError::Projection {
+                path: source_path.to_path_buf(),
+                message,
+            })
+        })?;
         // A component that joins outside discovery and file events — the
         // editor opened it before it reached disk, or saved it as a new name —
         // is still this project's own when it lives where the project owns
@@ -772,17 +795,37 @@ impl TsgoOverlay {
         };
 
         let options = self.projection_options(&source_path, &shadow_path, preprocessed_text);
-        let artifact = match self.engine.project(preprocessed_text, options) {
-            Ok(artifact) => artifact,
+        let projected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            tests::panic_on_marker(preprocessed_text);
+            self.engine.project(preprocessed_text, options)
+        }));
+        let artifact = match projected {
+            Ok(Ok(artifact)) => artifact,
             // `DocumentSnapshot.ts:275-291`: a rejected document still gets a
             // snapshot, over its extracted script, so TypeScript keeps answering.
-            Err(error) => {
+            Ok(Err(error)) => {
                 return self.parser_error_state(
                     &source_path,
                     &shadow_path,
                     original_text,
                     version,
                     error.to_string(),
+                );
+            }
+            // A projection panic is a bug, but a document projects on every
+            // keystroke, on the main loop: the state that triggers it must cost
+            // the template's types, not the server. It gets a rejected
+            // document's snapshot, over this version's text.
+            Err(payload) => {
+                let message = format!("svelte2tsx panicked: {}", panic_message(payload.as_ref()));
+                crate::log::warn(format_args!("{message} on {}", source_path.display()));
+                return self.parser_error_state(
+                    &source_path,
+                    &shadow_path,
+                    original_text,
+                    version,
+                    message,
                 );
             }
         };
@@ -4395,6 +4438,57 @@ mod tests {
                     path_for_tsconfig(overlay.workspace())
                 )))
         );
+    }
+
+    /// Text that makes the projection panic in tests, standing in for the
+    /// keystroke states that used to (`{#each items as }`, `{:then }`).
+    const PROJECTION_PANIC: &str = "<!-- svelte-rs test: panic in svelte2tsx -->";
+
+    pub(super) fn panic_on_marker(text: &str) {
+        assert!(
+            !text.contains(PROJECTION_PANIC),
+            "injected projection panic"
+        );
+    }
+
+    #[test]
+    fn a_projection_panic_falls_back_to_the_script_of_the_same_version() {
+        let workspace = TestWorkspace::new("projection-panic");
+        let app = workspace.0.join("src/App.svelte");
+        write(&app, "<p>disk</p>");
+        let mut overlay = build_overlay(&workspace.0).unwrap();
+
+        let script = "\nimport Child from './Child.svelte';\nlet answer = 42;\n";
+        let source = format!(
+            "<script lang=\"ts\">{script}</script>\n{PROJECTION_PANIC}\n<Child value={{answer}} />\n"
+        );
+        let shadow = overlay.open_or_update(&app, &source, 2).unwrap();
+        assert_eq!(shadow.version, 2);
+        assert_eq!(shadow.text, script, "the imports stay visible to tsgo");
+        assert!(
+            overlay
+                .parser_error(&app)
+                .is_some_and(|message| message.contains("injected projection panic")),
+            "{:?}",
+            overlay.parser_error(&app)
+        );
+        // `answer` is on the script's third line in both texts.
+        assert_eq!(
+            overlay.map_source_position(&app, Position::new(2, 4)),
+            Some(Position::new(2, 4)),
+            "the fallback maps to the source"
+        );
+
+        let shadow = overlay
+            .open_or_update(
+                &app,
+                "<script lang=\"ts\">let answer = 42;</script>\n<p>{answer}</p>\n",
+                3,
+            )
+            .unwrap();
+        assert_eq!(shadow.version, 3);
+        assert!(shadow.text.contains("$$render"), "{}", shadow.text);
+        assert!(overlay.parser_error(&app).is_none());
     }
 
     #[test]
