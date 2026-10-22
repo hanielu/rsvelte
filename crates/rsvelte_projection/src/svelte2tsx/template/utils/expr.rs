@@ -163,7 +163,8 @@ pub fn get_expression_end_stripping_ts(
     }
     // `x as T` / `x satisfies T`: find the outermost (last top-level) ` as ` /
     // ` satisfies ` keyword; the inner expression ends just before it.
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    // A non-ASCII byte belongs to an identifier (`as Café`), as in JavaScript.
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
     let mut depth: i32 = 0;
     let mut string: Option<u8> = None;
     let mut op_ws: Option<usize> = None; // index of the whitespace preceding the keyword
@@ -192,7 +193,7 @@ pub fn get_expression_end_stripping_ts(
                 }
                 for (kw, kwlen) in [("as", 2usize), ("satisfies", 9usize)] {
                     if j + kwlen <= e
-                        && &source[j..j + kwlen] == kw
+                        && &bytes[j..j + kwlen] == kw.as_bytes()
                         && (j + kwlen == e || !is_ident(bytes[j + kwlen]))
                     {
                         op_ws = Some(i);
