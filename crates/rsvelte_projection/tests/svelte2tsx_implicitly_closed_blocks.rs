@@ -147,3 +147,22 @@ fn a_snippet_left_open() {
     ));
     assert_balanced(&code);
 }
+
+#[test]
+fn a_block_closed_by_its_element_before_an_outer_else() {
+    // Deleting the inner `{/if}` used to fail the loose parse at `{:else}`.
+    let code = convert(
+        &[
+            HEAD,
+            "{#if a}\n<div>\n{#if items}\n<p>x</p>\n</div>\n{:else}\n<p>{a}</p>\n{/if}\n",
+        ]
+        .concat(),
+    );
+    assert_balanced(&code);
+    assert!(
+        code.contains(
+        "if(items){\n { svelteHTML.createElement(\"p\", {});  }\n} }\n}else{\n { svelteHTML.createElement(\"p\", {});a; }\n}\n};"
+    ),
+        "{code}"
+    );
+}

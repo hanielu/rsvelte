@@ -831,11 +831,7 @@ impl<'a> Parser<'a> {
         // Handle closing {/if} if not already consumed
         let found_closing = self.expect_block_close("if")?;
 
-        // Pop from stack only if we found the closing tag
-        // If we reached EOF without closing, leave on stack for error reporting
-        if found_closing && !self.stack.is_empty() {
-            self.stack.pop();
-        }
+        self.pop_block_entry(found_closing);
         self.note_left_open(found_closing, start as u32);
 
         // Update end positions of all elseif blocks recursively
@@ -1312,10 +1308,7 @@ impl<'a> Parser<'a> {
             // mode; in loose mode it is left for an outer block.
             let found_closing = self.expect_block_close("each")?;
 
-            // At EOF the entry stays on the stack for `block_unclosed`.
-            if found_closing && !self.stack.is_empty() {
-                self.stack.pop();
-            }
+            self.pop_block_entry(found_closing);
             self.note_left_open(found_closing, start as u32);
 
             return Ok(Some(TemplateNode::EachBlock(Box::new(EachBlock {
@@ -1553,10 +1546,7 @@ impl<'a> Parser<'a> {
         // strict mode; in loose mode it is left for an outer block.
         let found_closing = self.expect_block_close("each")?;
 
-        // At EOF the entry stays on the stack for `block_unclosed`.
-        if found_closing && !self.stack.is_empty() {
-            self.stack.pop();
-        }
+        self.pop_block_entry(found_closing);
         self.note_left_open(found_closing, start as u32);
 
         Ok(Some(TemplateNode::EachBlock(Box::new(EachBlock {
@@ -1963,10 +1953,7 @@ impl<'a> Parser<'a> {
         // block.
         let found_closing = self.expect_block_close("await")?;
 
-        // At EOF the entry stays on the stack for `block_unclosed`.
-        if found_closing && !self.stack.is_empty() {
-            self.stack.pop();
-        }
+        self.pop_block_entry(found_closing);
         self.note_left_open(found_closing, start as u32);
 
         Ok(Some(TemplateNode::AwaitBlock(Box::new(AwaitBlock {
@@ -2009,10 +1996,7 @@ impl<'a> Parser<'a> {
         // strict mode; in loose mode it is left for an outer block.
         let found_closing = self.expect_block_close("key")?;
 
-        // At EOF the entry stays on the stack for `block_unclosed`.
-        if found_closing && !self.stack.is_empty() {
-            self.stack.pop();
-        }
+        self.pop_block_entry(found_closing);
         self.note_left_open(found_closing, start as u32);
 
         Ok(Some(TemplateNode::KeyBlock(Box::new(KeyBlock {
@@ -2223,10 +2207,7 @@ impl<'a> Parser<'a> {
         // strict mode; in loose mode it is left for an outer block.
         let found_closing = self.expect_block_close("snippet")?;
 
-        // At EOF the entry stays on the stack for `block_unclosed`.
-        if found_closing && !self.stack.is_empty() {
-            self.stack.pop();
-        }
+        self.pop_block_entry(found_closing);
         self.note_left_open(found_closing, start as u32);
 
         Ok(Some(TemplateNode::SnippetBlock(Box::new(SnippetBlock {
