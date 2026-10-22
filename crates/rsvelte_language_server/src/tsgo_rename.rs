@@ -282,7 +282,21 @@ pub fn rewrite_workspace_edit(
                     LineIndex::new(document.source_text),
                 )
             });
-        if tags.covers(index.offset(document.source_text, source_range.start)) {
+        let source_start = index.offset(document.source_text, source_range.start);
+        if tags.covers(source_start) {
+            return;
+        }
+        // A rename edit replaces the name being renamed, and an exact mapping
+        // copies it. One whose source text is not the text tsgo replaced in
+        // the shadow comes from a mapping that only approximates the source
+        // (a copy svelte2tsx makes, sent to the nearest source-map token: the
+        // end of the statement above a generic component's props
+        // annotation, review 5 genericsrename.mjs), and would overwrite
+        // other text.
+        let source_end = index.offset(document.source_text, source_range.end);
+        if document.source_text.get(source_start..source_end)
+            != document.generated_text.get(start..end)
+        {
             return;
         }
         let (source_range, replacement) =
@@ -1148,6 +1162,51 @@ mod tests {
             [Position::new(0, generics), Position::new(1, 8)],
             "{rewritten:?}"
         );
+    }
+
+    /// A copy svelte2tsx makes of a generic component's props annotation can
+    /// map, through the nearest source-map token, to the end of the statement
+    /// above it (review 5, genericsrename.mjs: renaming `T` replaced the `;`
+    /// of `type Size = 'sm' | 'lg';`). An edit whose source text is not the
+    /// name tsgo replaced is dropped; one that maps onto that name is kept.
+    #[test]
+    fn an_edit_whose_source_text_is_not_the_renamed_name_is_dropped() {
+        let source_uri = uri("file:///Input.svelte");
+        let shadow_uri = uri("file:///cache/Input.svelte.tsx");
+        let source = "<script lang=\"ts\">\n\ttype Size = 'sm';\n\tlet x: T;\n</script>\n";
+        let generated =
+            "function $$render() {\n\tlet { a }: { a: T } = $props();\n\tlet x: T;\n}\n";
+        let copy = generated.find("a: T").unwrap() + 3;
+        let semicolon = u32::try_from(source.lines().nth(1).unwrap().find(';').unwrap()).unwrap();
+        let map = source_map(&[(1, 0, 1, semicolon), (2, 0, 2, 0), (2, 8, 2, 8)]);
+        let projection_map = ProjectionMap::default();
+        let document = RenameDocument {
+            source_uri: &source_uri,
+            shadow_uri: &shadow_uri,
+            source_text: source,
+            generated_text: generated,
+            projection_map: &projection_map,
+            source_map: Some(&map),
+            parser_error: false,
+        };
+        let edits = merge_workspace_edits([
+            edit(
+                &shadow_uri,
+                "U",
+                utf8_position(generated, copy),
+                utf8_position(generated, copy + 1),
+            ),
+            edit(&shadow_uri, "U", Position::new(2, 8), Position::new(2, 9)),
+        ]);
+        let plan = PrepareRenamePlan::Reject(RenameRejection::UnmappedPosition);
+        let rewritten = rewrite_workspace_edit(&plan, &edits, &[document], "U", false);
+        let kept = rewritten.edit["changes"][source_uri.as_str()]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|edit| parse_range(&edit["range"]).unwrap().start)
+            .collect::<Vec<_>>();
+        assert_eq!(kept, [Position::new(2, 8)], "{rewritten:?}");
     }
 
     /// Two edits of the same text can come from the owner and a copy of a
