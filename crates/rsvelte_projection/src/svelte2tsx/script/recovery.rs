@@ -516,6 +516,28 @@ fn open_brackets(bytes: &[u8], tokens: &[Token]) -> Vec<(usize, &'static str)> {
     open
 }
 
+/// What closes the brackets the author's `text` of a declaration leaves open,
+/// innermost first, if recovery repaired it: `None` when `repaired` (the same
+/// span of the recovered script) equals `text`. A declaration that svelte2tsx
+/// hoists above `$$render()` (an import, a type alias, an interface) is
+/// emitted with the author's bytes, so `import {` or `type T = {` would
+/// otherwise reach TypeScript still open and run into the generated code after
+/// it: `import {` took the `$$ComponentProps` alias for import specifiers,
+/// which left the props untyped.
+pub(crate) fn closers_for_hoisted(text: &str, repaired: Option<&str>) -> Option<String> {
+    if repaired == Some(text) {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    Some(
+        open_brackets(bytes, &tokens(bytes))
+            .iter()
+            .rev()
+            .map(|(_, closer)| *closer)
+            .collect(),
+    )
+}
+
 /// `source` with everything from `cut` on blanked, and the brackets the code
 /// before `cut` leaves open closed in the blanked space (never in a blanked
 /// multibyte character).
@@ -893,6 +915,29 @@ mod tests {
     fn multibyte_text_is_blanked_byte_for_byte() {
         assert_eq!(recovered("const é = ü."), "const é = ü ");
         assert_eq!(recovered("const s = 'ü\n"), "const s =_   \n");
+    }
+
+    #[test]
+    fn a_repaired_declaration_gets_the_closers_of_its_open_brackets() {
+        assert_eq!(
+            closers_for_hoisted("import {", Some("import\"\"")).as_deref(),
+            Some("}")
+        );
+        assert_eq!(
+            closers_for_hoisted("type T = { a: { b: `${", Some("type T =_")).as_deref(),
+            Some("}`}}")
+        );
+        assert_eq!(
+            closers_for_hoisted("import { x }", Some("import\"    \"")).as_deref(),
+            Some("")
+        );
+        // Brackets in strings and comments do not count.
+        assert_eq!(
+            closers_for_hoisted("import { '{' /* ( */", Some("import\"\"")).as_deref(),
+            Some("}")
+        );
+        let complete = "import { x } from 'x'";
+        assert_eq!(closers_for_hoisted(complete, Some(complete)), None);
     }
 
     #[test]

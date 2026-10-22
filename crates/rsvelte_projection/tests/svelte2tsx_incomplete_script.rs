@@ -171,3 +171,45 @@ fn multibyte_whitespace_in_an_unfinished_construct() {
         assert!(code.contains("export default"), "{source:?}\n{code}");
     }
 }
+
+/// An import or a type alias being typed above other code. svelte2tsx hoists
+/// it above `$$render()` with the author's bytes, so its open `{` ran into the
+/// generated code after it: TypeScript read `import {` on into the
+/// `$$ComponentProps` alias (`type` is a valid import specifier) and left the
+/// props untyped, and an open type literal reported errors on generated `;`s,
+/// which the language server could only place at the start of the file. The
+/// hoisted copy now closes what the author's text leaves open, and a repaired
+/// import is terminated, so TypeScript reports what is missing at its end.
+#[test]
+fn a_hoisted_declaration_left_open_is_closed_after_the_authors_text() {
+    let head = "<script lang=\"ts\">\n\timport Child from \"./Child.svelte\";\n\tlet { title }: { title: number } = $props();\n";
+    let props = ";type $$ComponentProps =  { title: number };function $$render() {";
+    for (typed, hoisted) in [
+        ("\timport {", "import {};\n"),
+        ("\timport { ", "import {};\n"),
+        ("\timport { x", "import { x};\n"),
+        ("\timport type {", "import type {};\n"),
+        ("\timport { a,\n\t\tb\n\tconst x = 1;", "import { a,};\n"),
+        (
+            "\timport {\n\timport B from \"b\";",
+            "import {};\nimport B from \"b\";\n",
+        ),
+        (
+            "\ttype T = { a: string;",
+            ";\n\ttype T = { a: string;\n};\n",
+        ),
+    ] {
+        let source = format!("{head}{typed}\n</script>\n\n<Child label={{title}} />\n");
+        let code = convert(&source);
+        let expected = format!("import Child from \"./Child.svelte\";\n{hoisted}{props}");
+        assert!(code.contains(&expected), "{typed:?}\n{code}");
+    }
+    // A declaration recovery did not touch keeps its text.
+    let code = convert(&format!(
+        "{head}\timport {{ x }} from './x';\n\tconst o = \n</script>\n"
+    ));
+    assert!(
+        code.contains("import { x } from './x';\n;type $$ComponentProps"),
+        "{code}"
+    );
+}
