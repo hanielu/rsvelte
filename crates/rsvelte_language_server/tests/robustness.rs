@@ -1339,11 +1339,12 @@ fn an_edit_after_a_diagnostic_pull_waits_for_neither_of_its_halves() {
     server.shutdown();
 }
 
-/// tsrs occasionally never answers a request. The server answers it without
-/// tsgo once it is overdue (the empty answer here: the request has no native
-/// half), and the background, which waits for tsgo to answer the editor's
-/// requests, stops waiting for one after a couple of seconds, so it still
-/// loads the other projects.
+/// tsrs occasionally never answers a request: it loops on it for good. The
+/// server answers it without tsgo once it is overdue (the empty answer here:
+/// the request has no native half) and restarts tsgo, which replays the
+/// buffers it holds; and the background, which waits for tsgo to answer the
+/// editor's requests, stops waiting for one after a couple of seconds, so it
+/// still loads the other projects.
 #[cfg(unix)]
 #[test]
 fn a_request_tsgo_never_answers_is_answered_without_it_and_holds_nothing_back() {
@@ -1356,7 +1357,10 @@ fn a_request_tsgo_never_answers_is_answered_without_it_and_holds_nothing_back() 
         &[
             ("TSGO_BIN", helper.as_path()),
             ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
-            ("RSVELTE_TEST_TSGO_IGNORE", Path::new("textDocument/signatureHelp")),
+            (
+                "RSVELTE_TEST_TSGO_IGNORE",
+                Path::new("textDocument/signatureHelp"),
+            ),
             ("RSVELTE_TSGO_REQUEST_TIMEOUT_MS", Path::new("6000")),
         ],
     );
@@ -1398,10 +1402,16 @@ fn a_request_tsgo_never_answers_is_answered_without_it_and_holds_nothing_back() 
         "answered before it was overdue"
     );
     assert_eq!(answer["result"], Value::Null, "{answer}");
-    assert!(
-        traffic(&log).contains(&"$/cancelRequest ".to_string()),
-        "tsgo is asked to drop it"
-    );
+    let opened = format!("textDocument/didOpen {}", kept("a", "X"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while traffic(&log).iter().filter(|line| **line == opened).count() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "tsgo was not restarted: {:?}",
+            traffic(&log)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
     assert!(hover(&mut server, &x).to_string().contains("recorded"));
     server.shutdown();
 }
