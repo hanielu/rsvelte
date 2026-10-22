@@ -118,7 +118,11 @@ pub fn handle_await_block(
             // $$_value = await (…); { const VALUE = $$_value; ` wrapper
             // is attached as the relocated chunk's intro / outro so it
             // travels with the expression.
-            if let Some((expr_start, expr_end)) = get_expression_range(&block.expression) {
+            // `{#await }` (typed with an auto-closed `}`) has an empty promise,
+            // which `move_range` cannot relocate: it takes the baked fallback.
+            if let Some((expr_start, expr_end)) =
+                get_expression_range(&block.expression).filter(|(start, end)| start < end)
+            {
                 str.move_range(expr_start, expr_end, prev_end);
                 str.overwrite_fmt(block.start, expr_start, format_args!("{open_pad}{{ "));
                 if expr_end < pending_start {

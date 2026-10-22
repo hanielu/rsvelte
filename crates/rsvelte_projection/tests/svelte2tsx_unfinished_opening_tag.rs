@@ -51,3 +51,36 @@ fn an_element_being_typed_inside_an_element() {
         " { svelteHTML.createElement(\"section\", {});\n\t  { svelteHTML.createElement(\"div\", { \"class\":`x`,});} { svelteHTML.createElement(\"p\", {});a; }\n }\n};"
     ));
 }
+
+/// A script tag that is never closed, with `</script>` inside an attribute
+/// value: the content's end was searched from the tag's start and found in
+/// the attribute, before the content, and slicing the content panicked
+/// ("byte range starts at … but ends at …"; found by fuzzing). Official
+/// svelte2tsx rejects the document; nothing may panic.
+#[test]
+fn a_script_tag_with_its_closing_tag_in_an_attribute() {
+    for source in [
+        "<script l=\"</script>\"/",
+        "<script lang=\"ts\" l=\"</script>\"/>",
+        "<script lang=\"ts\" l=\"</script>\"/>\n$: a = 1;\nimport A from './A.svelte';\n",
+    ] {
+        let _ = svelte2tsx(
+            source,
+            Svelte2TsxOptions {
+                filename: "Test.svelte".to_string(),
+                is_ts_file: true,
+                emit_on_template_error: true,
+                ..Svelte2TsxOptions::default()
+            },
+        );
+    }
+    // A closed script with the same attribute is unaffected.
+    let code = convert(
+        "<script lang=\"ts\" l=\"</script>\">\n\timport A from './A.svelte';\n\t$: b = 1;\n</script>\n<A />\n",
+    );
+    assert!(code.contains("import A from './A.svelte';"), "{code}");
+    assert!(
+        code.contains("let  b = __sveltets_2_invalidate(() => 1);"),
+        "{code}"
+    );
+}

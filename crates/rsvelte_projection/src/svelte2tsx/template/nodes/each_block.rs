@@ -124,11 +124,17 @@ pub fn handle_each_block(
         Some((s, e)) => source.get(s as usize..e as usize).unwrap_or(""),
         None => "",
     };
-    let has_context = block.context.is_some();
-    let context_text = block.context.as_ref().map_or_else(
-        || "$$each_item".to_string(),
-        |c| get_expression_text(c, source).to_string(),
-    );
+    // Loose parsing gives `{#each items as }` — a state every `{#each … as
+    // item}` typed with an auto-closed `}` passes through — an empty context,
+    // which is projected as if there were none: `for(let  of …)` would not be
+    // a loop TypeScript can read.
+    let context_text = block
+        .context
+        .as_ref()
+        .map(|c| get_expression_text(c, source))
+        .filter(|text| !text.trim().is_empty());
+    let has_context = context_text.is_some();
+    let context_text = context_text.map_or_else(|| "$$each_item".to_string(), str::to_string);
 
     let body_start = if block.body.nodes.is_empty() {
         block.end
@@ -191,13 +197,17 @@ pub fn handle_each_block(
         //     source range,
         //   - the expression and context source ranges overlap (parser
         //     edge case),
+        //   - the context is empty (`{#each items as }`, see above), a
+        //     zero-width range that `move_range` cannot relocate,
         //   - the variable name collides with the expression text
         //     (`{#each items as items}`) — the `needs_temp_var` branch
         //     above rebakes the wrapper around the expression and would
         //     repeat the context text twice.
         let context_range = block.context.as_ref().and_then(get_expression_range);
         if let (Some((ctx_s, ctx_e)), false) = (context_range, needs_temp_var)
+            && has_context
             && ctx_s > expr_end
+            && ctx_s < ctx_e
             && ctx_e <= body_start
         {
             // Generated header rewritten to flow as:

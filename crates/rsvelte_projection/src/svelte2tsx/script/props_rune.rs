@@ -614,10 +614,11 @@ fn is_bindable_call(expr: &oxc::Expression, raw_content: &str) -> (bool, Option<
         && callee.name == "$bindable"
     {
         // Get the first argument if any (for type inference)
-        let arg_text = call.arguments.first().map(|arg| {
-            let start = arg.span().start as usize;
-            let end = arg.span().end as usize;
-            raw_content[start..end].to_string()
+        let arg_text = call.arguments.first().and_then(|arg| {
+            let span = arg.span();
+            raw_content
+                .get(span.start as usize..span.end as usize)
+                .map(str::to_string)
         });
         return (true, arg_text);
     }

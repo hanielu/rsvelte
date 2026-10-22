@@ -1435,6 +1435,63 @@ fn a_workspace_wide_request_loads_every_project_first() {
     server.shutdown();
 }
 
+/// States a component passes through while it is typed (Zed auto-closes `{`),
+/// whose projection used to panic on the server's main loop and end the whole
+/// server (review round 2). Each must reach tsgo as a shadow of that version,
+/// and the server must keep answering.
+#[cfg(unix)]
+#[test]
+fn keystroke_states_that_panicked_the_projection_keep_the_server_answering() {
+    let dir = TestDir::new("keystroke-panics");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = fs::canonicalize(&dir.0).unwrap().join("ws");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    fs::write(root.join("tsconfig.json"), "{}").unwrap();
+    let head = "<script lang=\"ts\">\n\tlet items = [1, 2];\n\tlet p = Promise.resolve(KeystrokeMarker);\n</script>\n\n";
+    let clean = "<script lang=\"ts\">\n\tlet items = [1, 2];\n</script>\n\n<p>{items}</p>\n";
+    fs::write(root.join("App.svelte"), clean).unwrap();
+    let mut server = Server::start(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            ("RSVELTE_TEST_MARKER", Path::new("KeystrokeMarker")),
+        ],
+    );
+    let uri = file_uri(&root.join("App.svelte"));
+    server.open(&uri, clean);
+    assert!(hover(&mut server, &uri).to_string().contains("recorded"));
+
+    let states = [
+        [head, "{#each items as }\n<p>after</p>\n"].concat(),
+        [head, "{#await p}\n\t<p>loading</p>\n{:then }\n\t<p>done</p>\n{/await}\n"].concat(),
+        [head, "{#await p}\n\t<p>loading</p>\n{:catch }\n\t<p>done</p>\n{/await}\n"].concat(),
+        "<script lang=\"ts\">\n\texport let { a = $bindable(KeystrokeMarker) } = $props();\n</script>\n"
+            .to_string(),
+    ];
+    for (index, state) in states.iter().enumerate() {
+        server.change(&uri, 2 + index as i64, state);
+        let response = hover(&mut server, &uri);
+        assert!(
+            response.get("result").is_some(),
+            "no hover after state {index}: {response}"
+        );
+        server.probe();
+    }
+    let changed = traffic(&log)
+        .into_iter()
+        .filter(|line| {
+            line.starts_with("textDocument/didChange ")
+                && line.contains("App.svelte.tsx")
+                && line.ends_with(" marked")
+        })
+        .count();
+    assert_eq!(changed, states.len(), "every state reaches tsgo");
+    server.shutdown();
+}
+
 #[cfg(unix)]
 const FAKE_TSGO_TRAFFIC: &str = r###"
 use std::fs::OpenOptions;

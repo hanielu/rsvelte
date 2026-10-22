@@ -87,7 +87,7 @@ pub(super) fn handle_export_named_decl(
                         extract_props_from_binding_pattern_runes(
                             &declarator.id,
                             exported_names,
-                            "",
+                            raw_content,
                         );
                     } else {
                         let has_default = declarator.init.is_some();

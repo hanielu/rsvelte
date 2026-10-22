@@ -125,7 +125,7 @@ pub fn opener_spacing(
         push_attribute_ranges(&mut ranges, attr, source, comments, index == last, &ctx);
     }
 
-    count_gaps(node_start, transform_end, delete_dest, &ranges)
+    count_gaps(source, node_start, transform_end, delete_dest, &ranges)
 }
 
 /// Spaces upstream leaves ahead of a closing tag's lowering.
@@ -136,19 +136,36 @@ pub fn opener_spacing(
 /// `</Component>` → `Component}` mapping an `InlineComponent` keeps; elements and
 /// the `svelte:` tags keep nothing and always collapse to a single space.
 pub fn closing_tag_spacing(
+    source: &str,
     closing_tag_start: u32,
     node_end: u32,
     name_range: Option<Range>,
 ) -> usize {
     let ranges: Vec<Range> = name_range.into_iter().collect();
-    count_gaps(closing_tag_start, node_end, None, &ranges).before_block
+    count_gaps(source, closing_tag_start, node_end, None, &ranges).before_block
+}
+
+/// The end of the character at `at`: upstream's "one character" is one UTF-16
+/// unit, and a multibyte character (a no-break space between attributes, say)
+/// is still one character there.
+fn char_end(source: &str, at: u32) -> u32 {
+    source
+        .get(at as usize..)
+        .and_then(|rest| rest.chars().next())
+        .map_or(at + 1, |next| at + source_offset(next.len_utf8()))
 }
 
 /// Replay of `transform`'s move/removal bookkeeping. Each run of source
 /// characters between two kept ranges collapses to one space; whether that
 /// space is moved to the end of the opener or stays in place decides which side
 /// of the generated `{ …createElement(` it ends up on.
-fn count_gaps(start: u32, end: u32, delete_dest: Option<u32>, ranges: &[Range]) -> OpenerSpacing {
+fn count_gaps(
+    source: &str,
+    start: u32,
+    end: u32,
+    delete_dest: Option<u32>,
+    ranges: &[Range],
+) -> OpenerSpacing {
     // A transformation is skipped as a move when it is zero-length, but it still
     // counts for the "does another transformation start here?" lookup that
     // decides whether a range swallows the character after it.
@@ -158,8 +175,8 @@ fn count_gaps(start: u32, end: u32, delete_dest: Option<u32>, ranges: &[Range]) 
         if t_start == t_end {
             continue;
         }
-        let t_end = if t_end + 1 < end && !starts.contains(&t_end) {
-            t_end + 1
+        let t_end = if char_end(source, t_end) < end && !starts.contains(&t_end) {
+            char_end(source, t_end)
         } else {
             t_end
         };
@@ -192,10 +209,10 @@ fn count_gaps(start: u32, end: u32, delete_dest: Option<u32>, ranges: &[Range]) 
     }
     if remove_start < end {
         // The first character after the last kept range is deleted outright.
-        remove_start += 1;
+        remove_start = char_end(source, remove_start);
     }
     if remove_start < end {
-        if moved(remove_start) && remove_start + 1 < end {
+        if moved(remove_start) && char_end(source, remove_start) < end {
             spacing.in_attr_object += 1;
         } else {
             spacing.before_block += 1;

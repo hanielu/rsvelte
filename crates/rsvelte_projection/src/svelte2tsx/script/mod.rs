@@ -31,7 +31,7 @@ use oxc_span::GetSpan;
 use crate::ast::template::Script;
 
 use super::magic_string::MagicString;
-use super::nodes::scripts::{InstanceImportCollector, LiftedImport};
+use super::nodes::scripts::{InstanceImportCollector, LiftedImport, script_content_end};
 use super::svelte2tsx::slice_src;
 use super::utils::lexical::contains_word;
 
@@ -514,13 +514,8 @@ pub fn process_instance_script(
 
         // Pass 3: handle reactive statements ($: ...)
         let content_start = script.content_offset as usize;
-        let script_source = slice_src(source, script.start as usize, script.end as usize);
-        let close_tag_offset = script_source
-            .rfind("</script>")
-            .or_else(|| script_source.rfind("</Script>"))
-            .unwrap_or(script_source.len());
-        let content_end = script.start as usize + close_tag_offset;
-        let raw_content = &source[content_start..content_end];
+        let content_end = script_content_end(script, source);
+        let raw_content = slice_src(source, content_start, content_end);
 
         for stmt in &program.body {
             if let oxc::Statement::LabeledStatement(labeled) = stmt

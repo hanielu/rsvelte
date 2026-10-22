@@ -146,3 +146,27 @@ fn element_binding_instantiation_strips_from_setter() {
         "instantiation type args leaked into the setter LHS:\n{out}"
     );
 }
+
+/// A type name with a non-ASCII character: the scan for the assertion keyword
+/// sliced the source inside it and panicked ("not a char boundary"; found by
+/// fuzzing, and a panic on the language server's main loop ended the whole
+/// server), and a type named `asé` read as the `as` keyword. Expected strings
+/// are official svelte2tsx 0.7.61's.
+#[test]
+fn an_assertion_to_a_type_with_a_non_ascii_name() {
+    for (expression, value) in [
+        ("e as Café", "\"bind:value\":e as Café,"),
+        ("e satisfies Typé", "\"bind:value\":e satisfies Typé,"),
+        ("e as asé", "\"bind:value\":e as asé,"),
+        ("e as né", "\"bind:value\":e as né,"),
+    ] {
+        let out = to_tsx(&format!(
+            "<script lang=\"ts\">let e;</script>\n<input bind:value={{{expression}}} />\n"
+        ));
+        assert!(out.contains(value), "{expression}:\n{out}");
+        assert!(
+            out.contains("() => e = __sveltets_2_any(null);"),
+            "{expression}:\n{out}"
+        );
+    }
+}
