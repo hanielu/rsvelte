@@ -395,8 +395,58 @@ const NATIVE_HALF_WAIT: Duration = Duration::from_millis(250);
 const TSGO_ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many times a restart for the same method and document doubles the
-/// time its next one waits for ([`Server::restart_due`]).
+/// time its next one waits for ([`RestartBackoff`]).
 const TSGO_RESTART_BACKOFF_LIMIT: u32 = 3;
+
+/// After how many request timeouts without a restart for a method and
+/// document a request for them waits the plain timeout again
+/// ([`RestartBackoff`]): the longest wait the doubling reaches.
+const TSGO_RESTART_QUIET_TIMEOUTS: u32 = 1 << TSGO_RESTART_BACKOFF_LIMIT;
+
+/// How long an overdue request tsgo loops on waits before it restarts tsgo.
+/// Each restart for the same method and document doubles the next one's
+/// wait, up to [`TSGO_RESTART_BACKOFF_LIMIT`] times, so that a state the
+/// editor keeps asking about does not restart tsgo, which rebuilds every
+/// project, every timeout. The doubling counts only restarts shortly before
+/// the request: one sent [`TSGO_RESTART_QUIET_TIMEOUTS`] timeouts after the
+/// last restart for its method and document waits the plain timeout again
+/// (review 5: the doubling never reset, so a loop hours later still waited
+/// eight timeouts, minutes of an editor without TypeScript answers).
+#[derive(Default)]
+struct RestartBackoff {
+    /// By method and document: how many restarts in a row, and the last one.
+    restarts: HashMap<(String, Option<String>), (u32, Instant)>,
+}
+
+impl RestartBackoff {
+    /// How many times the wait of a request sent at `sent` doubles.
+    fn doublings(&self, key: &(String, Option<String>), sent: Instant, timeout: Duration) -> u32 {
+        self.restarts
+            .get(key)
+            .filter(|(_, last)| {
+                sent.saturating_duration_since(*last) < timeout * TSGO_RESTART_QUIET_TIMEOUTS
+            })
+            .map_or(0, |(count, _)| (*count).min(TSGO_RESTART_BACKOFF_LIMIT))
+    }
+
+    /// Note a restart at `now` for a request sent at `sent`: one in a row
+    /// with the last for its method and document if it was sent before the
+    /// quiet period after that one ended.
+    fn restarted(
+        &mut self,
+        key: (String, Option<String>),
+        sent: Instant,
+        now: Instant,
+        timeout: Duration,
+    ) {
+        if self.doublings(&key, sent, timeout) == 0 {
+            self.restarts.remove(&key);
+        }
+        let (count, last) = self.restarts.entry(key).or_insert((0, now));
+        *count += 1;
+        *last = now;
+    }
+}
 
 /// A request tsgo has not answered yet.
 struct SentRequest {
@@ -1177,9 +1227,8 @@ struct Server {
     joins: HashMap<RequestId, Join>,
     /// [`TSGO_ANSWER_TIMEOUT`], or `RSVELTE_TSGO_REQUEST_TIMEOUT_MS`.
     tsgo_answer_timeout: Duration,
-    /// How many times a request tsgo never answered restarted it, by method
-    /// and document ([`Server::restart_due`]).
-    tsgo_restarts: HashMap<(String, Option<String>), u32>,
+    /// The restarts for requests tsgo loops on ([`Server::restart_deadline`]).
+    tsgo_restarts: RestartBackoff,
     pending_tsgo: HashMap<RequestId, PendingTsgoRequest>,
     /// tsgo's own completion `data`, by entry name, for the sites whose items
     /// currently carry upstream's `{name, uri, position}` payload instead.
@@ -1260,7 +1309,7 @@ impl Server {
                 .ok()
                 .and_then(|ms| ms.parse().ok())
                 .map_or(TSGO_ANSWER_TIMEOUT, Duration::from_millis),
-            tsgo_restarts: HashMap::new(),
+            tsgo_restarts: RestartBackoff::default(),
             pending_tsgo: HashMap::new(),
             completion_data: HashMap::new(),
             completion_order: Vec::new(),
@@ -3254,12 +3303,11 @@ impl Server {
         if checking {
             return None;
         }
-        let restarts = self
-            .tsgo_restarts
-            .get(&(request.method.clone(), request.document.clone()))
-            .copied()
-            .unwrap_or(0)
-            .min(TSGO_RESTART_BACKOFF_LIMIT);
+        let restarts = self.tsgo_restarts.doublings(
+            &(request.method.clone(), request.document.clone()),
+            request.at,
+            self.tsgo_answer_timeout,
+        );
         Some(request.at + self.tsgo_answer_timeout * 2_u32.pow(restarts))
     }
 
@@ -3352,7 +3400,13 @@ impl Server {
             .borrow()
             .iter()
             .filter(|(_, request)| self.restart_due(request, now))
-            .map(|(id, request)| (id.clone(), request.method.clone(), request.document.clone()))
+            .map(|(id, request)| {
+                (
+                    id.clone(),
+                    (request.method.clone(), request.document.clone()),
+                    request.at,
+                )
+            })
             .collect::<Vec<_>>();
         if hung.is_empty() {
             return;
@@ -3360,12 +3414,13 @@ impl Server {
         log::warn(format_args!(
             "restarting tsgo, which is still busy with {}",
             hung.iter()
-                .map(|(id, method, _)| format!("{method} ({id})"))
+                .map(|(id, (method, _), _)| format!("{method} ({id})"))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
-        for (_, method, document) in hung {
-            *self.tsgo_restarts.entry((method, document)).or_default() += 1;
+        for (_, key, sent) in hung {
+            self.tsgo_restarts
+                .restarted(key, sent, now, self.tsgo_answer_timeout);
         }
         self.abort_tsgo_requests("TypeScript service restarted: a request never finished");
         if let Some(runtime) = &mut self.tsgo {
@@ -6824,6 +6879,55 @@ fn might_be_at_start_tag_whitespace(text: &str, offset: usize) -> bool {
     let at = text.get(offset..).and_then(|text| text.chars().next());
     before.is_some_and(char::is_whitespace)
         && at.is_some_and(|character| character.is_whitespace() || matches!(character, '>' | '/'))
+}
+
+#[cfg(test)]
+mod restart_backoff_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{RestartBackoff, TSGO_RESTART_QUIET_TIMEOUTS};
+
+    /// Restarts for a state the editor keeps asking about double the next
+    /// one's wait, up to eight timeouts; a request sent after eight timeouts
+    /// without one waits the plain timeout again (review 5), and other
+    /// requests are not affected.
+    #[test]
+    fn the_restart_backoff_doubles_and_resets_after_a_quiet_period() {
+        let timeout = Duration::from_secs(30);
+        let key = (
+            "textDocument/signatureHelp".to_string(),
+            Some("file:///a.ts".to_string()),
+        );
+        let other = (
+            "textDocument/completion".to_string(),
+            Some("file:///a.ts".to_string()),
+        );
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let mut backoff = RestartBackoff::default();
+        assert_eq!(backoff.doublings(&key, at(0), timeout), 0);
+        // The editor asks again a second after each restart.
+        let (mut sent, mut now) = (0, 30);
+        for expected in [1, 2, 3, 3, 3] {
+            backoff.restarted(key.clone(), at(sent), at(now), timeout);
+            sent = now + 1;
+            assert_eq!(backoff.doublings(&key, at(sent), timeout), expected);
+            now = sent + 30 * (1 << expected);
+        }
+        assert_eq!(backoff.doublings(&other, at(sent), timeout), 0);
+        // Quiet since the last restart (at `now - 241`): the plain timeout.
+        let quiet = 30 * u64::from(TSGO_RESTART_QUIET_TIMEOUTS);
+        let last = now - 241;
+        assert_eq!(backoff.doublings(&key, at(last + quiet - 1), timeout), 3);
+        assert_eq!(backoff.doublings(&key, at(last + quiet), timeout), 0);
+        backoff.restarted(
+            key.clone(),
+            at(last + quiet),
+            at(last + quiet + 30),
+            timeout,
+        );
+        assert_eq!(backoff.doublings(&key, at(last + quiet + 31), timeout), 1);
+    }
 }
 
 #[cfg(test)]
