@@ -1336,6 +1336,64 @@ impl<'source> MagicString<'source> {
         self
     }
 
+    /// Insert a copy of the original text `[start, end)` before the chunk that
+    /// starts at `index`, after anything moved or copied there earlier:
+    /// `prefix`, mapped to `start` as an overwrite is mapped to its start, then
+    /// the copied text, mapped byte for byte as an unedited chunk is (and listed
+    /// in [`Self::forward_segments`]), then `suffix`, unmapped as an outro is.
+    ///
+    /// The copy is a chunk of its own outside the original layout: the original
+    /// range keeps its chunks and whatever replaces them, later edits of that
+    /// range do not reach the copy, and the copy travels with the range it is
+    /// linked into when that range is moved.
+    pub fn insert_copy(
+        &mut self,
+        index: u32,
+        prefix: &str,
+        start: u32,
+        end: u32,
+        suffix: &str,
+    ) -> &mut Self {
+        assert!(
+            start < end && (end as usize) <= self.original.len(),
+            "insert_copy: invalid range [{start}, {end})"
+        );
+        assert!(
+            (index as usize) <= self.original.len(),
+            "insert_copy: index out of range"
+        );
+
+        let target = self.split_at(index).right_index();
+        let mut copy = Chunk::new(start, end);
+        copy.outro = suffix.to_string();
+        let last = self.chunks.len();
+        self.chunks.push(copy);
+        let first = if prefix.is_empty() {
+            last
+        } else {
+            let mut lead = Chunk::new(start, start);
+            lead.content = Some(prefix.to_string());
+            let lead_index = self.chunks.len();
+            self.chunks.push(lead);
+            self.link(Some(lead_index), Some(last));
+            lead_index
+        };
+
+        if let Some(target) = target {
+            let before_target = self.chunks[target].previous_index();
+            self.link(before_target, Some(first));
+            self.link(Some(last), Some(target));
+            if before_target.is_none() {
+                self.first_chunk = ChunkId::from_index(first);
+            }
+        } else {
+            let old_last = self.last_chunk.index();
+            self.link(Some(old_last), Some(first));
+            self.last_chunk = ChunkId::from_index(last);
+        }
+        self
+    }
+
     // -----------------------------------------------------------------
     // Public API – output
     // -----------------------------------------------------------------
@@ -2848,6 +2906,71 @@ mod tests {
         // and must map to original UTF-16 column 4 — not byte column 8.
         let t = sm.lookup_token(0, 4).expect("token at generated col 4");
         assert_eq!(t.get_src_col(), 4);
+    }
+
+    #[test]
+    fn a_copy_maps_its_text_byte_for_byte_and_its_prefix_to_its_start() {
+        let source = "ab\ncdef\ngh";
+        let mut s = MagicString::new(source);
+        // The original place has its own replacement, as `: { … }` does.
+        s.overwrite(3, 7, "X");
+        s.insert_copy(1, "<\n=", 3, 7, ">");
+        assert_eq!(s.to_string(), "a<\n=cdef>b\nX\ngh");
+        assert_eq!(
+            s.forward_segments(),
+            vec![(0, 1, 0), (3, 7, 4), (1, 3, 9), (7, 10, 12)]
+        );
+        assert_mappings_agree_with_forward_segments(&s);
+        assert_bundle_matches_individual_outputs(&s);
+        assert_bidirectional_links(&s);
+        // Both lines of the prefix map to the copy's start (1:0), the copied
+        // text one column at a time, and `>` is covered by its last character.
+        assert_eq!(
+            decode_mappings(&s.generate_mappings()),
+            vec![
+                vec![[0, 0, 0, 0], [1, 0, 1, 0]],
+                vec![
+                    [0, 0, 1, 0],
+                    [1, 0, 1, 0],
+                    [2, 0, 1, 1],
+                    [3, 0, 1, 2],
+                    [4, 0, 1, 3],
+                    [6, 0, 0, 1],
+                    [7, 0, 0, 2]
+                ],
+                vec![[0, 0, 1, 0], [1, 0, 1, 4]],
+                vec![[0, 0, 2, 0], [1, 0, 2, 1]],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_copy_keeps_its_text_when_the_original_is_edited_and_moves_with_its_range() {
+        let mut s = MagicString::new("abcdefghij");
+        s.insert_copy(8, "", 2, 5, ";");
+        // Edits of the copied range after the copy reach only the original.
+        s.overwrite(3, 4, "D");
+        s.append_left(5, "!");
+        assert_eq!(s.to_string(), "abcDe!fghcde;ij");
+        // The copy sits inside [6, 9) as linked, so it moves with it; one
+        // inserted at the end of the source follows the last chunk.
+        s.move_range(6, 9, 0);
+        s.insert_copy(10, "+", 0, 1, "");
+        assert_eq!(s.to_string(), "ghcde;iabcDe!fj+a");
+        assert_mappings_agree_with_forward_segments(&s);
+        assert_bundle_matches_individual_outputs(&s);
+        assert_bidirectional_links(&s);
+
+        // Copies at the same index keep their order, after a move there.
+        let mut s = MagicString::new("abcdef");
+        s.move_range(4, 6, 2);
+        s.insert_copy(2, "", 0, 1, "");
+        s.insert_copy(2, "", 1, 2, "");
+        assert_eq!(s.to_string(), "abefabcd");
+        // Before the first chunk, the copy becomes the first chunk.
+        s.insert_copy(0, "", 3, 4, "");
+        assert_eq!(s.to_string(), "dabefabcd");
+        assert_bidirectional_links(&s);
     }
 
     /// `overwrite` and `remove` walk by ORIGINAL position, not by the chunk

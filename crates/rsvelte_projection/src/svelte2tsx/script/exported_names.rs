@@ -66,6 +66,10 @@ pub struct ExportedNames {
     /// statement when the type can't be hoisted out of $$render (matches JS reference's
     /// `move(generic_arg.pos, generic_arg.end, node.parent.pos)`).
     pub props_let_abs_pos: Option<u32>,
+    /// Absolute source range of the `$props()` annotation whose text
+    /// `props_type_text` holds, when that annotation becomes the
+    /// `$$ComponentProps` alias: the alias is emitted as a mapped copy of it.
+    pub props_type_source: Option<(u32, u32)>,
     /// Names of top-level `type X = ...` and `interface X { ... }` declarations
     /// in the instance script. Used to detect "shadowed" type references in the
     /// `$props()` type annotation: if `let { ... }: { x: T } = $props()` mentions
@@ -347,6 +351,7 @@ impl ExportedNames {
             hoistable_type_ranges: Vec::new(),
             dollar_generic_referenced_ranges: Vec::new(),
             props_let_abs_pos: None,
+            props_type_source: None,
             instance_type_names: HashSet::new(),
             instance_value_names: HashSet::new(),
             instance_import_names: HashSet::new(),
