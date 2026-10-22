@@ -2215,6 +2215,15 @@ impl Server {
 
     fn on_notification(&mut self, notification: Notification) {
         let method = notification.method.clone();
+        // Requests held while a probe is in a shadow's buffer arrived before
+        // this change: they are answered against the text they were sent
+        // for, so the probe ends, and they are replayed, before it applies.
+        if matches!(
+            method.as_str(),
+            "textDocument/didChange" | "textDocument/didClose"
+        ) {
+            self.end_probes();
+        }
         match method.as_str() {
             "$/cancelRequest" => {
                 match serde_json::from_value::<CancelParams>(notification.params) {
@@ -2429,24 +2438,7 @@ impl Server {
         let tsgo = self.pending_tsgo.remove(&id).is_some();
         let rename = self.rename_aggregates.remove(&id).is_some();
         let component = self.component_queries.remove(&id);
-        let child_component_ids = self
-            .component_query_requests
-            .iter()
-            .filter(|(_, (editor_id, _))| editor_id == &id)
-            .map(|(child_id, _)| child_id.clone())
-            .collect::<Vec<_>>();
-        for child_id in child_component_ids {
-            self.component_query_requests.remove(&child_id);
-            if let Some(runtime) = &self.tsgo {
-                let _ = runtime.client.forward(
-                    Notification::new(
-                        "$/cancelRequest".to_string(),
-                        serde_json::json!({ "id": child_id }),
-                    )
-                    .into(),
-                );
-            }
-        }
+        self.cancel_component_requests(&id);
         if let Some(component) = &component {
             self.run_component_action(component.query.restore());
         }
@@ -5070,12 +5062,29 @@ impl Server {
     /// the change replaces the probe, so the query ends, answered with what
     /// tsgo offered without the component's own members.
     fn end_probe_in(&mut self, shadow_uri: &Uri) {
+        self.end_probes_where(|query| query.query_uri() == shadow_uri);
+    }
+
+    /// End every in-place probe — before a document changes, so the requests
+    /// held while one was in are replayed against the state they were sent
+    /// for (the editor applies an answer's edits to the version it asked
+    /// about). A replayed completion may start a probe of its own, which
+    /// would hold the rest again: that one ends too, until none is left.
+    fn end_probes(&mut self) {
+        while self.probe_in_flight() {
+            self.end_probes_where(|_| true);
+        }
+    }
+
+    /// End the in-place probes `ends` picks: put each shadow's own text and
+    /// version back in tsgo, drop its outstanding tsgo requests, answer it
+    /// with what tsgo offered without the component's own members, then hand
+    /// on the held requests.
+    fn end_probes_where(&mut self, ends: impl Fn(&ComponentInfoQuery) -> bool) {
         let probing = self
             .component_queries
             .iter()
-            .filter(|(_, pending)| {
-                pending.query.is_in_place() && pending.query.query_uri() == shadow_uri
-            })
+            .filter(|(_, pending)| pending.query.is_in_place() && ends(&pending.query))
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         if probing.is_empty() {
@@ -5083,10 +5092,35 @@ impl Server {
         }
         for id in probing {
             if let Some(pending) = self.component_queries.remove(&id) {
+                self.run_component_action(pending.query.restore());
+                self.cancel_component_requests(&id);
                 self.respond(Response::new_ok(id, pending.result));
             }
         }
         self.replay_deferred();
+    }
+
+    /// Forget the tsgo requests a component query has outstanding and ask
+    /// tsgo to cancel them.
+    fn cancel_component_requests(&mut self, editor_id: &RequestId) {
+        let child_ids = self
+            .component_query_requests
+            .iter()
+            .filter(|(_, (owner, _))| owner == editor_id)
+            .map(|(child_id, _)| child_id.clone())
+            .collect::<Vec<_>>();
+        for child_id in child_ids {
+            self.component_query_requests.remove(&child_id);
+            if let Some(runtime) = &self.tsgo {
+                let _ = runtime.client.forward(
+                    Notification::new(
+                        "$/cancelRequest".to_string(),
+                        serde_json::json!({ "id": child_id }),
+                    )
+                    .into(),
+                );
+            }
+        }
     }
 
     /// Hand on the requests held while a probe was in a shadow's buffer.

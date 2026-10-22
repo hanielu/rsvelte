@@ -1026,6 +1026,127 @@ fn component_attribute_completion_probes_in_the_shadow_and_holds_other_requests(
     server.shutdown();
 }
 
+/// Requests held while a probe is in the shadow arrived before the edit that
+/// ends it, so they are answered against the text they were sent for: the
+/// editor applies a reply's edits to the version it asked about (round-2
+/// review: the formatting reply was an edit for the next version, and tsgo
+/// answered a held request while the shadow still held the probe).
+#[cfg(unix)]
+#[test]
+fn an_edit_during_a_probe_answers_the_held_requests_against_the_text_before_it() {
+    let dir = TestDir::new("component-query-held-before-edit");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = fs::canonicalize(&dir.0).unwrap().join("ws");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    fs::write(root.join("tsconfig.json"), "{}").unwrap();
+    let parent = "<script lang=\"ts\">\n\timport Child from './Child.svelte';\n\tconst later: number   =   1;\n</script>\n\n<Child  />\n<p>{later}</p>\n";
+    fs::write(root.join("Parent.svelte"), parent).unwrap();
+    fs::write(
+        root.join("Child.svelte"),
+        "<script lang=\"ts\">\n\tlet { alpha }: { alpha: string } = $props();\n</script>\n",
+    )
+    .unwrap();
+    let mut server = Server::start_with_settings(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            (
+                "RSVELTE_TEST_MARKER",
+                Path::new("__rsvelte_component_info_probe"),
+            ),
+            ("RSVELTE_TEST_SLOW_COMPLETION_MS", Path::new("300")),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+    );
+    let parent_uri = file_uri(&root.join("Parent.svelte"));
+    server.open(&parent_uri, parent);
+    hover(&mut server, &parent_uri);
+    let formatting = |server: &mut Server| {
+        server.request(
+            "textDocument/formatting",
+            json!({
+                "textDocument": { "uri": parent_uri },
+                "options": { "tabSize": 2, "insertSpaces": false },
+            }),
+        )
+    };
+    let quiet = formatting(&mut server);
+    let expected = server.response(quiet, Duration::from_secs(10))["result"].clone();
+    assert!(
+        expected.as_array().is_some_and(|edits| !edits.is_empty()),
+        "the document needs formatting: {expected}"
+    );
+
+    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/Parent.svelte.tsx"));
+    let completion = server.request(
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": parent_uri },
+            "position": { "line": 5, "character": 7 },
+            "context": { "triggerKind": 1 },
+        }),
+    );
+    let probing = format!("textDocument/didChange {shadow} marked");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !traffic(&log).contains(&probing) {
+        assert!(Instant::now() < deadline, "no probe: {:?}", traffic(&log));
+        thread::sleep(Duration::from_millis(5));
+    }
+    // While the probe is in: a formatting request and a request tsgo answers
+    // (references go to tsgo directly), then an edit.
+    let held_formatting = formatting(&mut server);
+    let held_references = server.request(
+        "textDocument/references",
+        json!({
+            "textDocument": { "uri": parent_uri },
+            "position": { "line": 2, "character": 8 },
+            "context": { "includeDeclaration": true },
+        }),
+    );
+    server.change(&parent_uri, 2, &format!("<!-- top -->\n{parent}"));
+
+    assert!(
+        server
+            .response(completion, Duration::from_secs(10))
+            .get("result")
+            .is_some()
+    );
+    let reply = server.response(held_formatting, Duration::from_secs(10));
+    assert_eq!(
+        reply["result"], expected,
+        "formatting answers for the version it was sent for"
+    );
+    assert!(
+        server
+            .response(held_references, Duration::from_secs(10))
+            .get("result")
+            .is_some()
+    );
+    let lines = traffic(&log);
+    let last_probe = lines.iter().rposition(|line| line == &probing).unwrap();
+    let references = lines
+        .iter()
+        .position(|line| line == &format!("textDocument/references {shadow}"))
+        .expect("forwarded");
+    assert!(last_probe < references, "{lines:?}");
+    let changes_between = lines[last_probe + 1..references]
+        .iter()
+        .filter(|line| *line == &format!("textDocument/didChange {shadow}"))
+        .count();
+    assert_eq!(
+        changes_between, 1,
+        "the shadow's own text, and not the edit, comes back before tsgo hears the held request: {lines:?}"
+    );
+    assert!(
+        lines[references + 1..].contains(&format!("textDocument/didChange {shadow}")),
+        "and the edit reaches tsgo after it: {lines:?}"
+    );
+    server.shutdown();
+}
+
 /// A workspace with three projects that own components and one that owns
 /// none, for the background-loading tests.
 #[cfg(unix)]
