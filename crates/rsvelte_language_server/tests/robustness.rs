@@ -1339,6 +1339,73 @@ fn an_edit_after_a_diagnostic_pull_waits_for_neither_of_its_halves() {
     server.shutdown();
 }
 
+/// tsrs occasionally never answers a request. The server answers it without
+/// tsgo once it is overdue (the empty answer here: the request has no native
+/// half), and the background, which waits for tsgo to answer the editor's
+/// requests, stops waiting for one after a couple of seconds, so it still
+/// loads the other projects.
+#[cfg(unix)]
+#[test]
+fn a_request_tsgo_never_answers_is_answered_without_it_and_holds_nothing_back() {
+    let dir = TestDir::new("lost-tsgo-request");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = three_projects(&dir.0);
+    let mut server = Server::start(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            ("RSVELTE_TEST_TSGO_IGNORE", Path::new("textDocument/signatureHelp")),
+            ("RSVELTE_TSGO_REQUEST_TIMEOUT_MS", Path::new("6000")),
+        ],
+    );
+    let x = file_uri(&root.join("a/X.svelte"));
+    server.open(&x, &fs::read_to_string(root.join("a/X.svelte")).unwrap());
+    hover(&mut server, &x);
+    let sent = Instant::now();
+    let lost = server.request(
+        "textDocument/signatureHelp",
+        json!({ "textDocument": { "uri": x }, "position": { "line": 1, "character": 5 } }),
+    );
+    let kept = |project: &str, file: &str| {
+        file_uri(
+            &root
+                .join(".svelte-rs/projects")
+                .join(project)
+                .join("tsgo/svelte")
+                .join(project)
+                .join(format!("{file}.svelte.tsx")),
+        )
+    };
+    let deadline = sent + Duration::from_secs(5);
+    loop {
+        let lines = traffic(&log);
+        if lines.contains(&format!("textDocument/didOpen {}", kept("b", "Y")))
+            && lines.contains(&format!("textDocument/didOpen {}", kept("c", "Z")))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the lost request held the background: {lines:?}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let answer = server.response(lost, Duration::from_secs(20));
+    assert!(
+        sent.elapsed() >= Duration::from_secs(6),
+        "answered before it was overdue"
+    );
+    assert_eq!(answer["result"], Value::Null, "{answer}");
+    assert!(
+        traffic(&log).contains(&"$/cancelRequest ".to_string()),
+        "tsgo is asked to drop it"
+    );
+    assert!(hover(&mut server, &x).to_string().contains("recorded"));
+    server.shutdown();
+}
+
 /// A workspace with three projects that own components and one that owns
 /// none, for the background-loading tests.
 #[cfg(unix)]
@@ -1621,6 +1688,8 @@ fn main() {
             )).unwrap();
         } else if method == "exit" {
             return;
+        } else if std::env::var("RSVELTE_TEST_TSGO_IGNORE").is_ok_and(|ignored| ignored == method) {
+            // A request tsgo loses: never answered, not even once cancelled.
         } else if !method.is_empty() && message.contains(r#""id":"#) {
             let id = json_id(&message);
             write_message(&mut output, &format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#)).unwrap();

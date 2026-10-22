@@ -1,5 +1,6 @@
 //! The LSP message loop.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
@@ -47,7 +48,7 @@ use crate::preprocess_sidecar::{
 };
 use crate::settings::Settings;
 use crate::text::LineIndex;
-use crate::tsgo_client::{OpenBuffer, TsgoClient, TsgoConfig, TsgoEvent};
+use crate::tsgo_client::{OpenBuffer, TsgoClient, TsgoClientClosed, TsgoConfig, TsgoEvent};
 use crate::tsgo_code_actions::{
     TsgoCodeActionContext, document_has_parser_error, rewrite_code_action_response,
 };
@@ -385,6 +386,17 @@ struct PendingTsgoRequest {
 /// that arrived before it ([`Server::finish_native_halves`]).
 const NATIVE_HALF_WAIT: Duration = Duration::from_millis(250);
 
+/// How long tsgo has to answer a request before the server answers it
+/// without tsgo ([`Server::expire_tsgo_requests`]). tsrs occasionally never
+/// answers a request; the editor would wait for it forever.
+/// `RSVELTE_TSGO_REQUEST_TIMEOUT_MS` overrides it.
+const TSGO_ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an unanswered editor request keeps the background from loading
+/// projects: the background waits for tsgo to be idle, and a request tsgo
+/// lost would otherwise hold it until the request expires.
+const TSGO_BUSY_FOR: Duration = Duration::from_secs(2);
+
 /// Work held while a component query probes in a shadow's own buffer.
 enum Deferred {
     /// An editor request, replayed from the start.
@@ -470,6 +482,8 @@ struct TsgoRuntime {
     /// Whether every loaded project is kept, which starts with the first
     /// background load or workspace-wide request.
     keep_all: bool,
+    /// When each request tsgo has not answered yet went out.
+    sent: RefCell<HashMap<RequestId, Instant>>,
 }
 
 /// tsgo takes a buffer's script kind from its language id. A JavaScript
@@ -680,7 +694,43 @@ impl TsgoRuntime {
             document_imports: HashMap::new(),
             keep_alive: HashMap::new(),
             keep_all: false,
+            sent: RefCell::new(HashMap::new()),
         })
+    }
+
+    /// Send tsgo a message, noting when each request goes out
+    /// ([`Server::expire_tsgo_requests`]).
+    fn forward(&self, message: Message) -> Result<(), TsgoClientClosed> {
+        let id = match &message {
+            Message::Request(request) => Some(request.id.clone()),
+            _ => None,
+        };
+        self.client.forward(message)?;
+        if let Some(id) = id {
+            self.sent.borrow_mut().insert(id, Instant::now());
+        }
+        Ok(())
+    }
+
+    /// Forget a request tsgo answered or that nothing waits for any more.
+    fn answered(&self, id: &RequestId) {
+        self.sent.borrow_mut().remove(id);
+    }
+
+    fn sent_at(&self, id: &RequestId) -> Option<Instant> {
+        self.sent.borrow().get(id).copied()
+    }
+
+    /// Ask tsgo to drop a request nothing waits for any more.
+    fn cancel(&self, id: &RequestId) {
+        self.answered(id);
+        let _ = self.forward(
+            Notification::new(
+                "$/cancelRequest".to_string(),
+                serde_json::json!({ "id": id }),
+            )
+            .into(),
+        );
     }
 
     /// Make sure the project that owns `source` is built and loaded, and
@@ -1051,6 +1101,8 @@ struct Server {
     linted: HashMap<String, u64>,
     pending: HashMap<RequestId, Pending>,
     joins: HashMap<RequestId, Join>,
+    /// [`TSGO_ANSWER_TIMEOUT`], or `RSVELTE_TSGO_REQUEST_TIMEOUT_MS`.
+    tsgo_answer_timeout: Duration,
     pending_tsgo: HashMap<RequestId, PendingTsgoRequest>,
     /// tsgo's own completion `data`, by entry name, for the sites whose items
     /// currently carry upstream's `{name, uri, position}` payload instead.
@@ -1127,6 +1179,10 @@ impl Server {
             linted: HashMap::new(),
             pending: HashMap::new(),
             joins: HashMap::new(),
+            tsgo_answer_timeout: std::env::var("RSVELTE_TSGO_REQUEST_TIMEOUT_MS")
+                .ok()
+                .and_then(|ms| ms.parse().ok())
+                .map_or(TSGO_ANSWER_TIMEOUT, Duration::from_millis),
             pending_tsgo: HashMap::new(),
             completion_data: HashMap::new(),
             completion_order: Vec::new(),
@@ -1186,6 +1242,7 @@ impl Server {
                 .values()
                 .copied()
                 .chain(self.background_deadline())
+                .chain(self.tsgo_request_deadline())
                 .min()
             {
                 Some(deadline) => after(deadline.saturating_duration_since(Instant::now())),
@@ -1224,6 +1281,7 @@ impl Server {
                 },
                 recv(timer) -> _ => {
                     self.run_scheduled_lints();
+                    self.expire_tsgo_requests();
                     self.step_background();
                 },
             }
@@ -1590,7 +1648,7 @@ impl Server {
             completion_site_data: None,
         };
         let child = Request::new(id.clone(), method.to_string(), params);
-        if let Err(error) = runtime.client.forward(child.into()) {
+        if let Err(error) = runtime.forward(child.into()) {
             log::warn(format_args!("could not forward rename to tsgo: {error}"));
             self.respond_nothing(id);
             return;
@@ -1696,7 +1754,7 @@ impl Server {
             code_lens_resolve: None,
             completion_site_data: None,
         };
-        if runtime.client.forward(child.into()).is_ok() {
+        if runtime.forward(child.into()).is_ok() {
             self.pending_tsgo.insert(request.id, pending);
         } else {
             self.respond(Response::new_ok(
@@ -1791,7 +1849,7 @@ impl Server {
             code_lens_resolve: None,
             completion_site_data: None,
         };
-        if runtime.client.forward(child.into()).is_ok() {
+        if runtime.forward(child.into()).is_ok() {
             self.pending_tsgo.insert(request.id, pending);
         } else {
             self.respond_nothing(request.id);
@@ -2085,7 +2143,7 @@ impl Server {
             }),
             completion_site_data: None,
         };
-        if runtime.client.forward(child.into()).is_ok() {
+        if runtime.forward(child.into()).is_ok() {
             self.pending_tsgo.insert(id, pending);
         } else if let Some(resolve) = pending.code_lens_resolve {
             self.respond(Response::new_ok(id, resolve.lens));
@@ -2322,7 +2380,7 @@ impl Server {
                                 workspace_folders,
                                 current_dir,
                             );
-                            let _ = runtime.client.forward(child_notification.into());
+                            let _ = runtime.forward(child_notification.into());
                         }
                     }
                     Err(err) => log::warn(format_args!("{method}: {err}")),
@@ -2379,7 +2437,7 @@ impl Server {
                             self.refresh_tsgo_overlays(&changes);
                         }
                         if let Some(runtime) = &self.tsgo {
-                            let _ = runtime.client.forward(child_notification.into());
+                            let _ = runtime.forward(child_notification.into());
                         }
                     }
                     Err(err) => log::warn(format_args!("{method}: {err}")),
@@ -2511,23 +2569,11 @@ impl Server {
         for child_id in child_rename_ids {
             self.pending_tsgo.remove(&child_id);
             if let Some(runtime) = &self.tsgo {
-                let _ = runtime.client.forward(
-                    Notification::new(
-                        "$/cancelRequest".to_string(),
-                        serde_json::json!({ "id": child_id }),
-                    )
-                    .into(),
-                );
+                runtime.cancel(&child_id);
             }
         }
         if tsgo && let Some(runtime) = &self.tsgo {
-            let _ = runtime.client.forward(
-                Notification::new(
-                    "$/cancelRequest".to_string(),
-                    serde_json::json!({ "id": id }),
-                )
-                .into(),
-            );
+            runtime.cancel(&id);
         }
         let deferred = self.deferred.len();
         self.deferred.retain(|request| match request {
@@ -2649,7 +2695,7 @@ impl Server {
             completion_site_data,
         };
         let id = request.id.clone();
-        if let Err(error) = runtime.client.forward(request.into()) {
+        if let Err(error) = runtime.forward(request.into()) {
             log::warn(format_args!("could not forward request to tsgo: {error}"));
             self.respond(Response::new_ok(
                 id,
@@ -2710,7 +2756,7 @@ impl Server {
             code_lens_resolve: None,
             completion_site_data: None,
         };
-        if runtime.client.forward(request.into()).is_ok() {
+        if runtime.forward(request.into()).is_ok() {
             self.pending_tsgo.insert(id, pending);
         } else {
             self.publish(uri, version, native_fallback);
@@ -3050,17 +3096,80 @@ impl Server {
             || background.enumerating
             || background.in_flight.is_some()
             || background.warming.is_some()
-            || !self.pending_tsgo.is_empty()
             || !self.component_queries.is_empty()
         {
             return None;
         }
         let runtime = self.tsgo.as_ref()?;
+        // tsgo is idle once it answered every editor request, or once those
+        // it has not answered are old enough to be lost.
+        let tsgo_idle = self
+            .pending_tsgo
+            .keys()
+            .map(|id| {
+                runtime
+                    .sent_at(id)
+                    .map_or(Instant::now(), |sent| sent + TSGO_BUSY_FOR)
+            })
+            .max();
         runtime
             .overlays
             .iter()
             .any(TsgoOverlay::is_loaded)
-            .then(|| background.last_activity + background::IDLE)
+            .then(|| {
+                let quiet = background.last_activity + background::IDLE;
+                tsgo_idle.map_or(quiet, |idle| quiet.max(idle))
+            })
+    }
+
+    /// When the oldest request tsgo has not answered expires.
+    fn tsgo_request_deadline(&self) -> Option<Instant> {
+        let runtime = self.tsgo.as_ref()?;
+        let oldest = runtime.sent.borrow().values().min().copied()?;
+        Some(oldest + self.tsgo_answer_timeout)
+    }
+
+    /// Answer every request tsgo has left unanswered for
+    /// [`TSGO_ANSWER_TIMEOUT`] as if tsgo had nothing (each editor request
+    /// gets its native fallback, or the empty answer, a component query goes
+    /// on without that member), and ask tsgo to drop it. A request tsrs loses
+    /// would otherwise never be answered, and the background, which waits for
+    /// tsgo to be idle, would never load another project.
+    fn expire_tsgo_requests(&mut self) {
+        let Some(runtime) = &self.tsgo else {
+            return;
+        };
+        let now = Instant::now();
+        let expired = runtime
+            .sent
+            .borrow()
+            .iter()
+            .filter(|(_, sent)| now.duration_since(**sent) >= self.tsgo_answer_timeout)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in expired {
+            if let Some(runtime) = &self.tsgo {
+                runtime.cancel(&id);
+            }
+            let method = self
+                .pending_tsgo
+                .get(&id)
+                .map_or("a request", |pending| pending.method.as_str());
+            log::warn(format_args!(
+                "tsgo did not answer {method} ({id}) in {} ms; answering without it",
+                self.tsgo_answer_timeout.as_millis()
+            ));
+            let response = if self.component_query_requests.contains_key(&id) {
+                Response::new_err(
+                    id,
+                    ErrorCode::RequestCanceled as i32,
+                    "tsgo did not answer".to_string(),
+                )
+            } else {
+                Response::new_ok(id, serde_json::Value::Null)
+            };
+            self.on_tsgo_message(Message::Response(response));
+        }
     }
 
     /// Hand the background thread its next job, when one is due: find the
@@ -3265,7 +3374,7 @@ impl Server {
             "textDocument/documentSymbol".to_string(),
             serde_json::json!({ "textDocument": { "uri": uri } }),
         );
-        if runtime.client.forward(request.into()).is_ok() {
+        if runtime.forward(request.into()).is_ok() {
             self.background.warming = Some(id);
         }
     }
@@ -4308,7 +4417,7 @@ impl Server {
             Outgoing::Tsgo { child_id } => {
                 response.id = child_id;
                 if let Some(runtime) = &self.tsgo {
-                    let _ = runtime.client.forward(response.into());
+                    let _ = runtime.forward(response.into());
                 }
             }
         }
@@ -4358,6 +4467,9 @@ impl Server {
 
     fn abort_tsgo_requests(&mut self, message: &str) {
         self.background.warming = None;
+        if let Some(runtime) = &self.tsgo {
+            runtime.sent.borrow_mut().clear();
+        }
         let stale_child_requests = self
             .outgoing
             .iter()
@@ -4417,6 +4529,9 @@ impl Server {
     fn on_tsgo_message(&mut self, message: Message) {
         match message {
             Message::Response(mut response) => {
+                if let Some(runtime) = &self.tsgo {
+                    runtime.answered(&response.id);
+                }
                 if self.background.warming.as_ref() == Some(&response.id) {
                     self.background.warming = None;
                     return;
@@ -4826,7 +4941,7 @@ impl Server {
                         Some(params) => request.params = params,
                         None => {
                             if let Some(runtime) = &self.tsgo {
-                                let _ = runtime.client.forward(
+                                let _ = runtime.forward(
                                     Response::new_ok(request.id, serde_json::Value::Null).into(),
                                 );
                             }
@@ -4840,7 +4955,7 @@ impl Server {
                         &request.params,
                     );
                     if !mapper.map_child_params(&request.method, &mut request.params) {
-                        let _ = runtime.client.forward(
+                        let _ = runtime.forward(
                             Response::new_err(
                                 request.id,
                                 ErrorCode::InvalidParams as i32,
@@ -5050,7 +5165,7 @@ impl Server {
                     let sent = self
                         .tsgo
                         .as_ref()
-                        .is_some_and(|runtime| runtime.client.forward(request.into()).is_ok());
+                        .is_some_and(|runtime| runtime.forward(request.into()).is_ok());
                     if sent {
                         self.component_query_requests
                             .insert(child_id, (editor_id.clone(), id));
@@ -5205,13 +5320,7 @@ impl Server {
         for child_id in child_ids {
             self.component_query_requests.remove(&child_id);
             if let Some(runtime) = &self.tsgo {
-                let _ = runtime.client.forward(
-                    Notification::new(
-                        "$/cancelRequest".to_string(),
-                        serde_json::json!({ "id": child_id }),
-                    )
-                    .into(),
-                );
+                runtime.cancel(&child_id);
             }
         }
     }
@@ -5312,7 +5421,7 @@ impl Server {
                 );
                 for (child_id, request, child_pending) in requests {
                     if let Some(runtime) = &self.tsgo
-                        && runtime.client.forward(request.into()).is_ok()
+                        && runtime.forward(request.into()).is_ok()
                     {
                         self.pending_tsgo.insert(child_id, child_pending);
                     } else {
