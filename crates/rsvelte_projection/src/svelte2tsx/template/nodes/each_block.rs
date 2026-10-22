@@ -22,9 +22,15 @@ pub fn prefix_with_for(prefix: &str) -> String {
 /// Build the text emitted after EXPR (and the relocated CTX) in the
 /// structured-bake each-block header. Mirrors the non-relocated
 /// `header_after_expr`: `))` closes `__sveltets_2_ensureArray(EXPR)` and
-/// the `for(...)` argument list; `{` opens the for body; the idx / key
-/// bindings still travel as plain text — only CTX is source-preserved.
-pub fn build_each_after_ctx_tail(block: &EachBlock, source: &str, comma_wrap: bool) -> String {
+/// the `for(...)` argument list; `{` opens the for body; the idx binding
+/// still travels as plain text. The key (`key;`) ends the text unless
+/// `with_key` is false, when the caller keeps it in place.
+pub fn build_each_after_ctx_tail(
+    block: &EachBlock,
+    source: &str,
+    comma_wrap: bool,
+    with_key: bool,
+) -> String {
     let suffix = if block.context.is_some() {
         ""
     } else {
@@ -37,12 +43,24 @@ pub fn build_each_after_ctx_tail(block: &EachBlock, source: &str, comma_wrap: bo
     if let Some(ref index) = block.index {
         let _ = write!(s, "let {index} = 1;");
     }
-    if let Some(ref key) = block.key {
+    if let Some(ref key) = block.key
+        && with_key
+    {
         let key_text = get_expression_text(key, source);
         s.push_str(key_text);
         s.push(';');
     }
     s
+}
+
+/// The each block's key when the header can be written around it, as upstream
+/// does (`[key.start, key.end], ';'`): it lies after `after`, the end of the
+/// last header range that stays or moves, and before the `)` and `}` that end
+/// the opening. Written out as text instead, the key mapped to the start of
+/// the text before it, so a rename of a name it uses left it behind.
+fn key_in_place(block: &EachBlock, after: u32, body_start: u32) -> Option<(u32, u32)> {
+    let (start, end) = block.key.as_ref().and_then(get_expression_range)?;
+    (after < start && start < end && end < body_start).then_some((start, end))
 }
 
 /// Handle an each block: `{#each items as item, i (key)}...{:else}...{/each}`.
@@ -231,18 +249,32 @@ pub fn handle_each_block(
             // " as " (or whitespace) between EXPR and CTX → "){...tail".
             // Then the trailing characters between CTX and body get
             // emitted/cleared.
-            let tail = build_each_after_ctx_tail(block, source, comma_wrap);
+            let key = key_in_place(block, ctx_e, body_start).filter(|_| expr_end < ctx_s);
+            let tail = build_each_after_ctx_tail(block, source, comma_wrap, key.is_none());
             if expr_end < ctx_s {
                 str.overwrite(expr_end, ctx_s, &tail);
             } else {
                 str.append_left(ctx_s, &tail);
             }
-            if ctx_e < body_start {
+            if let Some((key_start, key_end)) = key {
+                // The key follows the tail: CTX, between them, has moved.
+                str.overwrite(ctx_e, key_start, "");
+                str.overwrite(key_end, body_start, ";");
+            } else if ctx_e < body_start {
                 str.overwrite(ctx_e, body_start, "");
             }
         } else {
             str.overwrite(block.start, expr_start, &header_before_expr);
-            if expr_end < body_start {
+            if let Some((key_start, key_end)) = key_in_place(block, expr_end, body_start) {
+                // `header_after_expr` ends with the key and its `;`.
+                let key_text = &source[key_start as usize..key_end as usize];
+                let before_key = header_after_expr
+                    .strip_suffix(';')
+                    .and_then(|text| text.strip_suffix(key_text))
+                    .expect("the header ends with the key");
+                str.overwrite(expr_end, key_start, before_key);
+                str.overwrite(key_end, body_start, ";");
+            } else if expr_end < body_start {
                 str.overwrite(expr_end, body_start, &header_after_expr);
             } else {
                 // expr_end >= body_start (no space between expr and body opener).

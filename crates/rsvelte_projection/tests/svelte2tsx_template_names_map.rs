@@ -194,3 +194,35 @@ fn a_javascript_snippets_name_and_parameters_keep_their_place() {
     assert_maps_in_place(&artifact, source, nth_offset(source, "cell(x)", 0, 5), 1);
     assert_maps_in_place(&artifact, source, nth_offset(source, "none()", 0, 0), 4);
 }
+
+#[test]
+fn an_each_blocks_key_keeps_its_place() {
+    let source = "<script lang=\"ts\">\n\ttype Row = { id: string };\n\tlet rows: Row[] = $state([]);\n\tlet items = $state([1, 2]);\n</script>\n{#each rows as row (row.id)}<p>{row.id}</p>{/each}\n{#each rows as { id }, i (id)}<p>{id}{i}</p>{/each}\n{#each items as items (items)}{items}{/each}\n{#each rows as row, i (row.id)}<p>{i}</p>{:else}<p>none</p>{/each}\n{#each rows as row ( row.id )}{row.id}{/each}\n{#each rows as row (row.id)}{/each}\n{#each rows, 2 as row (row)}{row}{/each}\n";
+    let artifact = project(source);
+    assert_code_contains(
+        &artifact,
+        &[
+            "   for(let row of __sveltets_2_ensureArray(rows)){row.id; { svelteHTML.createElement(\"p\", {});row.id; }}\n",
+            "    for(let { id } of __sveltets_2_ensureArray(rows)){let i = 1;id; { svelteHTML.createElement(\"p\", {});id;i; }}\n",
+            "   { const $$_each = __sveltets_2_ensureArray(items); for(let items of $$_each){items;items;}}\n",
+            "    for(let row of __sveltets_2_ensureArray(rows)){let i = 1;row.id; { svelteHTML.createElement(\"p\", {});i; }} { svelteHTML.createElement(\"p\", {});  }\n",
+            "   for(let row of __sveltets_2_ensureArray(rows)){row.id;row.id;}\n",
+            "   for(let row of __sveltets_2_ensureArray(rows)){row.id;}\n",
+            "   for(let row of __sveltets_2_ensureArray((rows, 2))){row;row;}\n",
+        ],
+    );
+    for (key, nth) in [
+        ("(row.id)}<p>", 0),
+        ("(id)}", 0),
+        ("(items)}", 0),
+        ("(row.id)}<p>", 1),
+        ("( row.id )", 0),
+        ("(row.id)}{/each}", 0),
+        ("(row)}", 0),
+    ] {
+        let at = nth_offset(source, key, nth, 1);
+        let at = at + source[at..].find(|c: char| c != ' ').unwrap();
+        let len = source[at..].find([' ', ')']).unwrap();
+        assert_maps_in_place(&artifact, source, at, len);
+    }
+}
