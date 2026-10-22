@@ -248,6 +248,10 @@ struct ShadowState {
     preprocess_mappings: PreprocessMappings,
     preprocess_status: PreprocessStatus,
     generated_index: LineIndex,
+    /// Where each line of `document.text` starts as tsgo's UTF-8 positions
+    /// count lines (`\n` only), built the first time a position is mapped
+    /// ([`Self::generated_offset`]).
+    generated_lines: OnceLock<Vec<u32>>,
     exact_map: ProjectionMap,
     source_map: Option<String>,
     tokens: Vec<MappingToken>,
@@ -272,6 +276,16 @@ impl ShadowState {
     /// fallback — rather than a plain module routed through the project.
     const fn is_component(&self) -> bool {
         !self.identity || self.parser_error.is_some()
+    }
+
+    /// The shadow offset of a tsgo position: [`utf8_offset`] without a scan
+    /// of the text up to it, which made mapping a response with one position
+    /// per line quadratic in the component's size.
+    fn generated_offset(&self, position: Position) -> usize {
+        let lines = self
+            .generated_lines
+            .get_or_init(|| utf8_line_starts(&self.document.text));
+        utf8_offset_from_lines(&self.document.text, lines, position)
     }
 }
 
@@ -923,6 +937,7 @@ impl TsgoOverlay {
             preprocess_mappings,
             preprocess_status,
             generated_index,
+            generated_lines: OnceLock::new(),
             exact_map,
             source_map,
             tokens,
@@ -973,6 +988,7 @@ impl TsgoOverlay {
             preprocess_mappings: PreprocessMappings::default(),
             preprocess_status: PreprocessStatus::Identity,
             generated_index: LineIndex::new(&generated_text),
+            generated_lines: OnceLock::new(),
             exact_map: ProjectionMap::default(),
             tokens: Vec::new(),
             source_map: None,
@@ -1031,6 +1047,7 @@ impl TsgoOverlay {
             preprocess_mappings: PreprocessMappings::default(),
             preprocess_status: PreprocessStatus::Identity,
             generated_index: LineIndex::new(text),
+            generated_lines: OnceLock::new(),
             exact_map: ProjectionMap::default(),
             tokens: Vec::new(),
             source_map: None,
@@ -1802,7 +1819,7 @@ impl TsgoOverlay {
     ) -> Option<Position> {
         let source_path = self.source_for_shadow(shadow_path)?;
         let entry = self.entries.get(source_path)?;
-        let generated_offset = utf8_offset(&entry.document.text, position);
+        let generated_offset = entry.generated_offset(position);
         if entry.identity {
             if entry
                 .plain_insertions
@@ -1911,7 +1928,7 @@ impl TsgoOverlay {
         let Some(entry) = self.entries.get(source_path) else {
             return false;
         };
-        let offset = utf8_offset(&entry.document.text, position);
+        let offset = entry.generated_offset(position);
         entry
             .generated_ranges
             .iter()
@@ -1959,7 +1976,7 @@ impl TsgoOverlay {
     pub fn shadow_offset(&self, shadow_path: &Path, position: Position) -> Option<usize> {
         let source_path = self.source_for_shadow(shadow_path)?;
         let entry = self.entries.get(source_path)?;
-        Some(utf8_offset(&entry.document.text, position))
+        Some(entry.generated_offset(position))
     }
 
     /// Whether a tsgo range is generated text, which is what decides that it
@@ -1987,8 +2004,8 @@ impl TsgoOverlay {
         let Some(entry) = self.entries.get(source_path) else {
             return false;
         };
-        let start = utf8_offset(&entry.document.text, range.start);
-        let end = utf8_offset(&entry.document.text, range.end).max(start);
+        let start = entry.generated_offset(range.start);
+        let end = entry.generated_offset(range.end).max(start);
         if entry
             .generated_ranges
             .iter()
@@ -3708,6 +3725,34 @@ fn utf8_position(text: &str, offset: usize) -> Position {
     Position::new(
         u32::try_from(line).unwrap_or(u32::MAX),
         u32::try_from(offset - line_start).unwrap_or(u32::MAX),
+    )
+}
+
+/// Where each line of `text` starts, counting lines as [`utf8_offset`] does.
+fn utf8_line_starts(text: &str) -> Vec<u32> {
+    std::iter::once(0)
+        .chain(
+            text.bytes()
+                .enumerate()
+                .filter(|(_, byte)| *byte == b'\n')
+                .map(|(newline, _)| u32::try_from(newline + 1).unwrap_or(u32::MAX)),
+        )
+        .collect()
+}
+
+/// [`utf8_offset`] from `text`'s [`utf8_line_starts`].
+fn utf8_offset_from_lines(text: &str, lines: &[u32], position: Position) -> usize {
+    let line = position.line as usize;
+    let Some(&start) = lines.get(line) else {
+        return text.len();
+    };
+    let start = start as usize;
+    let end = lines
+        .get(line + 1)
+        .map_or(text.len(), |next| *next as usize - 1);
+    floor_char_boundary(
+        text,
+        start.saturating_add(position.character as usize).min(end),
     )
 }
 
@@ -6558,5 +6603,88 @@ mod tests {
         // every document, has no such mapping.
         let rooted = build_overlay(&root).unwrap();
         assert!(overlay_config(&rooted)["compilerOptions"]["paths"].is_null());
+    }
+
+    /// The line table gives every position the offset the scan it replaces
+    /// gives, line breaks of every kind, multibyte characters, positions
+    /// past a line's end or past the last line included.
+    #[test]
+    fn a_shadow_offset_from_its_line_starts_is_the_scanned_one() {
+        for text in [
+            "",
+            "a",
+            "\n",
+            "ab\ncd\n",
+            "ab\r\ncd\r\n\r\n",
+            "lone\rcarriage\nreturn",
+            "é€😀\nx€\n😀😀",
+            "no newline at the end",
+        ] {
+            let lines = utf8_line_starts(text);
+            for line in 0..6 {
+                for character in 0..(text.len() as u32 + 3) {
+                    let position = Position::new(line, character);
+                    assert_eq!(
+                        utf8_offset_from_lines(text, &lines, position),
+                        utf8_offset(text, position),
+                        "{text:?} at {line}:{character}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Mapping a tsgo position back no longer scans the shadow up to it:
+    /// a position on the last line of a large component costs what one on
+    /// the first line does (review 4: a symbol answer at 2,100 lines took
+    /// 0.6 s, most of it in these scans), and maps where the scan did.
+    #[test]
+    fn a_position_late_in_a_large_shadow_maps_as_fast_as_an_early_one() {
+        use std::fmt::Write as _;
+
+        let workspace = TestWorkspace::new("late-positions");
+        let mut text = "<script lang=\"ts\">\n\tlet first = 1;\n".to_string();
+        for index in 0..4_000 {
+            writeln!(text, "\tlet v{index} = {index};").unwrap();
+        }
+        text.push_str("\tlet last = 2;\n</script>\n<p>{first}{last}</p>\n");
+        let app = workspace.0.join("App.svelte");
+        write(&app, &text);
+        let overlay = build_overlay(&workspace.0).unwrap();
+        let shadow = overlay.shadow_for_source(&app).unwrap();
+        let shadow_path = crate::uri::uri_to_path(shadow.shadow_uri.as_str());
+        let generated = |needle: &str| {
+            let offset = shadow.text.find(needle).unwrap();
+            utf8_position(&shadow.text, offset)
+        };
+        let (early, late) = (generated("first = 1"), generated("last = 2"));
+        assert!(late.line > early.line + 3_000);
+        let entry = overlay
+            .entries
+            .get(&overlay.lookup_source_path(&app))
+            .unwrap();
+        for position in [early, late] {
+            assert_eq!(
+                entry.generated_offset(position),
+                utf8_offset(&shadow.text, position)
+            );
+        }
+        let time = |position: Position| {
+            let started = std::time::Instant::now();
+            for _ in 0..2_000 {
+                assert!(
+                    overlay
+                        .map_generated_position(&shadow_path, position)
+                        .is_some()
+                );
+            }
+            started.elapsed()
+        };
+        time(early);
+        let (early_took, late_took) = (time(early), time(late));
+        assert!(
+            late_took < early_took * 4 + std::time::Duration::from_millis(50),
+            "2,000 late positions took {late_took:?}, 2,000 early ones {early_took:?}"
+        );
     }
 }

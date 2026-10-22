@@ -78,6 +78,8 @@ struct MapperCaches<'a> {
     overlays: RefCell<BTreeMap<String, (PathBuf, Option<usize>)>>,
     /// [`FoldingTexts`] by shadow URI, with the source path they are for.
     folding: RefCell<BTreeMap<String, (PathBuf, Option<Rc<FoldingTexts<'a>>>)>>,
+    /// The document a URI names ([`TsgoResponseMapper::uri_context`]).
+    contexts: RefCell<BTreeMap<String, Option<RequestDocumentContext>>>,
 }
 
 impl MapperCaches<'_> {
@@ -85,6 +87,7 @@ impl MapperCaches<'_> {
         Self {
             overlays: RefCell::new(BTreeMap::new()),
             folding: RefCell::new(BTreeMap::new()),
+            contexts: RefCell::new(BTreeMap::new()),
         }
     }
 }
@@ -583,7 +586,7 @@ impl<'a> TsgoResponseMapper<'a> {
                 Direction::ShadowToSource => alias.source_uri.as_str().to_string(),
             };
         }
-        let Some(context) = document_context_for_uri_in(self.overlays, uri) else {
+        let Some(context) = self.uri_context(uri) else {
             return uri.to_string();
         };
         match direction {
@@ -792,6 +795,22 @@ impl<'a> TsgoResponseMapper<'a> {
         true
     }
 
+    /// The document a URI names, found once per message: each overlay's
+    /// lookup canonicalizes the path on disk, and a plain script is read
+    /// from it, where a symbol or location list names the same URI once per
+    /// item.
+    fn uri_context(&self, uri: &str) -> Option<RequestDocumentContext> {
+        if let Some(context) = self.caches.contexts.borrow().get(uri) {
+            return context.clone();
+        }
+        let context = document_context_for_uri_in(self.overlays, uri);
+        self.caches
+            .contexts
+            .borrow_mut()
+            .insert(uri.to_string(), context.clone());
+        context
+    }
+
     /// The overlay that serves a document, found once per message: each
     /// overlay's lookup canonicalizes the source path on disk.
     fn overlay_for_context(&self, context: &RequestDocumentContext) -> Option<&'a TsgoOverlay> {
@@ -822,7 +841,7 @@ impl<'a> TsgoResponseMapper<'a> {
     fn context_for_uri(&self, uri: &str) -> Option<RequestDocumentContext> {
         self.alias_for_uri(uri)
             .map(|alias| alias.projection.clone())
-            .or_else(|| document_context_for_uri_in(self.overlays, uri))
+            .or_else(|| self.uri_context(uri))
     }
 
     fn object_document_context(
