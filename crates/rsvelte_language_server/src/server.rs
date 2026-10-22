@@ -6447,8 +6447,11 @@ fn adjust_diagnostic_messages(result: &mut serde_json::Value) {
 /// which maps to the tag as a whole, and TypeScript reports a syntax error in
 /// that generated header only when a half-typed statement hoisted above it
 /// (`import {`, `type T = {`) left a bracket open and swallowed it. The
-/// author's own error is reported where it was typed. Semantic errors there
-/// are kept: one in the props type the header copies is the author's.
+/// author's own error is reported where it was typed. A syntax error in a
+/// `generics="…"` value, which the header copies as the render function's
+/// type parameters, is the author's and stays (review 5: with it dropped, a
+/// malformed value showed only a "Cannot find name 'T'" it caused), as do
+/// semantic errors: one in the props type the header copies is the author's.
 fn drop_syntax_errors_in_script_tags(result: &mut serde_json::Value, text: &str) {
     let Some(items) = result
         .get_mut("items")
@@ -6456,31 +6459,24 @@ fn drop_syntax_errors_in_script_tags(result: &mut serde_json::Value, text: &str)
     else {
         return;
     };
-    let opening_tags = crate::context::EmbeddedRegions::new(text)
-        .scripts()
-        .iter()
-        .filter_map(|body| {
-            let open = text.get(..body.start)?.rfind("<script")?;
-            Some(open..body.start)
-        })
-        .collect::<Vec<_>>();
-    if opening_tags.is_empty() {
+    let syntax = |item: &serde_json::Value| {
+        item.get("code")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|code| (1000..2000).contains(&code))
+    };
+    if !items.iter().any(syntax) {
         return;
     }
+    let tags = ScriptOpeningTags::new(text);
     let index = LineIndex::new(text);
     items.retain(|item| {
-        let syntax = item
-            .get("code")
-            .and_then(serde_json::Value::as_i64)
-            .is_some_and(|code| (1000..2000).contains(&code));
         let Some(start) = item
             .pointer("/range/start")
             .and_then(|start| serde_json::from_value::<Position>(start.clone()).ok())
         else {
             return true;
         };
-        let offset = index.offset(text, start);
-        !(syntax && opening_tags.iter().any(|tag| tag.contains(&offset)))
+        !(syntax(item) && tags.covers(index.offset(text, start)))
     });
 }
 
@@ -6954,6 +6950,45 @@ mod diagnostic_message_tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(kept, ["1003@1:9", "2304@0:1", "1005@4:3"]);
+    }
+
+    /// The header copies a `generics="…"` value as the render function's type
+    /// parameters, so a syntax error there is the author's and stays (review
+    /// 5); one elsewhere in the tag still goes.
+    #[test]
+    fn syntax_errors_in_a_generics_value_are_kept() {
+        let text = "<script lang=\"ts\" generics=\"T extends \">\n\tlet { item }: { item: T } = $props();\n</script>\n<p>{String(item)}</p>\n";
+        let value = u32::try_from(text.find("T extends").unwrap()).unwrap();
+        let end = value + u32::try_from("T extends ".len()).unwrap();
+        let item = |code: i64, character: u32| {
+            serde_json::json!({
+                "code": code,
+                "message": format!("{code}"),
+                "range": {
+                    "start": { "line": 0, "character": character },
+                    "end": { "line": 0, "character": character },
+                },
+            })
+        };
+        let mut result = serde_json::json!({
+            "kind": "full",
+            "items": [item(1110, end), item(1005, value), item(1005, 1), item(2304, 1)],
+        });
+        drop_syntax_errors_in_script_tags(&mut result, text);
+        let kept = result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| format!("{}@{}", item["code"], item["range"]["start"]["character"]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            [
+                format!("1110@{end}"),
+                format!("1005@{value}"),
+                "2304@1".to_string()
+            ]
+        );
     }
 
     fn messages(items: serde_json::Value) -> Vec<String> {
