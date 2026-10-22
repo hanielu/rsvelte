@@ -11,8 +11,9 @@
 //! module says tsrs loops on without sending them.
 //!
 //! What loops, as measured against tsrs (`tests/data/tsrs-lost-requests.json`:
-//! 398 requests, every loop among them found, and no request that is answered
-//! counted as one except a signature help next to a call's parentheses):
+//! 470 requests, every loop among them found, and no request that is answered
+//! counted as one except a signature help next to a call's parentheses and a
+//! type assertion a `.tsx` file reads as an element):
 //! both requests walk back from the position over the tokens a type argument
 //! list can hold, to decide whether a `<` before it opens one (Strada's
 //! `getPossibleTypeArgumentsInfo`), and completion repeats the walk from the
@@ -196,13 +197,14 @@ const OPERATORS: &[&str] = &[
 
 impl Tokens {
     /// TypeScript's tokens, near enough for the walk: a `>` is always one
-    /// token (the scanner's, before the parser rescans `>>` or `>=`), a `/`
-    /// never starts a regular expression, and a private name (`#a`) is a `#`
-    /// and a word. A template's text is a token up to each `${`, and the `}`
-    /// that ends a substitution (the one that closes no `{` opened in it)
-    /// continues it, as the scanner reads it again for the parser; a `;` in a
-    /// substitution ends the template instead (the parser gives up on its
-    /// expression there, and a later `}` is a plain one).
+    /// token (the scanner's, before the parser rescans `>>` or `>=`), and a
+    /// private name (`#a`) is a `#` and a word. A template's text is a token
+    /// up to each `${`, and the `}` that ends a substitution (the one that
+    /// closes no `{` opened in it) continues it, as the scanner reads it again
+    /// for the parser; a `;` in a substitution ends the template instead (the
+    /// parser gives up on its expression there, and a later `}` is a plain
+    /// one). A `/` where an expression starts begins a regular expression
+    /// ([`slash_starts_regex`], [`regex_end`]), a token the walk stops at.
     fn new(text: &str) -> Self {
         let bytes = text.as_bytes();
         let mut list = Vec::new();
@@ -233,6 +235,18 @@ impl Tokens {
                     .find("*/")
                     .map_or(bytes.len(), |close| at + 2 + close + 2);
                 comments.push(start..at);
+                continue;
+            }
+            // Read as division, a regular expression's quote would open a
+            // string, and its `//` or `/*` a comment, that hides the walk's
+            // tokens (review 6: `/'/` on the line of a loop the model missed).
+            if character == '/' && slash_starts_regex(text, list.last()) {
+                at = regex_end(text, at);
+                list.push(Token {
+                    kind: Kind::Other,
+                    start,
+                    end: at,
+                });
                 continue;
             }
             let kind = match character {
@@ -358,6 +372,87 @@ fn template_text(bytes: &[u8], mut from: usize) -> (usize, bool) {
         }
     }
     (bytes.len(), false)
+}
+
+/// Whether a `/` after `previous` starts a regular expression, which the
+/// parser decides (it rescans the `/` where it reads an expression): after a
+/// value (a word, a literal, `)`, `]`, a whole template, `++` or `--`) it
+/// divides, and after a `<` it is no expression's start either (a type
+/// assertion's type or a closing tag follows: `lsfuzz2.mjs` seed 12's
+/// `</scripi<…`); at the start, after an operator, an opener, a `,`, a
+/// keyword that is no value or a `}` (a block's end: a statement starts
+/// there) it begins one.
+fn slash_starts_regex(text: &str, previous: Option<&Token>) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    let source = &text[previous.start..previous.end];
+    match previous.kind {
+        Kind::Word | Kind::Literal | Kind::LessThan | Kind::Close(b')' | b']') => false,
+        Kind::Reserved => !matches!(source, "this" | "super" | "null"),
+        Kind::Other => !(source.ends_with('`') || source == "++" || source == "--"),
+        _ => true,
+    }
+}
+
+/// The end of the regular expression whose `/` is at `slash`, as
+/// TypeScript's scanner reads it (`reScanSlashToken`): to the `/` that is
+/// neither escaped nor in a class, then its flags. One that a line ends
+/// first ends at the first bracket it does not open (outside a class, a
+/// `{…}` quantifier and its own groups), before the spaces and `;`s ahead
+/// of that bracket, so a half-typed `/'; }` leaves the `}` to the script.
+fn regex_end(text: &str, slash: usize) -> usize {
+    let bytes = text.as_bytes();
+    let body = slash + 1;
+    let mut at = body;
+    let mut escaped = false;
+    let mut class = false;
+    while at < bytes.len() && !starts_line_break(bytes, at) {
+        match bytes[at] {
+            _ if escaped => escaped = false,
+            b'/' if !class => return skip_word(text, at + 1),
+            b'[' => class = true,
+            b'\\' => escaped = true,
+            b']' => class = false,
+            _ => {}
+        }
+        at += 1;
+    }
+    let line_end = at;
+    at = body;
+    escaped = false;
+    let mut class_depth = 0_usize;
+    let mut quantifier = false;
+    let mut group_depth = 0_usize;
+    while at < line_end {
+        match bytes[at] {
+            _ if escaped => escaped = false,
+            b'\\' => escaped = true,
+            b'[' => class_depth += 1,
+            b']' if class_depth > 0 => class_depth -= 1,
+            _ if class_depth > 0 => {}
+            b'{' => quantifier = true,
+            b'}' if quantifier => quantifier = false,
+            _ if quantifier => {}
+            b'(' => group_depth += 1,
+            b')' if group_depth > 0 => group_depth -= 1,
+            b')' | b']' | b'}' => break,
+            _ => {}
+        }
+        at += 1;
+    }
+    while at > body && (bytes[at - 1] == b';' || bytes[at - 1].is_ascii_whitespace()) {
+        at -= 1;
+    }
+    at
+}
+
+/// Whether a line break (one TypeScript's scanner ends a line at: `\n`,
+/// `\r`, U+2028 or U+2029) starts at the UTF-8 offset `at`.
+fn starts_line_break(bytes: &[u8], at: usize) -> bool {
+    matches!(bytes[at], b'\n' | b'\r')
+        || bytes[at..].starts_with(&[0xE2, 0x80, 0xA8])
+        || bytes[at..].starts_with(&[0xE2, 0x80, 0xA9])
 }
 
 fn is_word_character(character: char) -> bool {
@@ -531,11 +626,15 @@ mod tests {
         assert!(missed.is_empty(), "loops not found: {missed:#?}");
         // A signature help next to a call's parentheses is answered for the
         // call without the walk; the model, which reads no syntax tree, walks.
+        // In a `.tsx` file `<any>b` opens an element, whose text the model
+        // reads as script.
         assert!(
-            wrong.iter().all(|at| at.starts_with("signatureHelp")),
+            wrong
+                .iter()
+                .all(|at| at.starts_with("signatureHelp") || at.contains("<any>b")),
             "answered requests counted as loops: {wrong:#?}"
         );
-        assert!(wrong.len() <= 5, "{wrong:#?}");
+        assert!(wrong.len() <= 7, "{wrong:#?}");
     }
 
     #[test]
@@ -582,6 +681,62 @@ mod tests {
         assert!(completion("x = `a${b}c${d}`;q<w;\n}c{"));
         assert!(!completion("q<w;\n`${}c{"));
         assert!(!completion("q<w;\n}c{`${a}`"));
+    }
+
+    /// A regular expression is one token, wherever a `/` starts an
+    /// expression (review 6: read as a division, the quote in `/'/` opened a
+    /// string to the end of the line and the `/*` in `/\/*/` a comment, which
+    /// hid the loop's brackets, and tsrs looped on a request the model
+    /// cleared); after a value a `/` still divides, and a regular expression
+    /// a line ends leaves the bracket it does not open to the script, as
+    /// TypeScript's scanner does. Each of these is in the measured requests.
+    #[test]
+    fn a_regular_expression_is_read_as_typescript_reads_it() {
+        let completion = |text: &str| {
+            request_loops(
+                "textDocument/completion",
+                text,
+                text.rfind("}c").unwrap() + 2,
+            )
+        };
+        let line = "let a = x < y;\n";
+        for regex in [
+            "/'/",
+            "/\"/",
+            "'a'.replace(/['\"]/g, '')",
+            "/\\/*/",
+            "/https?:\\/\\//",
+            "/[/']/gi",
+            "!/'/.test(a)",
+            "() => /'/",
+            "[/'/]",
+            "a ? /'/ : /\"/",
+            "/'",
+        ] {
+            assert!(
+                completion(&format!("{line}const r = {regex}; }}c{{")),
+                "{regex}"
+            );
+        }
+        assert!(completion(&format!("{line}const r = /\\/*/;\n}}c{{")));
+        assert!(completion(&format!(
+            "{line}if (a) {{}}\n/'/.test(a); }}c{{"
+        )));
+        for division in ["n / 2", "(n) / 2", "m[0] / 2", "`${n}` / 2", "this.v / 2"] {
+            assert!(
+                completion(&format!(
+                    "{line}const d = {division}; const s = \"/\"; }}c{{"
+                )),
+                "{division}"
+            );
+        }
+        // Brackets a regular expression holds are no tokens.
+        let text = "let a = 1 < 2;\nconst r = /[}]/; c{";
+        assert!(!request_loops(
+            "textDocument/completion",
+            text,
+            text.len() - 1
+        ));
     }
 
     #[test]
