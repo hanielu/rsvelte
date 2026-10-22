@@ -251,3 +251,33 @@ fn a_class_or_style_shorthand_keeps_its_name_in_place() {
         assert_maps_in_place(&artifact, source, at, len);
     }
 }
+
+#[test]
+fn a_class_or_style_directive_before_a_later_attribute_keeps_its_mapping() {
+    // The directives are checked after `createElement(…)`, while the source
+    // spells them before an attribute whose expression the call holds.
+    let source = "<script lang=\"ts\">\n\tlet active = $state(false);\n\tlet color = $state(\"red\");\n\tfunction tip(node: HTMLElement) {}\n\tfunction onclick() {}\n</script>\n<p class:active style:color use:tip {onclick}>x</p>\n<p class:active={active} style:color={color} onclick={() => {}}>w</p>\n<svelte:element this={\"div\"} class:active style:color {onclick}>v</svelte:element>\n<p class:active style:color title=\"t\" {onclick} style:--x={color}>u</p>\n<input class:active style:color {onclick} />\n";
+    let artifact = project(source);
+    assert_code_contains(
+        &artifact,
+        &[
+            " {const $$action_0 = __sveltets_2_ensureAction(tip(svelteHTML.mapElementTag('p')));{ svelteHTML.createElement(\"p\", __sveltets_2_union($$action_0), {    onclick,});active;__sveltets_2_ensureType(String, Number, color);  }}\n",
+            " { svelteHTML.createElement(\"p\", {    \"onclick\":() => {},});active;__sveltets_2_ensureType(String, Number, color);  }\n",
+            " { svelteHTML.createElement(\"div\", {    onclick,});active;__sveltets_2_ensureType(String, Number, color);  }\n",
+            " { svelteHTML.createElement(\"p\", {     \"title\":`t`,onclick,});active;__sveltets_2_ensureType(String, Number, color);__sveltets_2_ensureType(String, Number, color);  }\n",
+            " { svelteHTML.createElement(\"input\", {    onclick,});active;__sveltets_2_ensureType(String, Number, color);}\n",
+        ],
+    );
+    // Every `active` and `color` in the template is a reference, except a
+    // directive's own name before its `=`.
+    let template = source.find("<p ").unwrap();
+    for name in ["active", "color"] {
+        for (at, _) in source[template..].match_indices(name) {
+            let at = template + at;
+            if source[at + name.len()..].starts_with('=') {
+                continue;
+            }
+            assert_maps_in_place(&artifact, source, at, name.len());
+        }
+    }
+}
