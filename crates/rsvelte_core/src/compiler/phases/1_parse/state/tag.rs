@@ -1575,6 +1575,14 @@ impl<'a> Parser<'a> {
             }
         } else {
             self.skip_pattern_expression();
+            // Nothing typed after the keyword (`{:then }`, which typing
+            // `{:then value}` with an auto-closed `}` passes through): the scan
+            // stops at the `}` and trims the whitespace before it, so it ends
+            // before it started.
+            if self.index <= start {
+                self.index = start;
+                return Ok(None);
+            }
         }
         let content = self.source[start..self.index].trim_ws();
         if content.is_empty() {
