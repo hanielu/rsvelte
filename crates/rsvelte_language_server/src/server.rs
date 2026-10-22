@@ -311,31 +311,58 @@ enum Pending {
     Formatting,
     Completion { tsgo_fallback: Request },
     Hover { tsgo_fallback: Request },
-    CodeAction { tsgo_fallback: Request },
-    CodeLens { tsgo_fallback: Request },
     ExtractComponent,
     CompiledCode,
-    FoldingRange { tsgo_fallback: Request },
     SelectionRange,
-    DocumentSymbol { tsgo_fallback: Request },
-    DocumentDiagnostic { tsgo_fallback: Request },
     FileReferences,
 }
 
 impl Pending {
     /// Whether tsgo is asked once the native worker answers.
     const fn asks_tsgo_next(&self) -> bool {
-        matches!(
-            self,
-            Self::Completion { .. }
-                | Self::Hover { .. }
-                | Self::CodeAction { .. }
-                | Self::CodeLens { .. }
-                | Self::FoldingRange { .. }
-                | Self::DocumentSymbol { .. }
-                | Self::DocumentDiagnostic { .. }
-        )
+        matches!(self, Self::Completion { .. } | Self::Hover { .. })
     }
+}
+
+/// A request whose tsgo half went out when it arrived, while the worker
+/// computes its native half (a diagnostic pull, code actions, code lenses,
+/// folding ranges, document symbols: tsgo is asked whatever the worker
+/// finds, and the two answers are merged). Whichever half comes back first
+/// waits here for the other, so an edit that follows such a request never
+/// waits for its native half, and tsgo never sees the edit first.
+struct Join {
+    method: &'static str,
+    first: Option<JoinHalf>,
+}
+
+enum JoinHalf {
+    /// The worker's answer, the fallback when tsgo has none.
+    Native(Option<serde_json::Value>),
+    /// tsgo's answer, already mapped back to the source.
+    Tsgo(Response),
+}
+
+impl Join {
+    const fn new(method: &'static str) -> Self {
+        Self {
+            method,
+            first: None,
+        }
+    }
+}
+
+/// tsgo's answer to a joined request with the worker's merged in, as
+/// [`Server::on_tsgo_message`] merges a fallback: the worker's items first,
+/// and the worker's answer alone when tsgo failed.
+fn joined(method: &str, mut response: Response, native: Option<serde_json::Value>) -> Response {
+    let Some(native) = native else {
+        return response;
+    };
+    match &mut response.response_result {
+        Ok(result) => merge_tsgo_result(method, result, native),
+        Err(_) => response.response_result = Ok(native),
+    }
+    response
 }
 
 struct PendingTsgoRequest {
@@ -1023,6 +1050,7 @@ struct Server {
     /// The content hash each document was last linted at.
     linted: HashMap<String, u64>,
     pending: HashMap<RequestId, Pending>,
+    joins: HashMap<RequestId, Join>,
     pending_tsgo: HashMap<RequestId, PendingTsgoRequest>,
     /// tsgo's own completion `data`, by entry name, for the sites whose items
     /// currently carry upstream's `{name, uri, position}` payload instead.
@@ -1098,6 +1126,7 @@ impl Server {
             scheduled: HashMap::new(),
             linted: HashMap::new(),
             pending: HashMap::new(),
+            joins: HashMap::new(),
             pending_tsgo: HashMap::new(),
             completion_data: HashMap::new(),
             completion_order: Vec::new(),
@@ -1362,10 +1391,8 @@ impl Server {
             self.forward_tsgo_request(tsgo_fallback);
             return;
         }
-        self.pending
-            .insert(id.clone(), Pending::DocumentDiagnostic { tsgo_fallback });
         self.worker.submit(Job::PullDiagnostics {
-            id,
+            id: id.clone(),
             path: uri_to_path(uri.as_str()),
             text: document.shared_text(),
             preprocessed: self.preprocessed_analysis(&uri_to_path(uri.as_str()), document.version),
@@ -1373,6 +1400,7 @@ impl Server {
             svelte_diagnostics: self.settings.svelte.enable && self.settings.svelte.diagnostics,
             css_diagnostics: self.settings.css.enable && self.settings.css.diagnostics,
         });
+        self.join(id, tsgo_fallback);
     }
 
     fn on_completion(&mut self, request: Request) {
@@ -1939,9 +1967,8 @@ impl Server {
                 kinds.contains(&CodeActionKind::from(crate::code_actions::FIX_ALL_KIND))
             }),
         };
-        self.pending
-            .insert(id, Pending::CodeAction { tsgo_fallback });
         self.worker.submit(job);
+        self.join(id, tsgo_fallback);
     }
 
     fn on_code_lens(&mut self, request: Request) {
@@ -1956,9 +1983,12 @@ impl Server {
         let Some((path, text)) = self.component(&params.text_document.uri) else {
             return self.forward_tsgo_request(tsgo_fallback);
         };
-        self.pending
-            .insert(id.clone(), Pending::CodeLens { tsgo_fallback });
-        self.worker.submit(Job::CodeLens { id, path, text });
+        self.worker.submit(Job::CodeLens {
+            id: id.clone(),
+            path,
+            text,
+        });
+        self.join(id, tsgo_fallback);
     }
 
     fn on_resolve_code_lens(&mut self, request: Request) {
@@ -2126,14 +2156,13 @@ impl Server {
         }
         match self.component(&params.text_document.uri) {
             Some((path, text)) => {
-                self.pending
-                    .insert(id.clone(), Pending::FoldingRange { tsgo_fallback });
                 self.worker.submit(Job::FoldingRange {
-                    id,
+                    id: id.clone(),
                     path,
                     text,
                     line_folding_only: self.client.line_folding_only,
                 });
+                self.join(id, tsgo_fallback);
             }
             None => self.forward_tsgo_request(tsgo_fallback),
         }
@@ -2203,15 +2232,14 @@ impl Server {
         let uri = params.text_document.uri;
         match self.component(&uri) {
             Some((path, text)) => {
-                self.pending
-                    .insert(id.clone(), Pending::DocumentSymbol { tsgo_fallback });
                 self.worker.submit(Job::DocumentSymbol {
-                    id,
+                    id: id.clone(),
                     uri,
                     path,
                     text,
                     hierarchical: self.client.hierarchical_document_symbols,
                 });
+                self.join(id, tsgo_fallback);
             }
             None => self.forward_tsgo_request(tsgo_fallback),
         }
@@ -2462,6 +2490,7 @@ impl Server {
             NumberOrString::String(id) => RequestId::from(id),
         };
         let native = self.pending.remove(&id).is_some();
+        let joined = self.joins.remove(&id).is_some();
         let tsgo = self.pending_tsgo.remove(&id).is_some();
         let rename = self.rename_aggregates.remove(&id).is_some();
         let component = self.component_queries.remove(&id);
@@ -2505,7 +2534,13 @@ impl Server {
             Deferred::Request(request) | Deferred::Forward(request, _) => request.id != id,
             Deferred::PushDiagnostics(..) => true,
         });
-        if native || tsgo || rename || component.is_some() || self.deferred.len() != deferred {
+        if native
+            || joined
+            || tsgo
+            || rename
+            || component.is_some()
+            || self.deferred.len() != deferred
+        {
             self.respond(Response::new_err(
                 id,
                 ErrorCode::RequestCanceled as i32,
@@ -5352,20 +5387,10 @@ impl Server {
                 }
             }
             Outcome::CodeActions { id, actions } => {
-                if let Some(Pending::CodeAction { tsgo_fallback }) = self.pending.remove(&id) {
-                    self.forward_tsgo_request_with_fallback(
-                        tsgo_fallback,
-                        serde_json::to_value(actions).ok(),
-                    );
-                }
+                self.join_native(id, serde_json::to_value(actions).ok());
             }
             Outcome::CodeLenses { id, lenses } => {
-                if let Some(Pending::CodeLens { tsgo_fallback }) = self.pending.remove(&id) {
-                    self.forward_tsgo_request_with_fallback(
-                        tsgo_fallback,
-                        serde_json::to_value(lenses).ok(),
-                    );
-                }
+                self.join_native(id, serde_json::to_value(lenses).ok());
             }
             Outcome::ExtractedComponent { id, result } => {
                 if !matches!(self.pending.remove(&id), Some(Pending::ExtractComponent)) {
@@ -5393,12 +5418,7 @@ impl Server {
                 }
             }
             Outcome::FoldingRanges { id, ranges } => {
-                if let Some(Pending::FoldingRange { tsgo_fallback }) = self.pending.remove(&id) {
-                    self.forward_tsgo_request_with_fallback(
-                        tsgo_fallback,
-                        serde_json::to_value(ranges).ok(),
-                    );
-                }
+                self.join_native(id, serde_json::to_value(ranges).ok());
             }
             Outcome::SelectionRanges { id, ranges } => {
                 if self.pending.remove(&id).is_some() {
@@ -5406,34 +5426,26 @@ impl Server {
                 }
             }
             Outcome::DocumentSymbols { id, symbols } => {
-                if let Some(Pending::DocumentSymbol { tsgo_fallback }) = self.pending.remove(&id) {
-                    self.forward_tsgo_request_with_fallback(
-                        tsgo_fallback,
-                        serde_json::to_value(symbols).ok(),
-                    );
-                }
+                self.join_native(id, serde_json::to_value(symbols).ok());
             }
             Outcome::PulledDiagnostics {
                 id,
+                path,
                 mut diagnostics,
             } => {
-                if let Some(Pending::DocumentDiagnostic { tsgo_fallback }) =
-                    self.pending.remove(&id)
-                {
-                    if let Some(uri) = text_document_request_uri(&tsgo_fallback)
-                        && let Some((_, message)) = {
-                            let path = uri_to_path(uri.as_str());
-                            let path = fs::canonicalize(&path).unwrap_or(path);
-                            self.preprocess_failures.get(&path)
-                        }
-                    {
-                        diagnostics.push(crate::diagnostics::preprocess_failure(message));
-                    }
-                    self.forward_tsgo_request_with_fallback(
-                        tsgo_fallback,
-                        serde_json::to_value(diagnostic_report(diagnostics)).ok(),
-                    );
+                if !self.joins.contains_key(&id) {
+                    return;
                 }
+                if let Some((_, message)) = {
+                    let path = fs::canonicalize(&path).unwrap_or(path);
+                    self.preprocess_failures.get(&path)
+                } {
+                    diagnostics.push(crate::diagnostics::preprocess_failure(message));
+                }
+                self.join_native(
+                    id,
+                    serde_json::to_value(diagnostic_report(diagnostics)).ok(),
+                );
             }
             Outcome::FileReferences { id, locations } => {
                 if matches!(self.pending.remove(&id), Some(Pending::FileReferences)) {
@@ -5632,40 +5644,92 @@ impl Server {
         ));
     }
 
-    fn respond_diagnostic_report(&self, id: RequestId, diagnostics: Vec<lsp_types::Diagnostic>) {
+    fn respond_diagnostic_report(
+        &mut self,
+        id: RequestId,
+        diagnostics: Vec<lsp_types::Diagnostic>,
+    ) {
         self.respond(Response::new_ok(id, diagnostic_report(diagnostics)));
     }
 
-    fn respond_no_edits(&self, id: RequestId) {
+    fn respond_no_edits(&mut self, id: RequestId) {
         self.respond(Response::new_ok(id, Vec::<TextEdit>::new()));
     }
 
     /// A request with nothing to offer is answered with `null`, not an error.
-    fn respond_nothing(&self, id: RequestId) {
+    fn respond_nothing(&mut self, id: RequestId) {
         self.respond(Response::new_ok(id, serde_json::Value::Null));
     }
 
-    fn respond_no_actions(&self, id: RequestId) {
+    fn respond_no_actions(&mut self, id: RequestId) {
         self.respond(Response::new_ok(id, Vec::<CodeActionOrCommand>::new()));
     }
 
-    fn respond_no_lenses(&self, id: RequestId) {
+    fn respond_no_lenses(&mut self, id: RequestId) {
         self.respond(Response::new_ok(id, Vec::<CodeLens>::new()));
     }
 
-    fn respond_no_ranges(&self, id: RequestId) {
+    fn respond_no_ranges(&mut self, id: RequestId) {
         self.respond(Response::new_ok(id, Vec::<FoldingRange>::new()));
     }
 
-    fn respond_no_symbols(&self, id: RequestId) {
+    fn respond_no_symbols(&mut self, id: RequestId) {
         self.respond(Response::new_ok(
             id,
             DocumentSymbolResponse::Nested(Vec::new()),
         ));
     }
 
-    fn respond(&self, response: Response) {
+    /// Answer the editor. tsgo's answer to a request whose native half is
+    /// still being computed waits for it ([`Join`]).
+    fn respond(&mut self, response: Response) {
+        let response = match self.joins.get_mut(&response.id) {
+            None => response,
+            Some(join) => match join.first.take() {
+                None | Some(JoinHalf::Tsgo(_)) => {
+                    join.first = Some(JoinHalf::Tsgo(response));
+                    return;
+                }
+                Some(JoinHalf::Native(native)) => {
+                    let method = join.method;
+                    self.joins.remove(&response.id);
+                    joined(method, response, native)
+                }
+            },
+        };
         self.send(response);
+    }
+
+    /// Send a joined request's tsgo half, as the editor sent it, while the
+    /// worker computes its native half ([`Join`]).
+    fn join(&mut self, id: RequestId, request: Request) {
+        let method = match request.method.as_str() {
+            "textDocument/diagnostic" => "textDocument/diagnostic",
+            "textDocument/codeAction" => "textDocument/codeAction",
+            "textDocument/codeLens" => "textDocument/codeLens",
+            "textDocument/foldingRange" => "textDocument/foldingRange",
+            "textDocument/documentSymbol" => "textDocument/documentSymbol",
+            other => unreachable!("{other} is not a joined request"),
+        };
+        self.joins.insert(id, Join::new(method));
+        self.forward_tsgo_request(request);
+    }
+
+    /// The worker's half of a joined request: the answer goes out if tsgo's
+    /// is in, and otherwise waits for it.
+    fn join_native(&mut self, id: RequestId, native: Option<serde_json::Value>) {
+        let Some(join) = self.joins.get_mut(&id) else {
+            // Cancelled.
+            return;
+        };
+        match join.first.take() {
+            None | Some(JoinHalf::Native(_)) => join.first = Some(JoinHalf::Native(native)),
+            Some(JoinHalf::Tsgo(response)) => {
+                let method = join.method;
+                self.joins.remove(&id);
+                self.send(joined(method, response, native));
+            }
+        }
     }
 
     fn send(&self, message: impl Into<Message>) {

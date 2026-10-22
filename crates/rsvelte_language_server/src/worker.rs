@@ -9,8 +9,18 @@
 //!
 //! The resolved-config caches live here too, so the loop never touches the
 //! filesystem.
+//!
+//! Jobs run on two lanes, each a thread with its own caches. The analysis
+//! lane runs the linter over a whole document (pushed and pulled diagnostics,
+//! code actions) and walks the workspace for file references: tens to
+//! hundreds of milliseconds on a large component. Everything else, what the
+//! editor waits for while the user types (completion, hover, symbols,
+//! folding, …), runs on the other lane and never queues behind an analysis.
+//! An analysis that a newer one of the same document already waits behind is
+//! not run: a stale pull is answered with the newer pull's result, a stale
+//! pushed lint is dropped.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -196,6 +206,7 @@ pub enum Outcome {
     },
     PulledDiagnostics {
         id: RequestId,
+        path: PathBuf,
         diagnostics: Vec<Diagnostic>,
     },
     FileReferences {
@@ -211,42 +222,39 @@ pub struct FileReferenceSource {
 }
 
 pub struct Worker {
-    jobs: Option<Sender<Job>>,
-    handle: Option<JoinHandle<()>>,
+    /// Requests the editor waits on while typing.
+    quick: Lane,
+    /// Whole-document lints and workspace walks.
+    analysis: Lane,
     stopping: Arc<AtomicBool>,
 }
 
-impl Worker {
-    /// # Panics
-    ///
-    /// Panics if the analysis worker thread cannot be spawned.
-    #[must_use]
-    pub fn spawn(outcomes: Sender<Outcome>) -> Self {
+struct Lane {
+    jobs: Option<Sender<Job>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Lane {
+    fn spawn(name: &str, outcomes: Sender<Outcome>, stopping: Arc<AtomicBool>) -> Self {
         let (jobs, receiver) = unbounded();
-        let stopping = Arc::new(AtomicBool::new(false));
-        let worker_stopping = Arc::clone(&stopping);
         let handle = std::thread::Builder::new()
-            .name("rsvelte-analysis".to_string())
+            .name(name.to_string())
             .stack_size(STACK_SIZE)
-            .spawn(move || run(&receiver, &outcomes, &worker_stopping))
-            .expect("spawn the analysis worker");
+            .spawn(move || run(&receiver, &outcomes, &stopping))
+            .expect("spawn an analysis worker");
         Self {
             jobs: Some(jobs),
             handle: Some(handle),
-            stopping,
         }
     }
 
-    pub fn submit(&self, job: Job) {
+    fn submit(&self, job: Job) {
         if let Some(jobs) = &self.jobs {
             let _ = jobs.send(job);
         }
     }
-}
 
-impl Drop for Worker {
-    fn drop(&mut self) {
-        self.stopping.store(true, Ordering::Release);
+    fn stop(&mut self) {
         self.jobs.take();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -254,13 +262,83 @@ impl Drop for Worker {
     }
 }
 
+impl Worker {
+    /// # Panics
+    ///
+    /// Panics if an analysis worker thread cannot be spawned.
+    #[must_use]
+    pub fn spawn(outcomes: Sender<Outcome>) -> Self {
+        let stopping = Arc::new(AtomicBool::new(false));
+        Self {
+            quick: Lane::spawn("rsvelte-analysis", outcomes.clone(), Arc::clone(&stopping)),
+            analysis: Lane::spawn("rsvelte-diagnostics", outcomes, Arc::clone(&stopping)),
+            stopping,
+        }
+    }
+
+    pub fn submit(&self, job: Job) {
+        match job {
+            Job::ClearCaches => {
+                self.quick.submit(Job::ClearCaches);
+                self.analysis.submit(Job::ClearCaches);
+            }
+            Job::Lint { .. }
+            | Job::PullDiagnostics { .. }
+            | Job::CodeAction { .. }
+            | Job::FileReferences { .. } => self.analysis.submit(job),
+            job => self.quick.submit(job),
+        }
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        self.quick.stop();
+        self.analysis.stop();
+    }
+}
+
+/// Whether `job` is an analysis a job queued after it makes pointless: a pull
+/// or a pushed lint of the same document.
+fn superseded(job: &Job, queued: &VecDeque<Job>) -> bool {
+    match job {
+        Job::PullDiagnostics { path, .. } => queued.iter().any(
+            |later| matches!(later, Job::PullDiagnostics { path: later, .. } if later == path),
+        ),
+        Job::Lint { key, .. } => queued
+            .iter()
+            .any(|later| matches!(later, Job::Lint { key: later, .. } if later == key)),
+        _ => false,
+    }
+}
+
 fn run(jobs: &Receiver<Job>, outcomes: &Sender<Outcome>, stopping: &AtomicBool) {
     let mut lint_configs = LintConfigCache::default();
     let mut format_sessions = FormatSessions::default();
+    let mut queued = VecDeque::new();
+    // Pulls answered with the result of a later pull of the same document.
+    let mut stale_pulls = HashMap::<PathBuf, Vec<RequestId>>::new();
 
-    for job in jobs {
+    loop {
+        if queued.is_empty() {
+            let Ok(job) = jobs.recv() else {
+                break;
+            };
+            queued.push_back(job);
+        }
+        queued.extend(jobs.try_iter());
+        let Some(job) = queued.pop_front() else {
+            continue;
+        };
         if stopping.load(Ordering::Acquire) {
             break;
+        }
+        if superseded(&job, &queued) {
+            if let Job::PullDiagnostics { id, path, .. } = job {
+                stale_pulls.entry(path).or_default().push(id);
+            }
+            continue;
         }
         let outcome = match job {
             Job::ClearCaches => {
@@ -498,7 +576,18 @@ fn run(jobs: &Receiver<Job>, outcomes: &Sender<Outcome>, stopping: &AtomicBool) 
                     diagnostics
                 })
                 .unwrap_or_default();
-                Outcome::PulledDiagnostics { id, diagnostics }
+                for stale in stale_pulls.remove(&path).unwrap_or_default() {
+                    let _ = outcomes.send(Outcome::PulledDiagnostics {
+                        id: stale,
+                        path: path.clone(),
+                        diagnostics: diagnostics.clone(),
+                    });
+                }
+                Outcome::PulledDiagnostics {
+                    id,
+                    path,
+                    diagnostics,
+                }
             }
             Job::FileReferences {
                 id,
@@ -687,5 +776,138 @@ fn guard<T>(what: &str, path: &Path, run: impl FnOnce() -> T) -> Option<T> {
     } else {
         log::warn(format_args!("{what} panicked on {}", path.display()));
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Job, Outcome, Worker};
+    use crate::settings::CompilerWarnings;
+    use crossbeam_channel::{Receiver, unbounded};
+    use lsp_server::RequestId;
+    use std::fmt::Write as _;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A component whose lint takes long enough that a job submitted right
+    /// after it is still queued when the worker comes back.
+    fn large_component() -> Arc<String> {
+        let mut text = "<script lang=\"ts\">\n".to_string();
+        let mut template = String::new();
+        for index in 0..1_500 {
+            writeln!(text, "\tlet v{index} = $state({index});").unwrap();
+            writeln!(template, "<div class=\"r{index}\">{{v{index}}}</div>").unwrap();
+        }
+        text.push_str("</script>\n");
+        text.push_str(&template);
+        Arc::new(text)
+    }
+
+    fn pull(id: i32, path: &str, text: Arc<String>) -> Job {
+        Job::PullDiagnostics {
+            id: RequestId::from(id),
+            path: std::env::temp_dir().join(path),
+            text,
+            preprocessed: None,
+            warnings: CompilerWarnings::default(),
+            svelte_diagnostics: true,
+            css_diagnostics: true,
+        }
+    }
+
+    fn next(outcomes: &Receiver<Outcome>) -> Outcome {
+        outcomes
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the worker answers")
+    }
+
+    /// The editor waits on a completion while it types; the analysis of the
+    /// previous keystroke's text (a diagnostic pull of a large component)
+    /// runs on its own lane and does not hold it up.
+    #[test]
+    fn a_completion_does_not_wait_for_the_analysis_of_a_large_component() {
+        let (sender, outcomes) = unbounded();
+        let worker = Worker::spawn(sender);
+        let text = large_component();
+        worker.submit(pull(1, "Large.svelte", Arc::clone(&text)));
+        worker.submit(Job::Complete {
+            id: RequestId::from(2),
+            path: PathBuf::from("Large.svelte"),
+            text,
+            offset: 0,
+            strict_mode: false,
+            markdown_documentation: true,
+        });
+        assert!(
+            matches!(next(&outcomes), Outcome::Completed { id, .. } if id == RequestId::from(2)),
+            "the completion is answered first"
+        );
+        assert!(matches!(
+            next(&outcomes),
+            Outcome::PulledDiagnostics { id, .. } if id == RequestId::from(1)
+        ));
+    }
+
+    /// Pulls of one document that pile up behind an analysis are not each
+    /// analysed: an earlier one is answered with the newest one's result,
+    /// before it. A pushed lint a newer one of its document follows is
+    /// dropped.
+    #[test]
+    fn a_pull_a_later_pull_of_its_document_follows_gets_that_ones_result() {
+        let (sender, outcomes) = unbounded();
+        let worker = Worker::spawn(sender);
+        worker.submit(pull(1, "Large.svelte", large_component()));
+        let clean = Arc::new("<p>clean</p>\n".to_string());
+        let warned = Arc::new("<img src=\"a.png\">\n".to_string());
+        worker.submit(pull(2, "Small.svelte", clean));
+        worker.submit(pull(3, "Small.svelte", Arc::clone(&warned)));
+        let lint = |version: i32, text: Arc<String>| Job::Lint {
+            key: "small".to_string(),
+            uri: "file:///Small.svelte".parse().unwrap(),
+            version,
+            path: std::env::temp_dir().join("Small.svelte"),
+            text,
+            preprocessed: None,
+            warnings: CompilerWarnings::default(),
+            svelte_diagnostics: true,
+            css_diagnostics: true,
+        };
+        worker.submit(lint(1, Arc::new("<p>clean</p>\n".to_string())));
+        worker.submit(lint(2, warned));
+
+        let mut answered = Vec::new();
+        while answered.len() < 4 {
+            match next(&outcomes) {
+                Outcome::PulledDiagnostics {
+                    id, diagnostics, ..
+                } => answered.push((format!("pull {id}"), diagnostics)),
+                Outcome::Diagnostics {
+                    version,
+                    diagnostics,
+                    ..
+                } => answered.push((format!("lint {version}"), diagnostics)),
+                _ => panic!("unexpected outcome"),
+            }
+        }
+        let names = answered
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["pull 1", "pull 2", "pull 3", "lint 2"]);
+        let warning = |diagnostics: &[lsp_types::Diagnostic]| {
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("alt"))
+        };
+        assert!(warning(&answered[2].1), "{:?}", answered[2].1);
+        assert_eq!(
+            answered[1].1, answered[2].1,
+            "the earlier pull gets the later one's result"
+        );
+        assert!(
+            outcomes.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the first lint is never run"
+        );
     }
 }

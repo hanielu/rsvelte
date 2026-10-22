@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -1255,6 +1256,86 @@ fn a_request_sent_before_an_edit_reaches_tsgo_before_it() {
             "round {round}: every hover reaches tsgo before the edit: {lines:?}"
         );
     }
+    server.shutdown();
+}
+
+/// A diagnostic pull asks tsgo when it arrives, while the worker analyses the
+/// component, and the answer merges both. An edit that follows it does not
+/// wait for that analysis (a large component's takes tens of milliseconds in
+/// a release build), and a hover sent after the edit is not queued behind
+/// it: typing in a large component used to wait for the previous
+/// keystroke's analysis at every keystroke.
+#[cfg(unix)]
+#[test]
+fn an_edit_after_a_diagnostic_pull_waits_for_neither_of_its_halves() {
+    let dir = TestDir::new("pull-joins-its-halves");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = fs::canonicalize(&dir.0).unwrap().join("ws");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    fs::write(root.join("tsconfig.json"), "{}").unwrap();
+    let mut text = "<script lang=\"ts\">\n\tconst later: number = 1;\n".to_string();
+    let mut template = "<img src=\"a.png\">\n".to_string();
+    for index in 0..1_500 {
+        writeln!(text, "\tlet v{index} = $state({index});").unwrap();
+        writeln!(template, "<div class=\"r{index}\">{{v{index}}}</div>").unwrap();
+    }
+    text.push_str("</script>\n");
+    text.push_str(&template);
+    fs::write(root.join("P.svelte"), &text).unwrap();
+    let mut server = Server::start_with_settings(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+    );
+    let uri = file_uri(&root.join("P.svelte"));
+    server.open(&uri, &text);
+    hover(&mut server, &uri);
+    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/P.svelte.tsx"));
+
+    let pull = server.request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    text.insert_str(0, "<!-- top -->\n");
+    server.change(&uri, 2, &text);
+    let hovered = server.request(
+        "textDocument/hover",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 2, "character": 8 } }),
+    );
+    assert!(
+        server
+            .response(hovered, Duration::from_secs(30))
+            .to_string()
+            .contains("recorded")
+    );
+    assert!(
+        !server.buffered.contains_key(&pull),
+        "the hover after the edit is answered before the pull's analysis is done"
+    );
+    let report = server.response(pull, Duration::from_secs(60));
+    assert!(
+        report["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["message"].as_str().unwrap().contains("alt")),
+        "the worker's diagnostics are in the answer: {report}"
+    );
+    let lines = traffic(&log);
+    let asked = lines
+        .iter()
+        .position(|line| line == &format!("textDocument/diagnostic {shadow}"))
+        .expect("tsgo was asked");
+    let edit = lines
+        .iter()
+        .rposition(|line| line == &format!("textDocument/didChange {shadow}"))
+        .expect("the edit reached tsgo");
+    assert!(asked < edit, "{lines:?}");
     server.shutdown();
 }
 
