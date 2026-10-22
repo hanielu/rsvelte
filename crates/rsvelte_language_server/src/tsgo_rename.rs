@@ -726,31 +726,46 @@ fn visit_workspace_edits(edit: &Value, mut visit: impl FnMut(&str, &Value)) {
     }
 }
 
+/// The editor's WorkspaceEdit, at most one edit for any stretch of a document.
+/// An editor applies a document's edits together, so two that overlap (or
+/// two insertions at one point) fail the rename or are applied over each
+/// other. The same edit can come several times (from a component's owner and
+/// from the copies other projects keep, or from a follow-up query): it is
+/// kept once. Of two that differ, the first is kept: the primary answer's,
+/// which [`merge_workspace_edits`] takes first.
 fn workspace_edit(edits: Vec<EditorEdit>) -> Value {
-    let mut seen = BTreeSet::new();
-    let mut changes: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    let mut changes: BTreeMap<String, Vec<(Range, String)>> = BTreeMap::new();
     for edit in edits {
-        let key = (
-            edit.uri.clone(),
-            edit.range.start.line,
-            edit.range.start.character,
-            edit.range.end.line,
-            edit.range.end.character,
-            edit.new_text.clone(),
-        );
-        if !seen.insert(key) {
+        let kept = changes.entry(edit.uri).or_default();
+        if kept
+            .iter()
+            .any(|(range, _)| ranges_conflict(*range, edit.range))
+        {
             continue;
         }
-        changes.entry(edit.uri).or_default().push(json!({
-            "range": range_value(edit.range),
-            "newText": edit.new_text
-        }));
+        kept.push((edit.range, edit.new_text));
     }
     let changes = changes
         .into_iter()
-        .map(|(uri, edits)| (uri, Value::Array(edits)))
+        .map(|(uri, edits)| {
+            let edits = edits
+                .into_iter()
+                .map(
+                    |(range, new_text)| json!({ "range": range_value(range), "newText": new_text }),
+                )
+                .collect();
+            (uri, Value::Array(edits))
+        })
         .collect::<Map<_, _>>();
     json!({ "changes": Value::Object(changes) })
+}
+
+/// Whether two edits of one document touch the same text: the same range
+/// (two insertions at one point included), or ranges that overlap. An
+/// insertion where a replaced range starts or ends does not.
+fn ranges_conflict(a: Range, b: Range) -> bool {
+    let at = |position: Position| (position.line, position.character);
+    a == b || (at(a.start) < at(b.end) && at(b.start) < at(a.end))
 }
 
 fn dedupe_followups(followups: &mut Vec<RenameFollowup>) {
@@ -1133,6 +1148,44 @@ mod tests {
             [Position::new(0, generics), Position::new(1, 8)],
             "{rewritten:?}"
         );
+    }
+
+    /// Two edits of the same text can come from the owner and a copy of a
+    /// component: one that repeats another is kept once, and one that
+    /// replaces any of the same text differently is dropped (the editor would
+    /// apply both or reject the rename); an insertion where a replaced range
+    /// starts is no conflict.
+    #[test]
+    fn edits_of_the_same_text_are_kept_once_and_a_conflicting_one_is_dropped() {
+        let source_uri = uri("file:///Input.svelte");
+        let at = |line, character| Position::new(line, character);
+        let edits = [
+            edit(&source_uri, "Dim", at(1, 15), at(1, 19)),
+            edit(&source_uri, "Dim", at(1, 15), at(1, 19)),
+            edit(&source_uri, "Size as Dim", at(1, 15), at(1, 19)),
+            edit(&source_uri, "x", at(1, 17), at(1, 30)),
+            edit(&source_uri, "y", at(1, 15), at(1, 15)),
+            edit(&source_uri, "z", at(1, 15), at(1, 15)),
+            edit(&source_uri, "Dim", at(2, 1), at(2, 5)),
+        ];
+        let merged = merge_workspace_edits(edits);
+        let kept = merged["changes"][source_uri.as_str()]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|edit| {
+                let range = parse_range(&edit["range"]).unwrap();
+                format!(
+                    "{}:{}-{}:{} {}",
+                    range.start.line,
+                    range.start.character,
+                    range.end.line,
+                    range.end.character,
+                    edit["newText"].as_str().unwrap()
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kept, ["1:15-1:19 Dim", "1:15-1:15 y", "2:1-2:5 Dim"]);
     }
 
     #[test]
