@@ -1106,6 +1106,11 @@ fn an_edit_during_a_probe_answers_the_held_requests_against_the_text_before_it()
             "context": { "includeDeclaration": true },
         }),
     );
+    // A hover in the script: the native worker has nothing, so tsgo answers.
+    let held_hover = server.request(
+        "textDocument/hover",
+        json!({ "textDocument": { "uri": parent_uri }, "position": { "line": 2, "character": 8 } }),
+    );
     server.change(&parent_uri, 2, &format!("<!-- top -->\n{parent}"));
 
     assert!(
@@ -1141,9 +1146,115 @@ fn an_edit_during_a_probe_answers_the_held_requests_against_the_text_before_it()
         "the shadow's own text, and not the edit, comes back before tsgo hears the held request: {lines:?}"
     );
     assert!(
-        lines[references + 1..].contains(&format!("textDocument/didChange {shadow}")),
-        "and the edit reaches tsgo after it: {lines:?}"
+        server
+            .response(held_hover, Duration::from_secs(10))
+            .to_string()
+            .contains("recorded")
     );
+    // tsgo reads the edit after it answered the hover, if the hover came first.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (lines, hover_after, edit) = loop {
+        let lines = traffic(&log);
+        let hover_after = lines
+            .iter()
+            .rposition(|line| line == &format!("textDocument/hover {shadow}"))
+            .unwrap();
+        let edit = lines
+            .iter()
+            .rposition(|line| line == &format!("textDocument/didChange {shadow}"))
+            .unwrap();
+        if hover_after < edit || Instant::now() > deadline {
+            break (lines, hover_after, edit);
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        references < hover_after && hover_after < edit,
+        "the held hover's tsgo half reaches tsgo before the edit: {lines:?}"
+    );
+    server.shutdown();
+}
+
+/// A request that takes the native worker's answer first and asks tsgo only
+/// when it has none (a hover in the script) arrived before the edit that
+/// follows it, so its tsgo half reaches tsgo before the edit does. Otherwise
+/// the main loop could take the edit first, and tsgo would describe whatever
+/// the next version has at that position: a hover on one line answered with
+/// the symbol on the line below.
+#[cfg(unix)]
+#[test]
+fn a_request_sent_before_an_edit_reaches_tsgo_before_it() {
+    let dir = TestDir::new("native-half-before-edit");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = fs::canonicalize(&dir.0).unwrap().join("ws");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    fs::write(root.join("tsconfig.json"), "{}").unwrap();
+    let mut text = "<script lang=\"ts\">\n\tconst later: number = 1;\n\tconst other: string = 'x';\n</script>\n<p>{later}{other}</p>\n".to_string();
+    fs::write(root.join("P.svelte"), &text).unwrap();
+    let mut server = Server::start_with_settings(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+    );
+    let uri = file_uri(&root.join("P.svelte"));
+    server.open(&uri, &text);
+    hover(&mut server, &uri);
+    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/P.svelte.tsx"));
+    let hover_line = format!("textDocument/hover {shadow}");
+    let change_line = format!("textDocument/didChange {shadow}");
+    for round in 0..5_usize {
+        let hovers = (0..4)
+            .map(|_| {
+                server.request(
+                    "textDocument/hover",
+                    json!({ "textDocument": { "uri": uri }, "position": { "line": 1 + round, "character": 8 } }),
+                )
+            })
+            .collect::<Vec<_>>();
+        text.insert_str(0, "<!-- top -->\n");
+        server.change(&uri, i64::try_from(round).unwrap() + 2, &text);
+        for id in hovers {
+            assert!(
+                server
+                    .response(id, Duration::from_secs(10))
+                    .to_string()
+                    .contains("recorded")
+            );
+        }
+        // tsgo reads the edit after it answered the hovers.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let lines = loop {
+            let lines = traffic(&log);
+            if lines.iter().filter(|line| *line == &change_line).count() == round + 1 {
+                break lines;
+            }
+            assert!(Instant::now() < deadline, "the edit never reached tsgo");
+            thread::sleep(Duration::from_millis(5));
+        };
+        let edit = lines
+            .iter()
+            .rposition(|line| line == &change_line)
+            .expect("the edit reached tsgo");
+        let hovers_before = lines[..edit]
+            .iter()
+            .filter(|line| *line == &hover_line)
+            .count();
+        let hovers_in_total = lines.iter().filter(|line| *line == &hover_line).count();
+        assert_eq!(
+            hovers_in_total,
+            1 + 4 * (round + 1),
+            "tsgo answers each hover"
+        );
+        assert_eq!(
+            hovers_before, hovers_in_total,
+            "round {round}: every hover reaches tsgo before the edit: {lines:?}"
+        );
+    }
     server.shutdown();
 }
 

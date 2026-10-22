@@ -322,6 +322,22 @@ enum Pending {
     FileReferences,
 }
 
+impl Pending {
+    /// Whether tsgo is asked once the native worker answers.
+    const fn asks_tsgo_next(&self) -> bool {
+        matches!(
+            self,
+            Self::Completion { .. }
+                | Self::Hover { .. }
+                | Self::CodeAction { .. }
+                | Self::CodeLens { .. }
+                | Self::FoldingRange { .. }
+                | Self::DocumentSymbol { .. }
+                | Self::DocumentDiagnostic { .. }
+        )
+    }
+}
+
 struct PendingTsgoRequest {
     method: String,
     document: Option<RequestDocumentContext>,
@@ -337,6 +353,10 @@ struct PendingTsgoRequest {
     /// The source document and position an adopted completion `data` names.
     completion_site_data: Option<(String, serde_json::Value)>,
 }
+
+/// How long a document change waits for the native half of the requests
+/// that arrived before it ([`Server::finish_native_halves`]).
+const NATIVE_HALF_WAIT: Duration = Duration::from_millis(250);
 
 /// Work held while a component query probes in a shadow's own buffer.
 enum Deferred {
@@ -2215,14 +2235,16 @@ impl Server {
 
     fn on_notification(&mut self, notification: Notification) {
         let method = notification.method.clone();
-        // Requests held while a probe is in a shadow's buffer arrived before
-        // this change: they are answered against the text they were sent
-        // for, so the probe ends, and they are replayed, before it applies.
+        // Requests that arrived before this change are answered against the
+        // text they were sent for: a probe that holds some ends, and they are
+        // replayed, and every native answer sends its tsgo half, before it
+        // applies.
         if matches!(
             method.as_str(),
             "textDocument/didChange" | "textDocument/didClose"
         ) {
             self.end_probes();
+            self.finish_native_halves();
         }
         match method.as_str() {
             "$/cancelRequest" => {
@@ -5073,6 +5095,32 @@ impl Server {
     fn end_probes(&mut self) {
         while self.probe_in_flight() {
             self.end_probes_where(|_| true);
+        }
+    }
+
+    /// Let the requests that arrived before a document change send their
+    /// tsgo half before the change applies. Most requests take the native
+    /// worker's answer first and ask tsgo only when it has none (a hover in
+    /// the script), and a tsgo half sent after the change is answered for the
+    /// next version: a hover sent right before a line was inserted above it
+    /// described the symbol on the line below. The worker answers in about a
+    /// millisecond; this waits at most [`NATIVE_HALF_WAIT`].
+    fn finish_native_halves(&mut self) {
+        let waiting = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.asks_tsgo_next())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        if waiting.is_empty() {
+            return;
+        }
+        let deadline = Instant::now() + NATIVE_HALF_WAIT;
+        while waiting.iter().any(|id| self.pending.contains_key(id)) {
+            let Ok(outcome) = self.outcomes.recv_deadline(deadline) else {
+                break;
+            };
+            self.on_outcome(outcome);
         }
     }
 
