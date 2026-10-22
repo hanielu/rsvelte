@@ -2090,6 +2090,71 @@ fn requests_a_check_holds_back_do_not_restart_tsgo() {
     server.shutdown();
 }
 
+/// tsgo sees a store and its `$store` value as two symbols, the second
+/// declared in generated code (`let $count = __sveltets_2_store_get(count);`),
+/// but a store's references are its value's too, and the other way round, as
+/// upstream lists them (review 6: from `const count` only the declaration was
+/// listed, from a `$count` use only the uses). The fake tsgo answers each
+/// symbol's references with the occurrences of its word.
+#[cfg(unix)]
+#[test]
+fn the_references_of_a_store_and_of_its_value_are_listed_together() {
+    let dir = TestDir::new("store-references");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = one_project(&dir.0);
+    let source = "<script lang=\"ts\">\n\timport { writable } from \"svelte/store\";\n\tconst count = writable(0);\n\tfunction bump() { $count++; }\n</script>\n<p>{$count}</p>\n";
+    fs::write(root.join("X.svelte"), source).unwrap();
+    let mut server = Server::start_with_settings(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            ("RSVELTE_TEST_TEXT_REFERENCES", Path::new("1")),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+    );
+    let x = file_uri(&root.join("X.svelte"));
+    server.open(&x, source);
+    hover(&mut server, &x);
+    let references = |server: &mut Server, line: u32, character: u32| {
+        let id = server.request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": x },
+                "position": { "line": line, "character": character },
+                "context": { "includeDeclaration": true },
+            }),
+        );
+        let answer = server.response(id, Duration::from_secs(10));
+        let mut ranges = answer["result"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{answer}"))
+            .iter()
+            .map(|location| {
+                let range = &location["range"];
+                format!(
+                    "{}:{}-{}:{}",
+                    range["start"]["line"],
+                    range["start"]["character"],
+                    range["end"]["line"],
+                    range["end"]["character"]
+                )
+            })
+            .collect::<Vec<_>>();
+        ranges.sort();
+        ranges
+    };
+    let expected = ["2:7-2:12", "3:19-3:25", "5:4-5:10"];
+    assert_eq!(references(&mut server, 2, 8), expected, "from the store");
+    assert_eq!(
+        references(&mut server, 5, 6),
+        expected,
+        "from a use of its value"
+    );
+    server.shutdown();
+}
+
 /// After tsgo restarts, the pulls it was asked for before were answered
 /// without it, so the editor is asked to pull again (review 4).
 #[cfg(unix)]
@@ -2592,6 +2657,50 @@ fn main() {
                 delay("RSVELTE_TEST_SLOW_DIAGNOSTIC_MS").unwrap_or_default(),
                 format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"kind":"full","items":[{items}]}}}}"#),
             );
+        } else if method == "textDocument/references"
+            && std::env::var_os("RSVELTE_TEST_TEXT_REFERENCES").is_some()
+        {
+            // Every occurrence of the word at the position, as opened: a
+            // store `count` and its value `$count` are two words, as they are
+            // two symbols for tsgo.
+            let id = json_id(&message);
+            let number = |name: &str| -> Option<usize> {
+                let rest = message.split_once(&format!(r#""{name}":"#))?.1;
+                rest[..rest.find(|c: char| !c.is_ascii_digit())?].parse().ok()
+            };
+            let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$';
+            let mut locations = Vec::new();
+            if let (Some(text), Some(line), Some(character)) =
+                (texts.get(&uri), number("line"), number("character"))
+            {
+                let line_start: usize = text.split('\n').take(line).map(|l| l.len() + 1).sum();
+                let bytes = text.as_bytes();
+                let at = line_start + character;
+                let mut start = at;
+                while start > 0 && word(bytes[start - 1]) {
+                    start -= 1;
+                }
+                let mut end = at;
+                while end < bytes.len() && word(bytes[end]) {
+                    end += 1;
+                }
+                let name = &text[start..end];
+                let mut from = 0;
+                while let Some(found) = (!name.is_empty()).then(|| text[from..].find(name)).flatten() {
+                    let found = from + found;
+                    from = found + name.len();
+                    if (found > 0 && word(bytes[found - 1])) || bytes.get(from).is_some_and(|b| word(*b)) {
+                        continue;
+                    }
+                    let line = text[..found].matches('\n').count();
+                    let character = found - text[..found].rfind('\n').map_or(0, |newline| newline + 1);
+                    let end = character + name.len();
+                    locations.push(format!(
+                        r#"{{"uri":"{uri}","range":{{"start":{{"line":{line},"character":{character}}},"end":{{"line":{line},"character":{end}}}}}}}"#
+                    ));
+                }
+            }
+            answer(format!(r#"{{"jsonrpc":"2.0","id":{id},"result":[{}]}}"#, locations.join(",")));
         } else if method == "exit" {
             return;
         } else if method == "$/cancelRequest" {

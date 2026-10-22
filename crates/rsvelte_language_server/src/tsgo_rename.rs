@@ -316,6 +316,45 @@ pub fn rewrite_workspace_edit(
     }
 }
 
+/// The other half of a store a reference at the generated `offset` of a
+/// shadow names, when it is one half of the declaration svelte2tsx writes for
+/// a store's value (`let $store = __sveltets_2_store_get(store);`): the
+/// offset of `store` for the `$store` declared there, of `$store` for the
+/// `store` it reads. tsgo sees two symbols, but a store's references are its
+/// value's too, and the other way round (review 6: the references of
+/// `const count = writable(0)` left out its `$count` uses), so the server asks
+/// for those of the other half as well, as upstream's FindReferencesProvider
+/// does.
+#[must_use]
+pub fn store_counterpart(generated: &str, offset: usize) -> Option<usize> {
+    const DECLARED: &str = " = __sveltets_2_store_get(";
+    let rest = generated.get(offset..)?;
+    if let Some(name) = rest.strip_prefix('$') {
+        let length = name
+            .bytes()
+            .take_while(|byte| is_identifier_byte(*byte))
+            .count();
+        if length > 0 && name[length..].starts_with(DECLARED) {
+            return Some(offset + 1 + length + DECLARED.len());
+        }
+    }
+    let value = generated.get(..offset)?.strip_suffix(DECLARED)?;
+    let start = value.len()
+        - value
+            .bytes()
+            .rev()
+            .take_while(|byte| is_identifier_byte(*byte))
+            .count();
+    (value[start..].len() > 1 && value[start..].starts_with('$')).then_some(start)
+}
+
+/// [`store_counterpart`] in tsgo's coordinates (UTF-8 columns).
+#[must_use]
+pub fn store_counterpart_position(generated: &str, position: Position) -> Option<Position> {
+    let counterpart = store_counterpart(generated, utf8_offset(generated, position))?;
+    Some(utf8_position(generated, counterpart))
+}
+
 /// Merge already-corrected WorkspaceEdits, dropping duplicate text edits.
 #[must_use]
 pub fn merge_workspace_edits(edits: impl IntoIterator<Item = Value>) -> Value {
@@ -1138,6 +1177,25 @@ mod tests {
         let rewritten = rewrite_workspace_edit(&plan, &response, &[document], "renamed", true);
         let edits = rewritten.edit["changes"][source_uri.as_str()].clone();
         assert_eq!(edits[0]["newText"], "$renamed", "{edits}");
+    }
+
+    #[test]
+    fn a_store_and_its_value_are_each_others_counterparts() {
+        let source = "<script>let store; $store;</script>{$store}";
+        let artifact = project(source);
+        let code = &artifact.code;
+        let declaration = code.find("$store = __sveltets_2_store_get(").unwrap();
+        let argument = code.find(&format!("{STORE_GET}store")).unwrap() + STORE_GET.len();
+        assert_eq!(store_counterpart(code, declaration), Some(argument));
+        assert_eq!(store_counterpart(code, argument), Some(declaration));
+        // A use of either is no declaration.
+        let use_ = code.rfind("$store").unwrap();
+        assert_ne!(use_, declaration);
+        assert_eq!(store_counterpart(code, use_), None);
+        assert_eq!(
+            store_counterpart(code, code.find("let store").unwrap() + 4),
+            None
+        );
     }
 
     #[test]

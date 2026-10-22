@@ -72,7 +72,7 @@ use crate::tsgo_loop;
 use crate::tsgo_overlay::{self, EditorBuffers, ProjectSpec, TsgoOverlay};
 use crate::tsgo_rename::{
     PrepareRenamePlan, RenameDocument, merge_workspace_edits, prepare_rename_plan,
-    rewrite_prepare_response, rewrite_workspace_edit,
+    rewrite_prepare_response, rewrite_workspace_edit, store_counterpart_position,
 };
 use crate::tsgo_response::{
     RequestDocumentContext, TsgoResponseMapper, empty_completion_list,
@@ -382,6 +382,34 @@ struct PendingTsgoRequest {
     code_lens_resolve: Option<PendingCodeLensResolve>,
     /// The source document and position an adopted completion `data` names.
     completion_site_data: Option<(String, serde_json::Value)>,
+    /// For the editor's references request: its `includeDeclaration`, which
+    /// the store follow-ups ask with ([`Server::continue_store_references`]).
+    include_declaration: Option<bool>,
+}
+
+/// The references of a store and of its `$store` value, asked together
+/// ([`Server::continue_store_references`]).
+#[derive(Default)]
+struct StoreReferences {
+    /// By the editor's references request: what has been gathered so far.
+    gathering: HashMap<RequestId, StoreReferencesGathering>,
+    /// Each follow-up request: the editor's request it belongs to.
+    followups: HashMap<RequestId, RequestId>,
+    /// The editor's requests whose gathered answer is being mapped.
+    gathered: HashSet<RequestId>,
+}
+
+struct StoreReferencesGathering {
+    /// The editor's request, held until every follow-up is answered.
+    pending: PendingTsgoRequest,
+    include_declaration: bool,
+    /// tsgo's locations so far, in shadow coordinates.
+    locations: Vec<serde_json::Value>,
+    /// The positions (shadow, line, character) whose symbol's references are
+    /// asked for or among the locations.
+    covered: HashSet<(String, u32, u32)>,
+    /// Follow-ups not answered yet.
+    remaining: usize,
 }
 
 /// How long a document change waits for the native half of the requests
@@ -1363,6 +1391,7 @@ struct Server {
     /// Insertion order of `completion_data`, oldest first.
     completion_order: Vec<String>,
     rename_aggregates: HashMap<RequestId, RenameAggregate>,
+    store_references: StoreReferences,
     component_queries: HashMap<RequestId, PendingComponentQuery>,
     component_query_requests: HashMap<RequestId, (RequestId, ComponentInfoRequestId)>,
     /// What waits for a probe in a shadow's buffer to end (see
@@ -1441,6 +1470,7 @@ impl Server {
             completion_data: HashMap::new(),
             completion_order: Vec::new(),
             rename_aggregates: HashMap::new(),
+            store_references: StoreReferences::default(),
             component_queries: HashMap::new(),
             component_query_requests: HashMap::new(),
             deferred: Vec::new(),
@@ -1911,6 +1941,7 @@ impl Server {
             file_rename: None,
             code_lens_resolve: None,
             completion_site_data: None,
+            include_declaration: None,
         };
         let child = Request::new(id.clone(), method.to_string(), params);
         if let Err(error) = runtime.forward(child.into()) {
@@ -2018,6 +2049,7 @@ impl Server {
             file_rename: None,
             code_lens_resolve: None,
             completion_site_data: None,
+            include_declaration: None,
         };
         if runtime.forward(child.into()).is_ok() {
             self.pending_tsgo.insert(request.id, pending);
@@ -2113,6 +2145,7 @@ impl Server {
             }),
             code_lens_resolve: None,
             completion_site_data: None,
+            include_declaration: None,
         };
         if runtime.forward(child.into()).is_ok() {
             self.pending_tsgo.insert(request.id, pending);
@@ -2407,6 +2440,7 @@ impl Server {
                 source_uri,
             }),
             completion_site_data: None,
+            include_declaration: None,
         };
         if runtime.forward(child.into()).is_ok() {
             self.pending_tsgo.insert(id, pending);
@@ -2958,6 +2992,13 @@ impl Server {
             file_rename: None,
             code_lens_resolve: None,
             completion_site_data,
+            include_declaration: (request.method == "textDocument/references").then(|| {
+                request
+                    .params
+                    .pointer("/context/includeDeclaration")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true)
+            }),
         };
         let id = request.id.clone();
         // tsrs never answers a request it loops on, and each one holds one of
@@ -3041,6 +3082,7 @@ impl Server {
             file_rename: None,
             code_lens_resolve: None,
             completion_site_data: None,
+            include_declaration: None,
         };
         if runtime.forward(request.into()).is_ok() {
             self.pending_tsgo.insert(id, pending);
@@ -3652,7 +3694,8 @@ impl Server {
             ));
             let waited_on = warm_up
                 || self.pending_tsgo.contains_key(&id)
-                || self.component_query_requests.contains_key(&id);
+                || self.component_query_requests.contains_key(&id)
+                || self.store_references.followups.contains_key(&id);
             if waited_on {
                 let response = if self.component_query_requests.contains_key(&id) {
                     Response::new_err(
@@ -5049,6 +5092,14 @@ impl Server {
                 message.to_string(),
             ));
         }
+        let store_references = std::mem::take(&mut self.store_references);
+        for (id, _) in store_references.gathering {
+            self.respond(Response::new_err(
+                id,
+                ErrorCode::InternalError as i32,
+                message.to_string(),
+            ));
+        }
         self.component_query_requests.clear();
         for (id, pending) in std::mem::take(&mut self.component_queries) {
             self.run_component_action(pending.query.restore());
@@ -5076,6 +5127,14 @@ impl Server {
                 if self.on_component_query_response(response.clone()) {
                     return;
                 }
+                if let Some(editor_id) = self.store_references.followups.remove(&response.id) {
+                    let locations = match response.response_result {
+                        Ok(serde_json::Value::Array(locations)) => locations,
+                        _ => Vec::new(),
+                    };
+                    self.continue_store_references(&editor_id, locations, true);
+                    return;
+                }
                 let Some(pending) = self.pending_tsgo.remove(&response.id) else {
                     log::warn(format_args!(
                         "response to unknown tsgo request {}{}",
@@ -5092,6 +5151,27 @@ impl Server {
                     self.on_tsgo_rename_response(response, rename);
                     return;
                 }
+                let pending = match (pending.include_declaration, &response.response_result) {
+                    (Some(include_declaration), Ok(serde_json::Value::Array(locations)))
+                        if !self.store_references.gathered.remove(&response.id) =>
+                    {
+                        let locations = locations.clone();
+                        let id = response.id.clone();
+                        self.store_references.gathering.insert(
+                            id.clone(),
+                            StoreReferencesGathering {
+                                pending,
+                                include_declaration,
+                                locations: Vec::new(),
+                                covered: HashSet::new(),
+                                remaining: 0,
+                            },
+                        );
+                        self.continue_store_references(&id, locations, false);
+                        return;
+                    }
+                    _ => pending,
+                };
                 let PendingTsgoRequest {
                     method,
                     document,
@@ -5105,6 +5185,7 @@ impl Server {
                     file_rename,
                     code_lens_resolve,
                     completion_site_data,
+                    include_declaration: _,
                 } = pending;
                 let source_path = document
                     .as_ref()
@@ -5968,6 +6049,7 @@ impl Server {
                         file_rename: None,
                         code_lens_resolve: None,
                         completion_site_data: None,
+                        include_declaration: None,
                     };
                     requests.push((child_id, request, child_pending));
                 }
@@ -6009,6 +6091,114 @@ impl Server {
                 self.finish_rename_followup(&editor_id, edit);
             }
         }
+    }
+
+    /// Gather the references of a store and of its `$store` value together
+    /// ([`store_counterpart_position`]): add tsgo's `locations` (an answer to the
+    /// editor's request, or to a follow-up), ask for the references of the
+    /// other half of each store declaration among them that no answer covers
+    /// yet (in each component that declares it), and once every follow-up is
+    /// answered, map the gathered locations as tsgo's answer to the editor's
+    /// request (review 6: from `$count`, official lists `const count` and
+    /// the three `$count` uses; this server listed the uses only, and from
+    /// the declaration only the declaration).
+    fn continue_store_references(
+        &mut self,
+        editor_id: &RequestId,
+        locations: Vec<serde_json::Value>,
+        followup: bool,
+    ) {
+        let start_of = |location: &serde_json::Value| {
+            let uri = location.get("uri")?.as_str()?;
+            let start = location.pointer("/range/start")?;
+            let line = u32::try_from(start.get("line")?.as_u64()?).ok()?;
+            let character = u32::try_from(start.get("character")?.as_u64()?).ok()?;
+            Some((uri.to_string(), line, character))
+        };
+        let counterparts = self.tsgo.as_ref().map_or_else(Vec::new, |runtime| {
+            locations
+                .iter()
+                .filter_map(|location| {
+                    let (uri, line, character) = start_of(location)?;
+                    let text = runtime
+                        .overlays
+                        .iter()
+                        .find_map(|overlay| overlay.shadow_text(&uri_to_path(&uri)))?;
+                    let position =
+                        store_counterpart_position(text, Position::new(line, character))?;
+                    Some((uri, position.line, position.character))
+                })
+                .collect::<Vec<_>>()
+        });
+        let Some(gathering) = self.store_references.gathering.get_mut(editor_id) else {
+            return;
+        };
+        if followup {
+            gathering.remaining = gathering.remaining.saturating_sub(1);
+        }
+        gathering
+            .covered
+            .extend(locations.iter().filter_map(start_of));
+        gathering.locations.extend(locations);
+        let include_declaration = gathering.include_declaration;
+        let mut asks = Vec::new();
+        for counterpart in counterparts {
+            if gathering.covered.insert(counterpart.clone()) {
+                asks.push(counterpart);
+            }
+        }
+        for (uri, line, character) in asks {
+            self.next_request_id += 1;
+            let child_id = RequestId::from(format!(
+                "rsvelte-tsgo-store-references-{}",
+                self.next_request_id
+            ));
+            let request = Request::new(
+                child_id.clone(),
+                "textDocument/references".to_string(),
+                serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                    "context": { "includeDeclaration": include_declaration },
+                }),
+            );
+            if self
+                .tsgo
+                .as_ref()
+                .is_some_and(|runtime| runtime.forward(request.into()).is_ok())
+            {
+                self.store_references
+                    .followups
+                    .insert(child_id, editor_id.clone());
+                if let Some(gathering) = self.store_references.gathering.get_mut(editor_id) {
+                    gathering.remaining += 1;
+                }
+            }
+        }
+        if self
+            .store_references
+            .gathering
+            .get(editor_id)
+            .is_none_or(|gathering| gathering.remaining > 0)
+        {
+            return;
+        }
+        let Some(gathering) = self.store_references.gathering.remove(editor_id) else {
+            return;
+        };
+        let mut locations = Vec::with_capacity(gathering.locations.len());
+        for location in gathering.locations {
+            if !locations.contains(&location) {
+                locations.push(location);
+            }
+        }
+        self.pending_tsgo
+            .insert(editor_id.clone(), gathering.pending);
+        self.store_references.gathered.insert(editor_id.clone());
+        self.on_tsgo_message(Message::Response(Response::new_ok(
+            editor_id.clone(),
+            serde_json::Value::Array(locations),
+        )));
     }
 
     fn finish_rename_followup(&mut self, editor_id: &RequestId, edit: Option<serde_json::Value>) {
