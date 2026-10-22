@@ -183,27 +183,28 @@ pub fn split_generic_param_names(generics: &str) -> Vec<String> {
 
 /// Extract the `generics` attribute value from a script tag text.
 pub fn extract_generics_from_script_tag(tag_text: &str) -> Option<String> {
-    if let Some(pos) = tag_text.find("generics=") {
-        let after = &tag_text[pos + 9..];
-        let trimmed = after.trim_start();
-        if let Some(quote_char) = trimmed.chars().next() {
-            if quote_char == '"' || quote_char == '\'' {
-                let content = &trimmed[1..];
-                if let Some(end) = content.find(quote_char) {
-                    return Some(content[..end].to_string());
-                }
-            } else {
-                // Unquoted value: take until whitespace or `>`
-                let end = trimmed
-                    .find(|c: char| c.is_whitespace() || c == '>')
-                    .unwrap_or(trimmed.len());
-                if end > 0 {
-                    return Some(trimmed[..end].to_string());
-                }
-            }
-        }
+    generics_value_range(tag_text).map(|range| tag_text[range].to_string())
+}
+
+/// Where in a script tag text the `generics` attribute value
+/// ([`extract_generics_from_script_tag`]) sits.
+pub fn generics_value_range(tag_text: &str) -> Option<std::ops::Range<usize>> {
+    let after_start = tag_text.find("generics=")? + "generics=".len();
+    let after = &tag_text[after_start..];
+    let trimmed = after.trim_start();
+    let trimmed_start = after_start + (after.len() - trimmed.len());
+    let quote_char = trimmed.chars().next()?;
+    if quote_char == '"' || quote_char == '\'' {
+        let content_start = trimmed_start + 1;
+        let end = tag_text[content_start..].find(quote_char)?;
+        Some(content_start..content_start + end)
+    } else {
+        // Unquoted value: take until whitespace or `>`
+        let end = trimmed
+            .find(|c: char| c.is_whitespace() || c == '>')
+            .unwrap_or(trimmed.len());
+        (end > 0).then_some(trimmed_start..trimmed_start + end)
     }
-    None
 }
 
 #[cfg(test)]

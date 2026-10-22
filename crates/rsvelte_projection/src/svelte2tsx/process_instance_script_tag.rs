@@ -7,7 +7,7 @@ use crate::ast::template::Root;
 use super::interfaces::{Svelte2TsxMode, Svelte2TsxOptions};
 use super::magic_string::MagicString;
 use super::nodes::generics::{
-    extract_generics_from_script_tag, split_generic_param_names, type_text_references_any,
+    generics_value_range, split_generic_param_names, type_text_references_any,
     type_text_typeof_references_local_value,
 };
 use super::nodes::scripts::{LiftedImport, detect_top_level_await, find_script_close_tag_start};
@@ -82,7 +82,10 @@ pub fn process_instance_script_tag(
 
     // Detect `generics` attribute on the script tag
     let script_tag_text = slice_src(source, script_start as usize, content_start as usize);
-    let generics_param = extract_generics_from_script_tag(script_tag_text);
+    let generics_value = generics_value_range(script_tag_text);
+    let generics_param = generics_value
+        .clone()
+        .map(|range| script_tag_text[range].to_string());
     let use_jsdoc_generics = options.emit_jsdoc && !options.is_ts_file;
     // For JS files emitting JSDoc, the generics live on a `/** @template T */`
     // line *before* `function $$render()`, not as `<T>` on the function.
@@ -279,8 +282,31 @@ pub fn process_instance_script_tag(
     } else {
         (part_b_prefix, ts_component_props_before_render.as_str())
     };
-    let part_b = format!(
-        "{part_b_lead}{part_b_component_props}{template_comment}{async_prefix}function $$render{render_generics}() {{{dollar_decls}{ts_component_props_inside_render}{trailing_newline}"
+    // TypeScript's `$$render<…>` keeps the `generics` attribute's value where it
+    // is, between the overwrites of the tag around it, as upstream does, so
+    // that its type parameters map back to the attribute: a rename of `T` or an
+    // error in its constraint lands there, not on the `<script` tag (0:1).
+    let generics_in_place = generics_value
+        .filter(|range| {
+            split_pos.is_some()
+                && options.is_ts_file
+                && exported_names.dollar_generics.is_empty()
+                && !range.is_empty()
+        })
+        .map(|range| {
+            let offset = |at: usize| script_start + u32::try_from(at).expect("tag offset fits");
+            (offset(range.start), offset(range.end))
+        });
+    let (generics_open, generics_close) = if generics_in_place.is_some() {
+        ("<", ">")
+    } else {
+        (render_generics.as_str(), "")
+    };
+    let part_b_head = format!(
+        "{part_b_lead}{part_b_component_props}{template_comment}{async_prefix}function $$render{generics_open}"
+    );
+    let part_b_tail = format!(
+        "{generics_close}() {{{dollar_decls}{ts_component_props_inside_render}{trailing_newline}"
     );
     if let Some(sp) = split_pos {
         if script_start < sp {
@@ -386,12 +412,21 @@ pub fn process_instance_script_tag(
                 ";",
             );
         }
-        str.overwrite(sp, content_start, &part_b);
+        if let Some((value_start, value_end)) = generics_in_place {
+            str.overwrite(sp, value_start, &part_b_head);
+            str.overwrite(value_end, content_start, &part_b_tail);
+        } else {
+            str.overwrite_fmt(
+                sp,
+                content_start,
+                format_args!("{part_b_head}{part_b_tail}"),
+            );
+        }
     } else if script_start < content_start {
         str.overwrite_fmt(
             script_start,
             content_start,
-            format_args!("{part_a}{part_b}"),
+            format_args!("{part_a}{part_b_head}{part_b_tail}"),
         );
     }
 
