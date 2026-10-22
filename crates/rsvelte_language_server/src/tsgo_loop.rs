@@ -11,7 +11,7 @@
 //! module says tsrs loops on without sending them.
 //!
 //! What loops, as measured against tsrs (`tests/data/tsrs-lost-requests.json`:
-//! 356 requests, every loop among them found, and no request that is answered
+//! 398 requests, every loop among them found, and no request that is answered
 //! counted as one except a signature help next to a call's parentheses):
 //! both requests walk back from the position over the tokens a type argument
 //! list can hold, to decide whether a `<` before it opens one (Strada's
@@ -197,12 +197,19 @@ const OPERATORS: &[&str] = &[
 impl Tokens {
     /// TypeScript's tokens, near enough for the walk: a `>` is always one
     /// token (the scanner's, before the parser rescans `>>` or `>=`), a `/`
-    /// never starts a regular expression, a template is one token, and a
-    /// private name (`#a`) is a `#` and a word.
+    /// never starts a regular expression, and a private name (`#a`) is a `#`
+    /// and a word. A template's text is a token up to each `${`, and the `}`
+    /// that ends a substitution (the one that closes no `{` opened in it)
+    /// continues it, as the scanner reads it again for the parser; a `;` in a
+    /// substitution ends the template instead (the parser gives up on its
+    /// expression there, and a later `}` is a plain one).
     fn new(text: &str) -> Self {
         let bytes = text.as_bytes();
         let mut list = Vec::new();
         let mut comments = Vec::new();
+        // For each `{` and `${` not closed yet, whether it opened a
+        // template's substitution.
+        let mut braces = Vec::new();
         let mut at = 0;
         while at < bytes.len() {
             let Some(character) = text[at..].chars().next() else {
@@ -218,6 +225,9 @@ impl Tokens {
                 comments.push(start..at);
                 continue;
             }
+            if bytes[at] == b';' && braces.last() == Some(&true) {
+                braces.pop();
+            }
             if text[at..].starts_with("/*") {
                 at = text[at + 2..]
                     .find("*/")
@@ -226,24 +236,37 @@ impl Tokens {
                 continue;
             }
             let kind = match character {
-                '\'' | '"' | '`' => {
+                '\'' | '"' => {
                     let quote = bytes[at];
                     at += 1;
                     while at < bytes.len() && bytes[at] != quote {
                         if bytes[at] == b'\\' {
                             at += 1;
-                        } else if quote != b'`' && bytes[at] == b'\n' {
+                        } else if bytes[at] == b'\n' {
                             break;
                         }
                         at += 1;
                     }
                     at = (at + 1).min(bytes.len());
-                    // A template is not among the literals the walk passes.
-                    if quote == b'`' {
-                        Kind::Other
-                    } else {
-                        Kind::Literal
+                    Kind::Literal
+                }
+                // A template's text is not among the tokens the walk passes.
+                '`' => {
+                    let substitution;
+                    (at, substitution) = template_text(bytes, at + 1);
+                    if substitution {
+                        braces.push(true);
                     }
+                    Kind::Other
+                }
+                '}' if braces.last() == Some(&true) => {
+                    braces.pop();
+                    let substitution;
+                    (at, substitution) = template_text(bytes, at + 1);
+                    if substitution {
+                        braces.push(true);
+                    }
+                    Kind::Other
                 }
                 '0'..='9' => {
                     at = skip_word(text, at);
@@ -281,6 +304,13 @@ impl Tokens {
                     } else {
                         at += character.len_utf8();
                         match character {
+                            '{' => braces.push(false),
+                            '}' => {
+                                braces.pop();
+                            }
+                            _ => {}
+                        }
+                        match character {
                             '<' => Kind::LessThan,
                             '>' => Kind::GreaterThan,
                             '{' | '(' | '[' => Kind::Open(bytes[start]),
@@ -314,6 +344,20 @@ impl Tokens {
             .iter()
             .any(|comment| comment.start < offset && offset < comment.end)
     }
+}
+
+/// The end of a template's text that starts at `from` (after its `` ` `` or
+/// the `}` of a substitution), and whether it ends with `${`.
+fn template_text(bytes: &[u8], mut from: usize) -> (usize, bool) {
+    while from < bytes.len() {
+        match bytes[from] {
+            b'\\' => from += 2,
+            b'`' => return (from + 1, false),
+            b'$' if bytes.get(from + 1) == Some(&b'{') => return (from + 2, true),
+            _ => from += 1,
+        }
+    }
+    (bytes.len(), false)
 }
 
 fn is_word_character(character: char) -> bool {
@@ -517,6 +561,27 @@ mod tests {
             &shadow("\tlet q = [1]a[];\n"),
             at
         ));
+    }
+
+    /// A template's text is no token the walk passes, and the parser reads a
+    /// `}` that ends a substitution as more of it; but a substitution its
+    /// expression cannot reach the end of (a `;` in it) ends the template
+    /// there. `lsfuzz2.mjs` seed 12 lost a completion in a script body whose
+    /// first line opened such a substitution (the text is in the measured
+    /// requests), which the model, reading the rest as one template, missed.
+    #[test]
+    fn a_template_is_read_as_typescript_reads_it() {
+        let completion = |text: &str| {
+            request_loops(
+                "textDocument/completion",
+                text,
+                text.rfind('c').unwrap() + 1,
+            )
+        };
+        assert!(completion("`${q<w;\n}c{`"));
+        assert!(completion("x = `a${b}c${d}`;q<w;\n}c{"));
+        assert!(!completion("q<w;\n`${}c{"));
+        assert!(!completion("q<w;\n}c{`${a}`"));
     }
 
     #[test]
