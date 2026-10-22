@@ -313,3 +313,26 @@ fn a_snippets_type_parameters_keep_their_place() {
         12,
     );
 }
+
+#[test]
+fn an_each_blocks_index_keeps_its_place() {
+    let source = "<script lang=\"ts\">\n\ttype Row = { id: string };\n\tlet rows: Row[] = $state([]);\n\tlet items = $state([1, 2]);\n</script>\n{#each rows as { id }, i (id)}<p>{id}{i}</p>{/each}\n{#each rows as row ,  idx}<p>{idx}</p>{:else}<p>none</p>{/each}\n{#each items as items, n (items)}{items}{n}{/each}\n{#each rows as row, $i}{$i}{/each}\n";
+    let artifact = project(source);
+    assert_code_contains(
+        &artifact,
+        &[
+            "    for(let { id } of __sveltets_2_ensureArray(rows)){let i = 1;id; { svelteHTML.createElement(\"p\", {});id;i; }}\n",
+            "   for(let row of __sveltets_2_ensureArray(rows)){let idx = 1; { svelteHTML.createElement(\"p\", {});idx; }} { svelteHTML.createElement(\"p\", {});  }\n",
+            "    { const $$_each = __sveltets_2_ensureArray(items); for(let items of $$_each){let n = 1;items;items;n;}}\n",
+            "   for(let row of __sveltets_2_ensureArray(rows)){let $i = 1;$i;}\n",
+        ],
+    );
+    for (index, nth) in [(", i (", 0), (",  idx}", 0), (", n (", 0), (", $i}", 0)] {
+        let at = nth_offset(source, index, nth, 1);
+        let at = at + source[at..].find(|c: char| c != ' ').unwrap();
+        let len = source[at..]
+            .find(|c: char| !(c.is_alphanumeric() || c == '$'))
+            .unwrap();
+        assert_maps_in_place(&artifact, source, at, len);
+    }
+}
