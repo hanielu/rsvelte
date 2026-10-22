@@ -13,7 +13,7 @@ use rsvelte_projection::{ByteRange, ProjectionMap};
 use serde_json::{Map, Value, json};
 use sourcemap::SourceMap;
 
-use crate::context::attribute_context;
+use crate::context::{ScriptOpeningTags, attribute_context};
 use crate::text::LineIndex;
 use crate::tsgo_overlay::is_in_generated_code;
 
@@ -241,6 +241,7 @@ pub fn rewrite_workspace_edit(
     let target = plan.request().map(|(_, _, target)| target);
     let mut edits = Vec::new();
     let mut followups = Vec::new();
+    let mut opening_tags = BTreeMap::new();
     visit_workspace_edits(response, |uri, edit| {
         let Some(range) = edit.get("range").and_then(parse_range) else {
             return;
@@ -271,6 +272,19 @@ pub fn rewrite_workspace_edit(
         let Some(source_range) = map_generated_offsets(document, start, end) else {
             return;
         };
+        // An edit of generated code that maps to no source of its own lands
+        // on the `<script …>` tag svelte2tsx replaced, and would corrupt it.
+        let (tags, index) = opening_tags
+            .entry(document.source_uri.as_str())
+            .or_insert_with(|| {
+                (
+                    ScriptOpeningTags::new(document.source_text),
+                    LineIndex::new(document.source_text),
+                )
+            });
+        if tags.covers(index.offset(document.source_text, source_range.start)) {
+            return;
+        }
         let (source_range, replacement) =
             correct_shorthand(document.source_text, source_range, new_text, new_name);
         edits.push(EditorEdit {
@@ -819,6 +833,7 @@ mod tests {
     use super::*;
     use crate::tsgo_overlay::IGNORE_START;
     use rsvelte_projection::{ProjectionArtifact, ProjectionEngine, Svelte2TsxOptions};
+    use sourcemap::SourceMapBuilder;
     use std::str::FromStr;
 
     fn uri(value: &str) -> Uri {
@@ -1027,6 +1042,96 @@ mod tests {
         assert_eq!(
             correct_shorthand(source, slot, "slot: renamed", "renamed"),
             (slot, "slot={renamed}".to_string())
+        );
+    }
+
+    /// A source map whose tokens send each generated `(line, column)` to a
+    /// source `(line, column)`.
+    fn source_map(tokens: &[(u32, u32, u32, u32)]) -> String {
+        let mut builder = SourceMapBuilder::new(None);
+        builder.add_source("Input.svelte");
+        for &(line, column, source_line, source_column) in tokens {
+            builder.add(
+                line,
+                column,
+                source_line,
+                source_column,
+                Some("Input.svelte"),
+                None,
+                false,
+            );
+        }
+        let mut encoded = Vec::new();
+        builder.into_sourcemap().to_writer(&mut encoded).unwrap();
+        String::from_utf8(encoded).unwrap()
+    }
+
+    /// svelte2tsx replaces the `<script …>` tag with the render function's
+    /// header; an edit in a copy the header makes that maps to the tag (0:1,
+    /// review 5: `<Dimpt lang="ts">` after renaming a type the props
+    /// annotation uses) is dropped, and one in the `generics` value it also
+    /// copies, or in the script, is kept.
+    #[test]
+    fn an_edit_that_maps_into_a_script_opening_tag_is_dropped_unless_in_its_generics() {
+        let source_uri = uri("file:///Input.svelte");
+        let shadow_uri = uri("file:///cache/Input.svelte.tsx");
+        let source = "<script lang=\"ts\" generics=\"T\">\n\tlet a: T;\n</script>\n";
+        let generated = ";type $$ComponentProps = T;function $$render<T>() {\n\tlet a: T;\n}\n";
+        let generics = u32::try_from(source.find("\"T\"").unwrap()).unwrap() + 1;
+        let map = source_map(&[
+            (0, 0, 0, 1),
+            (0, 45, 0, generics),
+            (0, 46, 0, 1),
+            (1, 0, 1, 0),
+            (1, 8, 1, 8),
+        ]);
+        let projection_map = ProjectionMap::default();
+        let document = RenameDocument {
+            source_uri: &source_uri,
+            shadow_uri: &shadow_uri,
+            source_text: source,
+            generated_text: generated,
+            projection_map: &projection_map,
+            source_map: Some(&map),
+            parser_error: false,
+        };
+        let header = generated.find("= T").unwrap() + 2;
+        let parameter = generated.find("<T>").unwrap() + 1;
+        assert_eq!(parameter, 45);
+        let edits = [header, parameter]
+            .into_iter()
+            .map(|offset| {
+                edit(
+                    &shadow_uri,
+                    "U",
+                    utf8_position(generated, offset),
+                    utf8_position(generated, offset + 1),
+                )
+            })
+            .chain([edit(
+                &shadow_uri,
+                "U",
+                Position::new(1, 8),
+                Position::new(1, 9),
+            )]);
+        let plan = PrepareRenamePlan::Reject(RenameRejection::UnmappedPosition);
+        let rewritten = rewrite_workspace_edit(
+            &plan,
+            &merge_workspace_edits(edits),
+            &[document],
+            "U",
+            false,
+        );
+        let kept = rewritten.edit["changes"][source_uri.as_str()]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|edit| parse_range(&edit["range"]).unwrap().start)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            [Position::new(0, generics), Position::new(1, 8)],
+            "{rewritten:?}"
         );
     }
 

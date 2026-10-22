@@ -505,6 +505,163 @@ const fn is_attribute_name_byte(byte: u8) -> bool {
     !byte.is_ascii_whitespace() && !matches!(byte, b'"' | b'\'' | b'<' | b'>' | b'/' | b'=')
 }
 
+/// The `<script …>` opening tags of a document, for the answers that must not
+/// point into one. svelte2tsx overwrites each with generated code (the render
+/// function's header, `;type $$ComponentProps = …;function $$render() {`),
+/// and a TypeScript location or edit in that code that has no exact mapping
+/// back lands on the tag (`script`, 0:1), where an edit corrupts the tag. The
+/// one author's text svelte2tsx copies from a tag is a `generics="…"` value
+/// (the render function's type parameters), which stays reachable.
+pub struct ScriptOpeningTags<'a> {
+    text: &'a str,
+    tags: Vec<ScriptOpeningTag>,
+    /// The script bodies the parser finds, read only once an offset falls in
+    /// a candidate tag (a parse of the whole component).
+    bodies: std::cell::OnceCell<Vec<Range<usize>>>,
+}
+
+/// A `<script` spelled in the text, through the `>` that ends its opening tag
+/// (one inside a quoted attribute value does not), and its `generics` value.
+struct ScriptOpeningTag {
+    start: usize,
+    end: usize,
+    generics: Option<Range<usize>>,
+}
+
+impl<'a> ScriptOpeningTags<'a> {
+    #[must_use]
+    pub fn new(text: &'a str) -> Self {
+        let bytes = text.as_bytes();
+        let mut tags = Vec::new();
+        let mut from = 0;
+        while let Some(found) = bytes
+            .get(from..)
+            .and_then(|rest| rest.windows(7).position(|window| window == b"<script"))
+        {
+            let start = from + found;
+            from = start + 1;
+            if let Some(tag) = scan_script_opening_tag(text, start) {
+                from = tag.end;
+                tags.push(tag);
+            }
+        }
+        Self {
+            text,
+            tags,
+            bodies: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Whether `offset` is inside a script's opening tag: after its `<` (a
+    /// position at the start of the file, where a definition of the component
+    /// itself lands, stays) up to its `>`, and not in its `generics` value
+    /// (its end included, where TypeScript reports a missing type).
+    #[must_use]
+    pub fn covers(&self, offset: usize) -> bool {
+        let Some(tag) = self
+            .tags
+            .iter()
+            .find(|tag| tag.start < offset && offset < tag.end)
+        else {
+            return false;
+        };
+        if tag
+            .generics
+            .as_ref()
+            .is_some_and(|value| value.start <= offset && offset <= value.end)
+        {
+            return false;
+        }
+        // Only a tag whose script the parser finds is replaced: `<script` in
+        // a string or a comment is not. The parser ends a tag at its first
+        // `>` (`body_of`), which can sit in a `generics` value.
+        self.bodies
+            .get_or_init(|| EmbeddedRegions::new(self.text).scripts().to_vec())
+            .iter()
+            .any(|body| tag.start < body.start && body.start <= tag.end)
+    }
+}
+
+/// The opening tag of a `<script` at `start`, read attribute by attribute,
+/// or `None` when `start` begins another word or the tag never ends.
+fn scan_script_opening_tag(text: &str, start: usize) -> Option<ScriptOpeningTag> {
+    let bytes = text.as_bytes();
+    let mut at = start + "<script".len();
+    if bytes
+        .get(at)
+        .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(byte, b'>' | b'/'))
+    {
+        return None;
+    }
+    let mut generics = None;
+    loop {
+        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+            at += 1;
+        }
+        match *bytes.get(at)? {
+            b'>' => {
+                return Some(ScriptOpeningTag {
+                    start,
+                    end: at + 1,
+                    generics,
+                });
+            }
+            b'/' => {
+                at += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let name_start = at;
+        while bytes
+            .get(at)
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(byte, b'=' | b'>' | b'/'))
+        {
+            at += 1;
+        }
+        let name = &text[name_start..at];
+        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+            at += 1;
+        }
+        if bytes.get(at) != Some(&b'=') {
+            if at == name_start {
+                at += 1;
+            }
+            continue;
+        }
+        at += 1;
+        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+            at += 1;
+        }
+        let value = match *bytes.get(at)? {
+            quote @ (b'"' | b'\'') => {
+                let close = at
+                    + 1
+                    + bytes
+                        .get(at + 1..)?
+                        .iter()
+                        .position(|byte| *byte == quote)?;
+                let value = at + 1..close;
+                at = close + 1;
+                value
+            }
+            _ => {
+                let value_start = at;
+                while bytes
+                    .get(at)
+                    .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'>')
+                {
+                    at += 1;
+                }
+                value_start..at
+            }
+        };
+        if name == "generics" {
+            generics = Some(value);
+        }
+    }
+}
+
 /// The `<script>` body upstream falls back to when svelte2tsx rejects a
 /// document: `Document.scriptInfo || Document.moduleScriptInfo`
 /// (`DocumentSnapshot.ts:289-291`), where the instance script is the one whose
@@ -584,6 +741,42 @@ mod tests {
 
     fn regions(text: &str) -> EmbeddedRegions {
         EmbeddedRegions::new(text)
+    }
+
+    /// Every offset of `text` the guard covers, as the text it covers.
+    fn covered(text: &str) -> String {
+        let tags = ScriptOpeningTags::new(text);
+        (0..=text.len())
+            .filter(|offset| text.is_char_boundary(*offset) && tags.covers(*offset))
+            .map(|offset| text[offset..].chars().next().unwrap_or('$'))
+            .collect()
+    }
+
+    #[test]
+    fn a_script_opening_tag_is_covered_after_its_lt_and_outside_its_generics() {
+        // The `<` stays (a definition of the component itself lands at 0:0),
+        // so does the generics value with its end (where a missing type is
+        // reported); a `>` inside the value does not end the tag.
+        let text = "<script lang=\"ts\" generics=\"T extends Map<K, V>, K\">\n\tlet a: T;\n</script>\n<p>{a}</p>\n";
+        assert_eq!(covered(text), "script lang=\"ts\" generics=\">");
+        let module = "<script module>\n\texport const x = 1;\n</script>\n<script lang='ts' generics='T'>\n\tlet t: T;\n</script>\n";
+        assert_eq!(
+            covered(module),
+            "script module>script lang='ts' generics='>"
+        );
+    }
+
+    #[test]
+    fn script_text_that_is_no_opening_tag_is_not_covered() {
+        // In a string, in a comment, in a word that only starts like it.
+        assert_eq!(
+            covered(
+                "<script>\n\tconst s = '<script lang=\"ts\">';\n</script>\n<!-- <script> -->\n<scripts>x</scripts>\n"
+            ),
+            "script>"
+        );
+        // A tag that never ends.
+        assert_eq!(covered("<p>x</p>\n<script lang=\"ts"), "");
     }
 
     fn located(text: &str, needle: &str) -> String {

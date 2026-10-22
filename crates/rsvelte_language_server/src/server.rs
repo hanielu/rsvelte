@@ -40,6 +40,7 @@ use rsvelte_projection::is_typescript_component;
 use crate::background;
 use crate::client::ClientState;
 use crate::completions::TRIGGER_CHARACTERS;
+use crate::context::ScriptOpeningTags;
 use crate::document::{Document, DocumentStore};
 use crate::log;
 use crate::preprocess_sidecar::{
@@ -4798,6 +4799,25 @@ impl Server {
                     ) {
                         dedupe_array(result);
                     }
+                    if matches!(
+                        method.as_str(),
+                        "textDocument/references"
+                            | "textDocument/implementation"
+                            | "textDocument/definition"
+                            | "textDocument/typeDefinition"
+                            | "textDocument/documentHighlight"
+                    ) {
+                        self.drop_locations_in_script_tags(
+                            result,
+                            source_uri.as_ref(),
+                            matches!(
+                                method.as_str(),
+                                "textDocument/definition"
+                                    | "textDocument/typeDefinition"
+                                    | "textDocument/implementation"
+                            ),
+                        );
+                    }
                     // The second half of upstream's inlay-hint filtering runs
                     // AFTER mapping (`InlayHintProvider.ts:84-88`), because the
                     // question it asks — which attribute is this hint on — only
@@ -5649,6 +5669,44 @@ impl Server {
         ));
     }
 
+    /// Drop the locations of a references, definition or highlight answer
+    /// that land in a component's `<script …>` opening tag
+    /// ([`drop_locations_in_script_tags`]).
+    fn drop_locations_in_script_tags(
+        &self,
+        result: &mut serde_json::Value,
+        request_document: Option<&Uri>,
+        definitions: bool,
+    ) {
+        drop_locations_in_script_tags(result, request_document, definitions, |uri| {
+            self.component_text(uri)
+        });
+    }
+
+    /// A Svelte component's text, for checking where an answer points into
+    /// it: the editor's buffer, else the copy a project holds, else the file.
+    fn component_text(&self, uri: &Uri) -> Option<std::borrow::Cow<'_, str>> {
+        let path = uri_to_path(uri.as_str());
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "svelte")
+        {
+            return None;
+        }
+        if let Some(document) = self.documents.get(uri) {
+            return Some(std::borrow::Cow::Borrowed(document.text()));
+        }
+        if let Some(text) = self.tsgo.as_ref().and_then(|runtime| {
+            runtime
+                .overlays
+                .iter()
+                .find_map(|overlay| overlay.source_text(&path))
+        }) {
+            return Some(std::borrow::Cow::Borrowed(text));
+        }
+        fs::read_to_string(&path).ok().map(std::borrow::Cow::Owned)
+    }
+
     fn on_outcome(&mut self, outcome: Outcome) {
         match outcome {
             Outcome::Formatted { id, edits } => {
@@ -6058,6 +6116,119 @@ fn inside_element_body(text: &str, offset: usize, tag: &str) -> bool {
     let open = before.rfind(&format!("<{tag}"));
     let close = before.rfind(&format!("</{tag}"));
     open > close && open.is_some_and(|start| before[start..].contains('>'))
+}
+
+/// Keep the locations of a references, definition or highlight answer out of
+/// a component's `<script …>` opening tag ([`ScriptOpeningTags`]): no
+/// author's text is there, only the generated code svelte2tsx wrote over it,
+/// whose unmapped copies (the props type the render header hoists, review 5)
+/// map to the tag. A reference or highlight there is dropped. A definition
+/// there is right about its file (the component's own declaration is that
+/// header: go to definition on a component's tag lands there, e2e 4c), so it
+/// is moved to the start of the file, where upstream puts a definition in
+/// generated code. `request_document` is the document a highlight is about;
+/// `text_of` reads a component's text (`None` for any other document).
+fn drop_locations_in_script_tags<'t>(
+    result: &mut serde_json::Value,
+    request_document: Option<&Uri>,
+    definitions: bool,
+    text_of: impl Fn(&Uri) -> Option<std::borrow::Cow<'t, str>>,
+) {
+    let single = result.is_object();
+    let items = if single {
+        std::slice::from_ref(&*result)
+    } else if let Some(items) = result.as_array() {
+        items.as_slice()
+    } else {
+        return;
+    };
+    let mut texts = HashMap::new();
+    for (uri, _) in items.iter().filter_map(location_target) {
+        let Some(uri) = uri
+            .and_then(|uri| uri.parse::<Uri>().ok())
+            .or_else(|| request_document.cloned())
+        else {
+            continue;
+        };
+        if !texts.contains_key(uri.as_str()) {
+            let text = text_of(&uri);
+            texts.insert(uri.as_str().to_string(), text);
+        }
+    }
+    let documents = texts
+        .iter()
+        .filter_map(|(uri, text)| {
+            let text = text.as_deref()?;
+            Some((
+                uri.as_str(),
+                (text, LineIndex::new(text), ScriptOpeningTags::new(text)),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    if documents.is_empty() {
+        return;
+    }
+    let request_document = request_document.map(|uri| uri.as_str());
+    let in_tag = |item: &serde_json::Value| {
+        let Some((uri, start)) = location_target(item) else {
+            return false;
+        };
+        uri.or(request_document)
+            .and_then(|uri| documents.get(uri))
+            .is_some_and(|(text, index, tags)| tags.covers(index.offset(text, start)))
+    };
+    let start_of_file = serde_json::json!({
+        "start": { "line": 0, "character": 0 },
+        "end": { "line": 0, "character": 0 },
+    });
+    let to_start_of_file = |item: &mut serde_json::Value| {
+        for field in ["range", "targetRange", "targetSelectionRange"] {
+            if let Some(range) = item.get_mut(field) {
+                *range = start_of_file.clone();
+            }
+        }
+    };
+    if single {
+        if in_tag(result) {
+            if definitions {
+                to_start_of_file(result);
+            } else {
+                *result = serde_json::Value::Array(Vec::new());
+            }
+        }
+    } else if let Some(items) = result.as_array_mut() {
+        if definitions {
+            for item in items.iter_mut() {
+                if in_tag(item) {
+                    to_start_of_file(item);
+                }
+            }
+        } else {
+            items.retain(|item| !in_tag(item));
+        }
+    }
+    if definitions {
+        dedupe_array(result);
+    }
+}
+
+/// Where a location in a tsgo answer points: its document (`None` for a
+/// document highlight, which is about the request's own document) and the
+/// start of its range.
+fn location_target(item: &serde_json::Value) -> Option<(Option<&str>, Position)> {
+    let (uri, range) = match item.get("targetUri") {
+        Some(uri) => (
+            uri.as_str(),
+            item.get("targetSelectionRange")
+                .or_else(|| item.get("targetRange"))?,
+        ),
+        None => (
+            item.get("uri").and_then(serde_json::Value::as_str),
+            item.get("range")?,
+        ),
+    };
+    let start = serde_json::from_value::<Position>(range.get("start")?.clone()).ok()?;
+    Some((uri, start))
 }
 
 /// Drop repeated elements of an array result, keeping the first of each.
@@ -6629,6 +6800,113 @@ fn might_be_at_start_tag_whitespace(text: &str, offset: usize) -> bool {
     let at = text.get(offset..).and_then(|text| text.chars().next());
     before.is_some_and(char::is_whitespace)
         && at.is_some_and(|character| character.is_whitespace() || matches!(character, '>' | '/'))
+}
+
+#[cfg(test)]
+mod script_tag_location_tests {
+    use std::borrow::Cow;
+
+    use lsp_types::Uri;
+    use serde_json::json;
+
+    use super::drop_locations_in_script_tags;
+
+    const COMPONENT: &str = "<script lang=\"ts\" generics=\"T\">\n\ttype Size = 'sm';\n\tlet s: Size = 'sm';\n</script>\n";
+
+    fn range(line: u32, start: u32, end: u32) -> serde_json::Value {
+        json!({
+            "start": { "line": line, "character": start },
+            "end": { "line": line, "character": end },
+        })
+    }
+
+    fn filtered(mut result: serde_json::Value, definitions: bool) -> serde_json::Value {
+        let request: Uri = "file:///ws/Card.svelte".parse().unwrap();
+        drop_locations_in_script_tags(&mut result, Some(&request), definitions, |uri| {
+            uri.as_str()
+                .ends_with(".svelte")
+                .then_some(Cow::Borrowed(COMPONENT))
+        });
+        result
+    }
+
+    fn starts(result: &serde_json::Value, field: &str) -> Vec<String> {
+        result
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                let start = &item[field]["start"];
+                let end = &item[field]["end"];
+                format!(
+                    "{}:{}-{}:{}",
+                    start["line"], start["character"], end["line"], end["character"]
+                )
+            })
+            .collect()
+    }
+
+    /// A copy the render header makes of the props type maps to the
+    /// `<script …>` tag (0:1, review 5): such a reference or highlight is
+    /// dropped, while one in the script, in the `generics` value, at the `<`
+    /// or in another kind of file stays.
+    #[test]
+    fn references_and_highlights_in_a_script_opening_tag_are_dropped() {
+        let card = "file:///ws/Card.svelte";
+        let references = filtered(
+            json!([
+                { "uri": card, "range": range(1, 6, 10) },
+                { "uri": card, "range": range(0, 1, 1) },
+                { "uri": card, "range": range(0, 28, 29) },
+                { "uri": card, "range": range(2, 8, 12) },
+                { "uri": card, "range": range(0, 0, 0) },
+                { "uri": "file:///ws/util.ts", "range": range(0, 1, 5) },
+            ]),
+            false,
+        );
+        assert_eq!(
+            starts(&references, "range"),
+            ["1:6-1:10", "0:28-0:29", "2:8-2:12", "0:0-0:0", "0:1-0:5"]
+        );
+        let highlights = filtered(
+            json!([
+                { "range": range(0, 1, 5), "kind": 1 },
+                { "range": range(1, 6, 10), "kind": 3 },
+            ]),
+            false,
+        );
+        assert_eq!(starts(&highlights, "range"), ["1:6-1:10"]);
+        assert_eq!(
+            filtered(json!({ "uri": card, "range": range(0, 1, 5) }), false),
+            json!([])
+        );
+    }
+
+    /// A definition in the tag is right about its file: the component's own
+    /// declaration is the header (go to definition on a component's tag,
+    /// e2e 4c). It moves to the start of the file, once.
+    #[test]
+    fn definitions_in_a_script_opening_tag_move_to_the_start_of_the_file() {
+        let card = "file:///ws/Card.svelte";
+        let links = filtered(
+            json!([
+                { "targetUri": card, "targetRange": range(0, 1, 5), "targetSelectionRange": range(0, 1, 5), "originSelectionRange": range(3, 1, 5) },
+                { "targetUri": card, "targetRange": range(0, 1, 1), "targetSelectionRange": range(0, 1, 1), "originSelectionRange": range(3, 1, 5) },
+                { "targetUri": card, "targetRange": range(1, 6, 10), "targetSelectionRange": range(1, 6, 10) },
+            ]),
+            true,
+        );
+        assert_eq!(
+            starts(&links, "targetSelectionRange"),
+            ["0:0-0:0", "1:6-1:10"]
+        );
+        assert_eq!(starts(&links, "targetRange"), ["0:0-0:0", "1:6-1:10"]);
+        assert_eq!(links[0]["originSelectionRange"], range(3, 1, 5));
+        assert_eq!(
+            filtered(json!({ "uri": card, "range": range(0, 1, 5) }), true),
+            json!({ "uri": card, "range": range(0, 0, 0) })
+        );
+    }
 }
 
 #[cfg(test)]
