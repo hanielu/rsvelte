@@ -8,6 +8,7 @@ use crate::svelte2tsx::svelte2tsx::Svelte2TsxOptions;
 use crate::svelte2tsx::template::ctx::{Counter, TemplateNodeExt};
 use crate::svelte2tsx::template::nodes::special_element::process_fragment_trimmed;
 use crate::svelte2tsx::template::utils::expr::{get_expression_range, get_expression_text};
+use crate::svelte2tsx::template::utils::source::close_block;
 
 use super::snippet_block::hoist_snippet_blocks;
 
@@ -157,9 +158,7 @@ pub fn handle_if_block(
             } else {
                 alternate.nodes.last().unwrap().end()
             };
-            if alternate_end < block.end {
-                str.overwrite(alternate_end, block.end, "}");
-            }
+            close_block(str, alternate_end, block.end, "}");
         }
     } else {
         // No alternate - just close with `}`
@@ -168,9 +167,7 @@ pub fn handle_if_block(
         } else {
             block.consequent.nodes.last().unwrap().end()
         };
-        if consequent_end < block.end {
-            str.overwrite(consequent_end, block.end, "}");
-        }
+        close_block(str, consequent_end, block.end, "}");
     }
 }
 

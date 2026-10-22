@@ -773,7 +773,11 @@ pub fn handle_named_slot_component(
     // Emit the component-name reference (non-self-closing only — official maps
     // `</Name>` to `Name`; self-closing components have no name reference) and
     // close the named-slot block.
-    let closing_tag_start = find_closing_tag_start(source, comp.end);
+    let closing_tag_start = super::inline_component::component_closing_tag_start(
+        source,
+        find_closing_tag_start(source, comp.end),
+        comp,
+    );
     if closing_tag_start < comp.end {
         // The closing tag's gaps were emitted by the component's own overwrite.
         str.append_left_fmt(comp.end, format_args!("{}}}", comp.name));

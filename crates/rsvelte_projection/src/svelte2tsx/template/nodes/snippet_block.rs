@@ -7,6 +7,7 @@ use crate::svelte2tsx::svelte2tsx::{Svelte2TsxOptions, slice_src};
 use crate::svelte2tsx::template::ctx::{Counter, TemplateNodeExt};
 use crate::svelte2tsx::template::nodes::special_element::process_fragment_trimmed;
 use crate::svelte2tsx::template::utils::expr::{get_expression_range, get_expression_text};
+use crate::svelte2tsx::template::utils::source::close_block;
 
 /// Hoist `{#snippet}` blocks to the top of their containing block/element.
 ///
@@ -309,10 +310,7 @@ pub fn handle_snippet_block_inner(
         counter.slot_inst = saved_slot;
 
         let body_end = block.body.nodes.last().unwrap().end();
-        if body_end < block.end {
-            // Overwrite `{/snippet}` with closing
-            str.overwrite(body_end, block.end, closing);
-        }
+        close_block(str, body_end, block.end, closing);
     } else {
         // Empty body: collapse the whole `{#snippet name(params)}{/snippet}`
         // into a single declaration. Without this branch the closing

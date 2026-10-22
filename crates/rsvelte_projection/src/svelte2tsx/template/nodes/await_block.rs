@@ -11,6 +11,7 @@ use crate::svelte2tsx::template::utils::expr::{
     get_binding_range_with_type, get_binding_text_with_type, get_expression_range,
     get_expression_text,
 };
+use crate::svelte2tsx::template::utils::source::close_block;
 use crate::svelte2tsx::template::walk::process_fragment_inplace;
 
 /// The source range of `{:then VALUE}`'s binding, when it lies inside the
@@ -244,9 +245,7 @@ pub fn handle_await_block(
                     catch.nodes.last().unwrap().end()
                 };
 
-                if catch_end < block.end {
-                    str.overwrite(catch_end, block.end, "}}");
-                }
+                close_block(str, catch_end, block.end, "}}");
             } else {
                 // No catch: close the value block (if any) + the outer await
                 // block. A bare `{:then}` opened only the outer block.
@@ -255,10 +254,8 @@ pub fn handle_await_block(
                 } else {
                     then.nodes.last().unwrap().end()
                 };
-                if then_end < block.end {
-                    let close = if value_text.is_empty() { "}" } else { "}}" };
-                    str.overwrite(then_end, block.end, close);
-                }
+                let close = if value_text.is_empty() { "}" } else { "}}" };
+                close_block(str, then_end, block.end, close);
             }
         } else {
             // No `:then` after the pending block. Covers
@@ -306,14 +303,13 @@ pub fn handle_await_block(
                 } else {
                     catch.nodes.last().unwrap().end()
                 };
-                if catch_end < block.end {
-                    str.overwrite(catch_end, block.end, "}}");
-                }
-            } else if pending_end < block.end {
-                str.overwrite_fmt(
+                close_block(str, catch_end, block.end, "}}");
+            } else {
+                close_block(
+                    str,
                     pending_end,
                     block.end,
-                    format_args!("await ({expr_text});}}"),
+                    &format!("await ({expr_text});}}"),
                 );
             }
         }
@@ -435,9 +431,7 @@ pub fn handle_await_block(
                 catch.nodes.last().unwrap().end()
             };
 
-            if catch_end < block.end {
-                str.overwrite(catch_end, block.end, "}}");
-            }
+            close_block(str, catch_end, block.end, "}}");
         } else {
             // Close the value block (if any) + the outer await block. This
             // handles both the normal case (then_end < block.end: the then
@@ -498,9 +492,7 @@ pub fn handle_await_block(
             catch.nodes.last().unwrap().end()
         };
 
-        if catch_end < block.end {
-            str.overwrite(catch_end, block.end, "}}");
-        }
+        close_block(str, catch_end, block.end, "}}");
     } else {
         // Bare await block `{#await promise}{/await}` (no pending/then/catch).
         // Official `handleAwait` emits `{ await (EXPR);}` — the promise is

@@ -25,7 +25,7 @@ use crate::svelte2tsx::template::attributes::let_::{
     build_let_destructure_string, has_let_directives,
 };
 use crate::svelte2tsx::template::attributes::spread::format_spread_attribute_segments;
-use crate::svelte2tsx::template::ctx::{Counter, ElementOpenerCommentIndex};
+use crate::svelte2tsx::template::ctx::{Counter, ElementOpenerCommentIndex, TemplateNodeExt};
 use crate::svelte2tsx::template::segs::{
     Seg, bake_out_of_order_src, emit_opener_segments, emit_segmented_overwrite,
 };
@@ -37,7 +37,9 @@ use crate::svelte2tsx::template::utils::names::reversed_component_name;
 use crate::svelte2tsx::template::utils::opener_spacing::{
     OpenerCtx, closing_tag_spacing, opener_spacing,
 };
-use crate::svelte2tsx::template::utils::source::{find_closing_tag_start, find_opening_tag_end};
+use crate::svelte2tsx::template::utils::source::{
+    closing_tag_name_matches, find_closing_tag_start, find_opening_tag_end,
+};
 use crate::svelte2tsx::template::walk::{process_fragment_inplace, process_node_inplace};
 
 use super::component_slots::{
@@ -107,6 +109,22 @@ fn component_name_range(comp: &Component, source: &str) -> Option<(u32, u32)> {
     let offset = source.get(start..)?.find(comp.name.as_str())? + start;
     let end = offset + comp.name.len();
     (end <= comp.end as usize).then(|| (source_offset(offset), source_offset(end)))
+}
+
+/// `found` (a `</…>` start, or `comp.end` for a self-closing tag), unless it is
+/// the closing tag of the last child of a component whose own closing tag is
+/// missing: then `comp.end`. Like upstream's `isImplicitlyClosedBlock`, a tag
+/// that starts before the last child ends belongs to that child, even when the
+/// child has the same name.
+pub(super) fn component_closing_tag_start(source: &str, found: u32, comp: &Component) -> u32 {
+    let children_end = comp.fragment.nodes.last().map_or(0, TemplateNodeExt::end);
+    if found >= comp.end
+        || (found >= children_end && closing_tag_name_matches(source, found, &comp.name))
+    {
+        found
+    } else {
+        comp.end
+    }
 }
 
 fn component_closing_name_range(
@@ -404,6 +422,10 @@ pub fn handle_component(
     // Handle closing tag
     let closing_tag_start = find_closing_tag_start(source, comp.end);
     let is_self_closing = closing_tag_start >= comp.end;
+    // Loose parsing ends a component whose `</Name>` is not typed yet at its
+    // last child, whose own closing tag is not this component's
+    // (`InlineComponent.ts`: "no closing tag" → `endStart = node.end`).
+    let closing_tag_start = component_closing_tag_start(source, closing_tag_start, comp);
 
     // Handle children with slot awareness
     let mut deferred_slot_close = false;
@@ -571,7 +593,9 @@ pub fn handle_component(
         } else {
             ""
         };
-        if named_slot_close {
+        if closing_tag_start == comp.end {
+            str.append_left_fmt(comp.end, format_args!("{slot_close}}}"));
+        } else if named_slot_close {
             // Close just this component's block; the named-slot caller emits
             // the component-name reference + the named-slot-block close after.
             str.overwrite_fmt(

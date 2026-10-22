@@ -13,7 +13,7 @@ use crate::svelte2tsx::template::attributes::directive_suffix::{
     action_arguments, build_action_prefix_segments, build_directive_prefix_suffix,
     build_element_directive_suffix_segments,
 };
-use crate::svelte2tsx::template::ctx::Counter;
+use crate::svelte2tsx::template::ctx::{Counter, TemplateNodeExt};
 use crate::svelte2tsx::template::segs::{
     Seg, bake_out_of_order_src, emit_opener_with_hoisted_prefix, emit_segmented_overwrite,
 };
@@ -314,9 +314,13 @@ fn close_regular_element(
         .trim_end()
         .ends_with("/>");
     let closing_start = find_closing_tag_start(source, el.end);
+    // A `</…>` before the last child ends is that child's, same name or not:
+    // this element's own closing tag is missing.
+    let children_end = el.fragment.nodes.last().map_or(0, TemplateNodeExt::end);
     if crate::compiler::utils::is_void_element(&el.name)
         || self_closing
         || closing_start >= el.end
+        || closing_start < children_end
         || !closing_tag_name_matches(source, closing_start, &el.name)
     {
         str.append_left_fmt(el.end, format_args!("}}{extra_close}"));
