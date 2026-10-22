@@ -46,6 +46,7 @@ pub fn diagnostics(text: &str) -> Vec<Diagnostic> {
         let Some(start) = text[open..].find('>').map(|at| open + at + 1) else {
             break;
         };
+        // A block whose closing tag is not typed yet runs to the end.
         let end = text[start..]
             .find("</style")
             .map_or(text.len(), |at| start + at);
@@ -63,7 +64,10 @@ pub fn diagnostics(text: &str) -> Vec<Diagnostic> {
                 ..Diagnostic::default()
             });
         }
-        from = end.saturating_add(8);
+        if end == text.len() {
+            break;
+        }
+        from = end + "</style".len();
     }
     diagnostics
 }
@@ -966,6 +970,30 @@ mod tests {
             Some(NumberOrString::String("css_unknown_property".to_string()))
         );
         assert!(diagnostics("<style>a {\n  --theme: blue;\n}</style>").is_empty());
+    }
+
+    /// While a `<style>` block is being typed it has no closing tag, or only
+    /// part of one; the scan used to step eight bytes past the block's end
+    /// and slice beyond the text, and the panic cost the document every
+    /// native diagnostic.
+    #[test]
+    fn a_style_block_without_its_closing_tag_is_read_to_the_end() {
+        assert_eq!(
+            messages("<p>x</p>\n<style>\n\tp { colr: red; }\n"),
+            ["Unknown CSS property `colr`.".to_string()]
+        );
+        assert!(messages("<style>").is_empty());
+        for text in [
+            "<style>a { colr: red }</style",
+            "<style>a { colr: red }</styl",
+            "<style>a { colr: red }</style>\n<style>b { badprop: 1 }",
+        ] {
+            assert!(!messages(text).is_empty(), "{text}");
+        }
+        assert_eq!(
+            messages("<style>a { colr: red }</style><style>b { badprop: 1 }</style>").len(),
+            2
+        );
     }
 
     #[test]
