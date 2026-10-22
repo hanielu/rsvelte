@@ -55,6 +55,17 @@ impl Server {
         environment: &[(&str, &Path)],
         rsvelte_settings: Value,
     ) -> Self {
+        Self::start_with_capabilities(root, environment, rsvelte_settings, &json!({}))
+    }
+
+    /// `capabilities` is merged into the editor's default ones, a section at
+    /// a time (`textDocument`, `workspace`).
+    fn start_with_capabilities(
+        root: Option<&Path>,
+        environment: &[(&str, &Path)],
+        rsvelte_settings: Value,
+        capabilities: &Value,
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rsvelte-language-server"));
         command
             .stdin(Stdio::piped())
@@ -97,15 +108,26 @@ impl Server {
             rsvelte_settings,
         };
         let root_uri = root.map(file_uri).map(Value::String).unwrap_or(Value::Null);
+        let mut client_capabilities = json!({
+            "general": { "positionEncodings": ["utf-8", "utf-16"] },
+            "workspace": { "configuration": true },
+        });
+        for (section, value) in capabilities.as_object().into_iter().flatten() {
+            let merged = client_capabilities
+                .as_object_mut()
+                .unwrap()
+                .entry(section.clone())
+                .or_insert_with(|| json!({}));
+            for (key, value) in value.as_object().into_iter().flatten() {
+                merged[key] = value.clone();
+            }
+        }
         let id = server.request(
             "initialize",
             json!({
                 "processId": Value::Null,
                 "rootUri": root_uri,
-                "capabilities": {
-                    "general": { "positionEncodings": ["utf-8", "utf-16"] },
-                    "workspace": { "configuration": true },
-                },
+                "capabilities": client_capabilities,
             }),
         );
         let response = server.response(id, RESPONSE_TIMEOUT);
@@ -1416,6 +1438,155 @@ fn a_request_tsgo_never_answers_is_answered_without_it_and_holds_nothing_back() 
     server.shutdown();
 }
 
+/// One project at `<dir>/ws` holding `X.svelte`; returns the workspace root.
+#[cfg(unix)]
+fn one_project(dir: &Path) -> PathBuf {
+    let root = fs::canonicalize(dir).unwrap().join("ws");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    fs::write(root.join("tsconfig.json"), "{}").unwrap();
+    fs::write(
+        root.join("X.svelte"),
+        "<script lang=\"ts\">\nlet answer = 42;\n</script>\n<p>{answer}</p>\n",
+    )
+    .unwrap();
+    root
+}
+
+/// A diagnostic pull tsgo takes longer than the request timeout to answer
+/// is a slow check, not a lost request (review 4: a component reading a
+/// module whose check takes 41 s). The editor gets tsgo's answer when it
+/// comes, and tsgo is neither cancelled nor restarted, which would throw
+/// the check away and leave the document without its TypeScript
+/// diagnostics; other requests are answered meanwhile.
+#[cfg(unix)]
+#[test]
+fn a_slow_diagnostic_pull_waits_for_tsgo_and_does_not_restart_it() {
+    let dir = TestDir::new("slow-diagnostic-pull");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = one_project(&dir.0);
+    let mut server = Server::start_with_capabilities(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            ("RSVELTE_TEST_SLOW_DIAGNOSTIC_MS", Path::new("4000")),
+            ("RSVELTE_TSGO_REQUEST_TIMEOUT_MS", Path::new("1000")),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+        &json!({
+            "textDocument": { "diagnostic": {} },
+            "workspace": { "diagnostics": { "refreshSupport": true } },
+        }),
+    );
+    let x = file_uri(&root.join("X.svelte"));
+    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
+    hover(&mut server, &x);
+    for round in 0..2 {
+        let sent = Instant::now();
+        let pull = server.request(
+            "textDocument/diagnostic",
+            json!({ "textDocument": { "uri": x } }),
+        );
+        assert!(hover(&mut server, &x).to_string().contains("recorded"));
+        let report = server.response(pull, Duration::from_secs(20));
+        assert_eq!(report["result"]["kind"], "full", "{report}");
+        assert!(
+            sent.elapsed() >= Duration::from_millis(3_500),
+            "pull {round} was answered without tsgo after {:?}",
+            sent.elapsed()
+        );
+        if round == 0 {
+            server.change(
+                &x,
+                2,
+                "<script lang=\"ts\">\nlet answer = 43;\n</script>\n<p>{answer}</p>\n",
+            );
+        }
+    }
+    let lines = traffic(&log);
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| **line == format!("textDocument/didOpen {shadow}"))
+            .count(),
+        1,
+        "tsgo was restarted: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.starts_with("$/cancelRequest")),
+        "a pull was cancelled: {lines:?}"
+    );
+    server.shutdown();
+}
+
+/// An overdue request that is not one tsrs is known to loop on restarts
+/// tsgo only once tsgo answers a later request about the same document,
+/// which says tsgo is serving the document but not that request; until then
+/// it is only answered without tsgo and cancelled.
+#[cfg(unix)]
+#[test]
+fn an_overdue_request_restarts_tsgo_once_a_later_one_about_its_document_is_answered() {
+    let dir = TestDir::new("overdue-evidence");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = one_project(&dir.0);
+    let mut server = Server::start_with_settings(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            (
+                "RSVELTE_TEST_TSGO_IGNORE",
+                Path::new("textDocument/definition"),
+            ),
+            ("RSVELTE_TSGO_REQUEST_TIMEOUT_MS", Path::new("1000")),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+    );
+    let x = file_uri(&root.join("X.svelte"));
+    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
+    hover(&mut server, &x);
+    let opened = |log: &Path| {
+        traffic(log)
+            .iter()
+            .filter(|line| **line == format!("textDocument/didOpen {shadow}"))
+            .count()
+    };
+    let lost = server.request(
+        "textDocument/definition",
+        json!({ "textDocument": { "uri": x }, "position": { "line": 1, "character": 5 } }),
+    );
+    let answer = server.response(lost, Duration::from_secs(10));
+    assert!(answer.get("result").is_some(), "{answer}");
+    thread::sleep(Duration::from_millis(1_500));
+    server.probe();
+    assert_eq!(opened(&log), 1, "restarted without a sign of a loop");
+    assert!(
+        traffic(&log)
+            .iter()
+            .any(|line| line.starts_with("$/cancelRequest")),
+        "the overdue request was not cancelled: {:?}",
+        traffic(&log)
+    );
+    assert!(hover(&mut server, &x).to_string().contains("recorded"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while opened(&log) < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "tsgo answered a later request and was not restarted: {:?}",
+            traffic(&log)
+        );
+        server.probe();
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(hover(&mut server, &x).to_string().contains("recorded"));
+    server.shutdown();
+}
+
 /// A workspace with three projects that own components and one that owns
 /// none, for the background-loading tests.
 #[cfg(unix)]
@@ -1655,14 +1826,27 @@ const FAKE_TSGO_TRAFFIC: &str = r###"
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 fn main() {
     let log = PathBuf::from(std::env::var_os("RSVELTE_TEST_TSGO_LOG").unwrap());
     let marker = std::env::var("RSVELTE_TEST_MARKER").unwrap_or_else(|_| "\u{0}".to_string());
+    let delay = |name: &str| {
+        std::env::var(name).ok().and_then(|ms| ms.parse().ok()).map(Duration::from_millis)
+    };
     let stdin = io::stdin();
     let mut input = stdin.lock();
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
+    // Answers can come from other threads (`answer_later`), a whole message at a time.
+    let output = Arc::new(Mutex::new(io::stdout()));
+    let answer = |body: String| write_message(&mut *output.lock().unwrap(), &body).unwrap();
+    let answer_later = |delay: Duration, body: String| {
+        let output = Arc::clone(&output);
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            write_message(&mut *output.lock().unwrap(), &body).unwrap();
+        });
+    };
     loop {
         let Some(message) = read_message(&mut input).unwrap() else { return };
         let method = message
@@ -1682,27 +1866,38 @@ fn main() {
         }
         if method == "initialize" {
             let id = json_id(&message);
-            write_message(&mut output, &format!(
+            answer(format!(
                 r#"{{"jsonrpc":"2.0","id":{id},"result":{{"capabilities":{{"positionEncoding":"utf-8","hoverProvider":true,"workspaceSymbolProvider":true,"documentSymbolProvider":true,"referencesProvider":true}}}}}}"#
-            )).unwrap();
+            ));
         } else if method == "textDocument/completion" {
-            if let Some(delay) = std::env::var("RSVELTE_TEST_SLOW_COMPLETION_MS").ok().and_then(|ms| ms.parse().ok()) {
-                std::thread::sleep(std::time::Duration::from_millis(delay));
+            if let Some(delay) = delay("RSVELTE_TEST_SLOW_COMPLETION_MS") {
+                std::thread::sleep(delay);
             }
             let id = json_id(&message);
-            write_message(&mut output, &format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#)).unwrap();
+            answer(format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#));
         } else if method == "textDocument/hover" {
             let id = json_id(&message);
-            write_message(&mut output, &format!(
+            let body = format!(
                 r#"{{"jsonrpc":"2.0","id":{id},"result":{{"contents":{{"kind":"plaintext","value":"recorded"}}}}}}"#
-            )).unwrap();
+            );
+            answer(body);
+        } else if method == "textDocument/diagnostic" && delay("RSVELTE_TEST_SLOW_DIAGNOSTIC_MS").is_some() {
+            // A check that takes long, while every other request is answered.
+            let id = json_id(&message);
+            answer_later(
+                delay("RSVELTE_TEST_SLOW_DIAGNOSTIC_MS").unwrap(),
+                format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"kind":"full","items":[]}}}}"#),
+            );
         } else if method == "exit" {
             return;
+        } else if method == "$/cancelRequest" {
+            // A notification (its `id` names the request): an answered request
+            // stays answered, a lost one stays lost.
         } else if std::env::var("RSVELTE_TEST_TSGO_IGNORE").is_ok_and(|ignored| ignored == method) {
             // A request tsgo loses: never answered, not even once cancelled.
         } else if !method.is_empty() && message.contains(r#""id":"#) {
             let id = json_id(&message);
-            write_message(&mut output, &format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#)).unwrap();
+            answer(format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#));
         }
     }
 }
