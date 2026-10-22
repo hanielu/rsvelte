@@ -43,6 +43,8 @@ struct Server {
     next_id: i64,
     /// What `workspace/configuration` answers for the `rsvelte` section.
     rsvelte_settings: Value,
+    /// The methods of the requests the server sent the editor, in order.
+    server_requests: Vec<String>,
 }
 
 impl Server {
@@ -106,6 +108,7 @@ impl Server {
             buffered: HashMap::new(),
             next_id: 0,
             rsvelte_settings,
+            server_requests: Vec::new(),
         };
         let root_uri = root.map(file_uri).map(Value::String).unwrap_or(Value::Null);
         let mut client_capabilities = json!({
@@ -197,6 +200,9 @@ impl Server {
 
     fn answer_server_request(&mut self, message: &Value) {
         let id = message["id"].clone();
+        if let Some(method) = message["method"].as_str() {
+            self.server_requests.push(method.to_string());
+        }
         let result = if message["method"] == "workspace/configuration" {
             let values = message["params"]["items"]
                 .as_array()
@@ -1584,6 +1590,73 @@ fn an_overdue_request_restarts_tsgo_once_a_later_one_about_its_document_is_answe
         thread::sleep(Duration::from_millis(100));
     }
     assert!(hover(&mut server, &x).to_string().contains("recorded"));
+    server.shutdown();
+}
+
+/// After tsgo restarts, the pulls it was asked for before were answered
+/// without it, so the editor is asked to pull again (review 4).
+#[cfg(unix)]
+#[test]
+fn a_restarted_tsgo_has_the_editor_pull_its_diagnostics_again() {
+    let dir = TestDir::new("restart-refresh");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = one_project(&dir.0);
+    let mut server = Server::start_with_capabilities(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            (
+                "RSVELTE_TEST_TSGO_IGNORE",
+                Path::new("textDocument/signatureHelp"),
+            ),
+            ("RSVELTE_TSGO_REQUEST_TIMEOUT_MS", Path::new("1000")),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+        &json!({
+            "textDocument": { "diagnostic": {} },
+            "workspace": { "diagnostics": { "refreshSupport": true } },
+        }),
+    );
+    let x = file_uri(&root.join("X.svelte"));
+    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
+    hover(&mut server, &x);
+    let refreshes = |server: &Server| {
+        server
+            .server_requests
+            .iter()
+            .filter(|method| *method == "workspace/diagnostic/refresh")
+            .count()
+    };
+    let before = refreshes(&server);
+    let lost = server.request(
+        "textDocument/signatureHelp",
+        json!({ "textDocument": { "uri": x }, "position": { "line": 1, "character": 5 } }),
+    );
+    assert_eq!(
+        server.response(lost, Duration::from_secs(10))["result"],
+        Value::Null
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let restarted = traffic(&log)
+            .iter()
+            .filter(|line| **line == format!("textDocument/didOpen {shadow}"))
+            .count()
+            == 2;
+        if restarted && refreshes(&server) > before {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no refresh after the restart (restarted: {restarted}): {:?}",
+            server.server_requests
+        );
+        server.probe();
+        thread::sleep(Duration::from_millis(100));
+    }
     server.shutdown();
 }
 

@@ -4597,6 +4597,11 @@ impl Server {
                 if let Some(params) = self.tsgo_watchers.reset() {
                     self.send_watcher_change("client/unregisterCapability", params);
                 }
+                // The diagnostics the previous one was asked for were
+                // answered without it.
+                if generation > 1 {
+                    self.refresh_all_diagnostics();
+                }
             }
             TsgoEvent::Message {
                 generation,
@@ -5807,6 +5812,20 @@ impl Server {
             self.schedule_lint(key, Duration::ZERO);
             return;
         }
+        self.request_diagnostic_refresh();
+    }
+
+    /// Have the editor pull every document's diagnostics again, or push
+    /// them again to an editor that does not pull.
+    fn refresh_all_diagnostics(&mut self) {
+        if self.client.pull_diagnostics {
+            self.request_diagnostic_refresh();
+        } else {
+            self.relint_open_documents();
+        }
+    }
+
+    fn request_diagnostic_refresh(&mut self) {
         if !self.client.diagnostic_refresh
             || self
                 .outgoing
