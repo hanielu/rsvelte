@@ -1368,6 +1368,18 @@ fn an_edit_after_a_diagnostic_pull_waits_for_neither_of_its_halves() {
     server.shutdown();
 }
 
+/// A TypeScript buffer whose text makes tsrs loop on a signature help or
+/// completion at the returned position (after `c`: every `}` there jumps to
+/// the last `{`, which comes after it; see `tsgo_loop`).
+#[cfg(unix)]
+fn looping_buffer(dir: &Path) -> (PathBuf, &'static str, Value) {
+    (
+        dir.join("lost.ts"),
+        "export const q = w<x>;\n}c{\n",
+        json!({ "line": 1, "character": 2 }),
+    )
+}
+
 /// tsrs occasionally never answers a request: it loops on it for good. The
 /// server answers it without tsgo once it is overdue (the empty answer here:
 /// the request has no native half) and restarts tsgo, which replays the
@@ -1396,10 +1408,14 @@ fn a_request_tsgo_never_answers_is_answered_without_it_and_holds_nothing_back() 
     let x = file_uri(&root.join("a/X.svelte"));
     server.open(&x, &fs::read_to_string(root.join("a/X.svelte")).unwrap());
     hover(&mut server, &x);
+    let (lost_path, lost_text, at) = looping_buffer(&root.join("a"));
+    let lost_uri = file_uri(&lost_path);
+    server.open_as(&lost_uri, "typescript", lost_text);
+    hover(&mut server, &lost_uri);
     let sent = Instant::now();
     let lost = server.request(
         "textDocument/signatureHelp",
-        json!({ "textDocument": { "uri": x }, "position": { "line": 1, "character": 5 } }),
+        json!({ "textDocument": { "uri": lost_uri }, "position": at }),
     );
     let kept = |project: &str, file: &str| {
         file_uri(
@@ -1529,68 +1545,87 @@ fn a_slow_diagnostic_pull_waits_for_tsgo_and_does_not_restart_it() {
     server.shutdown();
 }
 
-/// An overdue request that is not one tsrs is known to loop on restarts
-/// tsgo only once tsgo answers a later request about the same document,
-/// which says tsgo is serving the document but not that request; until then
-/// it is only answered without tsgo and cancelled.
+/// A signature help or a definition tsgo answers only after the request
+/// timeout, while it answers hovers at once, is slow, not lost (review 5:
+/// tsrs answers them once a check the document's pull started is done, 52 s
+/// later). Each is answered without tsgo at the timeout and cancelled, but
+/// tsgo is not restarted, which would throw away the check and leave the
+/// pull, answered meanwhile, without its TypeScript half.
 #[cfg(unix)]
 #[test]
-fn an_overdue_request_restarts_tsgo_once_a_later_one_about_its_document_is_answered() {
-    let dir = TestDir::new("overdue-evidence");
+fn a_slow_signature_help_or_definition_does_not_restart_tsgo() {
+    let dir = TestDir::new("slow-not-lost");
     let helper = traffic_recorder(&dir.0);
     let log = dir.0.join("tsgo.log");
     let root = one_project(&dir.0);
-    let mut server = Server::start_with_settings(
+    let mut server = Server::start_with_capabilities(
         Some(&root),
         &[
             ("TSGO_BIN", helper.as_path()),
             ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
             (
-                "RSVELTE_TEST_TSGO_IGNORE",
-                Path::new("textDocument/definition"),
+                "RSVELTE_TEST_SLOW_METHODS",
+                Path::new("textDocument/signatureHelp,textDocument/definition"),
             ),
+            ("RSVELTE_TEST_SLOW_MS", Path::new("2000")),
+            ("RSVELTE_TEST_SLOW_DIAGNOSTIC_MS", Path::new("2500")),
+            ("RSVELTE_TEST_DIAGNOSTIC_WORD", Path::new("answer")),
             ("RSVELTE_TSGO_REQUEST_TIMEOUT_MS", Path::new("1000")),
         ],
         json!({ "backgroundProjects": { "enable": false } }),
+        &json!({ "textDocument": { "diagnostic": {} } }),
     );
     let x = file_uri(&root.join("X.svelte"));
     let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
     server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
     hover(&mut server, &x);
-    let opened = |log: &Path| {
-        traffic(log)
-            .iter()
-            .filter(|line| **line == format!("textDocument/didOpen {shadow}"))
-            .count()
-    };
-    let lost = server.request(
-        "textDocument/definition",
-        json!({ "textDocument": { "uri": x }, "position": { "line": 1, "character": 5 } }),
+    let sent = Instant::now();
+    let pull = server.request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": x } }),
     );
-    let answer = server.response(lost, Duration::from_secs(10));
-    assert!(answer.get("result").is_some(), "{answer}");
-    thread::sleep(Duration::from_millis(1_500));
-    server.probe();
-    assert_eq!(opened(&log), 1, "restarted without a sign of a loop");
-    assert!(
-        traffic(&log)
-            .iter()
-            .any(|line| line.starts_with("$/cancelRequest")),
-        "the overdue request was not cancelled: {:?}",
-        traffic(&log)
-    );
-    assert!(hover(&mut server, &x).to_string().contains("recorded"));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while opened(&log) < 2 {
+    let slow = ["textDocument/signatureHelp", "textDocument/definition"].map(|method| {
+        server.request(
+            method,
+            json!({ "textDocument": { "uri": x }, "position": { "line": 1, "character": 5 } }),
+        )
+    });
+    while sent.elapsed() < Duration::from_millis(3_000) {
+        let asked = Instant::now();
+        assert!(hover(&mut server, &x).to_string().contains("recorded"));
         assert!(
-            Instant::now() < deadline,
-            "tsgo answered a later request and was not restarted: {:?}",
-            traffic(&log)
+            asked.elapsed() < Duration::from_millis(500),
+            "a hover waited {:?}",
+            asked.elapsed()
         );
-        server.probe();
         thread::sleep(Duration::from_millis(100));
     }
-    assert!(hover(&mut server, &x).to_string().contains("recorded"));
+    for id in slow {
+        let answer = server.response(id, Duration::from_secs(10));
+        assert!(answer.get("result").is_some(), "{answer}");
+    }
+    let report = server.response(pull, Duration::from_secs(10));
+    assert_eq!(
+        report["result"]["items"][0]["code"], 2322,
+        "the pull lost its TypeScript half: {report}"
+    );
+    let lines = traffic(&log);
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| **line == format!("textDocument/didOpen {shadow}"))
+            .count(),
+        1,
+        "tsgo was restarted: {lines:?}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("$/cancelRequest"))
+            .count(),
+        2,
+        "the two overdue requests, and nothing else, are cancelled: {lines:?}"
+    );
     server.shutdown();
 }
 
@@ -1624,6 +1659,10 @@ fn a_restarted_tsgo_has_the_editor_pull_its_diagnostics_again() {
     let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
     server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
     hover(&mut server, &x);
+    let (lost_path, lost_text, at) = looping_buffer(&root);
+    let lost_uri = file_uri(&lost_path);
+    server.open_as(&lost_uri, "typescript", lost_text);
+    hover(&mut server, &lost_uri);
     let refreshes = |server: &Server| {
         server
             .server_requests
@@ -1634,7 +1673,7 @@ fn a_restarted_tsgo_has_the_editor_pull_its_diagnostics_again() {
     let before = refreshes(&server);
     let lost = server.request(
         "textDocument/signatureHelp",
-        json!({ "textDocument": { "uri": x }, "position": { "line": 1, "character": 5 } }),
+        json!({ "textDocument": { "uri": lost_uri }, "position": at }),
     );
     assert_eq!(
         server.response(lost, Duration::from_secs(10))["result"],
@@ -1983,6 +2022,13 @@ fn main() {
     let delay = |name: &str| {
         std::env::var(name).ok().and_then(|ms| ms.parse().ok()).map(Duration::from_millis)
     };
+    // `RSVELTE_TEST_SLOW_METHODS` (comma-separated) are answered after
+    // `RSVELTE_TEST_SLOW_MS`, while every other request is answered at once.
+    let slow_methods = std::env::var("RSVELTE_TEST_SLOW_METHODS").unwrap_or_default();
+    // A pull reports one error on the first `RSVELTE_TEST_DIAGNOSTIC_WORD` of
+    // the document, as opened.
+    let diagnostic_word = std::env::var("RSVELTE_TEST_DIAGNOSTIC_WORD").ok();
+    let mut texts = std::collections::HashMap::new();
     let stdin = io::stdin();
     let mut input = stdin.lock();
     // Answers can come from other threads (`answer_later`), a whole message at a time.
@@ -2014,11 +2060,27 @@ fn main() {
             // restarted tsgo appends to the same log while the old one ends.
             file.write_all(format!("{method} {uri}{marked}\n").as_bytes()).unwrap();
         }
+        if method == "textDocument/didOpen" {
+            if let Some(text) = json_string_field(&message, "text") {
+                texts.insert(uri.clone(), text);
+            }
+        }
         if method == "initialize" {
             let id = json_id(&message);
             answer(format!(
                 r#"{{"jsonrpc":"2.0","id":{id},"result":{{"capabilities":{{"positionEncoding":"utf-8","hoverProvider":true,"workspaceSymbolProvider":true,"documentSymbolProvider":true,"referencesProvider":true}}}}}}"#
             ));
+        } else if !method.is_empty() && slow_methods.split(',').any(|slow| slow == method) {
+            let id = json_id(&message);
+            let result = if method == "textDocument/signatureHelp" {
+                r#"{"signatures":[{"label":"slow(): void","parameters":[]}],"activeSignature":0}"#
+            } else {
+                "[]"
+            };
+            answer_later(
+                delay("RSVELTE_TEST_SLOW_MS").unwrap(),
+                format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{result}}}"#),
+            );
         } else if method == "textDocument/completion" {
             if let Some(delay) = delay("RSVELTE_TEST_SLOW_COMPLETION_MS") {
                 std::thread::sleep(delay);
@@ -2035,12 +2097,27 @@ fn main() {
                 Some(delay) => answer_later(delay, body),
                 None => answer(body),
             }
-        } else if method == "textDocument/diagnostic" && delay("RSVELTE_TEST_SLOW_DIAGNOSTIC_MS").is_some() {
+        } else if method == "textDocument/diagnostic"
+            && (delay("RSVELTE_TEST_SLOW_DIAGNOSTIC_MS").is_some() || diagnostic_word.is_some())
+        {
             // A check that takes long, while every other request is answered.
             let id = json_id(&message);
+            let items = diagnostic_word
+                .as_deref()
+                .and_then(|word| {
+                    let text = texts.get(&uri)?;
+                    let at = text.find(word)?;
+                    let line = text[..at].matches('\n').count();
+                    let character = at - text[..at].rfind('\n').map_or(0, |newline| newline + 1);
+                    let end = character + word.len();
+                    Some(format!(
+                        r#"{{"range":{{"start":{{"line":{line},"character":{character}}},"end":{{"line":{line},"character":{end}}}}},"severity":1,"code":2322,"source":"ts","message":"recorded diagnostic"}}"#
+                    ))
+                })
+                .unwrap_or_default();
             answer_later(
-                delay("RSVELTE_TEST_SLOW_DIAGNOSTIC_MS").unwrap(),
-                format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"kind":"full","items":[]}}}}"#),
+                delay("RSVELTE_TEST_SLOW_DIAGNOSTIC_MS").unwrap_or_default(),
+                format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"kind":"full","items":[{items}]}}}}"#),
             );
         } else if method == "exit" {
             return;
@@ -2085,6 +2162,30 @@ fn json_id(message: &str) -> &str {
         let end = rest.find(|character: char| !character.is_ascii_digit() && character != '-').unwrap_or(rest.len());
         &rest[..end]
     }
+}
+
+/// The first string field `name` of a message, decoded.
+fn json_string_field(message: &str, name: &str) -> Option<String> {
+    let start = message.find(&format!(r#""{name}":""#))? + name.len() + 4;
+    let mut value = String::new();
+    let mut characters = message[start..].chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => return Some(value),
+            '\\' => match characters.next()? {
+                'n' => value.push('\n'),
+                't' => value.push('\t'),
+                'r' => value.push('\r'),
+                'u' => {
+                    let hex = characters.by_ref().take(4).collect::<String>();
+                    value.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?).unwrap_or('?'));
+                }
+                other => value.push(other),
+            },
+            other => value.push(other),
+        }
+    }
+    None
 }
 "###;
 
