@@ -7,7 +7,7 @@ use crate::ast::template::Root;
 use super::interfaces::{Svelte2TsxMode, Svelte2TsxOptions};
 use super::magic_string::MagicString;
 use super::nodes::generics::{
-    extract_generics_from_script_tag, split_generic_param_names, type_text_references_any,
+    generics_value_range, split_generic_param_names, type_text_references_any,
     type_text_typeof_references_local_value,
 };
 use super::nodes::scripts::{LiftedImport, detect_top_level_await, find_script_close_tag_start};
@@ -82,7 +82,10 @@ pub fn process_instance_script_tag(
 
     // Detect `generics` attribute on the script tag
     let script_tag_text = slice_src(source, script_start as usize, content_start as usize);
-    let generics_param = extract_generics_from_script_tag(script_tag_text);
+    let generics_value = generics_value_range(script_tag_text);
+    let generics_param = generics_value
+        .clone()
+        .map(|range| script_tag_text[range].to_string());
     let use_jsdoc_generics = options.emit_jsdoc && !options.is_ts_file;
     // For JS files emitting JSDoc, the generics live on a `/** @template T */`
     // line *before* `function $$render()`, not as `<T>` on the function.
@@ -174,10 +177,30 @@ pub fn process_instance_script_tag(
         && !force_inside_render
         && let Some(type_text) = exported_names.props_type_text.as_ref()
     {
-        format!("{type_decl_prefix};type $$ComponentProps =  {type_text};")
+        format!("{type_decl_prefix}{COMPONENT_PROPS_ALIAS_HEAD}{type_text};")
     } else {
         String::new()
     };
+
+    // Split position: right after the `<` of `<script>`. This matches
+    // the JS reference's `scriptTag.start + 1`, so moved chunks land
+    // between the `;` (from the `<` overwrite) and the function
+    // declaration that replaces the rest of the script tag. The JS
+    // reference always splits there (`overwrite(start, start + 1, ';')`
+    // then `overwrite(start + 1, scriptTagEnd, …)`).
+    let split_pos = if content_start > script_start + 1 {
+        Some(script_start + 1)
+    } else {
+        None
+    };
+    // The `$$ComponentProps` alias repeats the author's `$props()` annotation,
+    // which upstream moves there, so that a position in the alias maps back to
+    // the annotation. Written out as text, the alias mapped to the `<script`
+    // tag the header replaces (0:1): renaming a type the annotation uses edited
+    // the tag and missed the annotation. A mapped copy of the annotation
+    // (`MagicString::insert_copy`) yields the same code with an exact mapping,
+    // and the annotation's own place keeps its `$$ComponentProps` reference.
+    let alias_copy = split_pos.and_then(|_| props_alias_copy(exported_names, source));
 
     // For best-effort auto-generated types, insert INSIDE $$render.
     //
@@ -196,7 +219,7 @@ pub fn process_instance_script_tag(
         && let Some(type_text) = exported_names.props_type_text.as_ref()
     {
         if force_inside_render {
-            format!("\n;type $$ComponentProps =  {type_text};")
+            format!("\n{COMPONENT_PROPS_ALIAS_HEAD}{type_text};")
         } else {
             format!(
                 "\n/*\u{03A9}ignore_start\u{03A9}*/;type $$ComponentProps = {type_text};/*\u{03A9}ignore_end\u{03A9}*/"
@@ -227,7 +250,7 @@ pub fn process_instance_script_tag(
     // reference produces.
     let ts_component_props_in_part_a =
         !hoistable_snippet_ranges.is_empty() && !ts_component_props_before_render.is_empty();
-    if ts_component_props_in_part_a && !has_imports {
+    if ts_component_props_in_part_a && !has_imports && alias_copy.is_none() {
         part_a.push('\n');
         part_a.push_str(&ts_component_props_before_render);
     }
@@ -248,26 +271,43 @@ pub fn process_instance_script_tag(
     } else {
         ""
     };
-    let part_b_component_props = if ts_component_props_in_part_a {
-        ""
+    // The alias leads `part_b`, after `part_b_prefix`; as a copy it is
+    // inserted just before `part_b`, carrying that prefix.
+    let alias_copy_in_part_b = alias_copy
+        .filter(|_| !ts_component_props_in_part_a && !ts_component_props_before_render.is_empty());
+    let (part_b_lead, part_b_component_props) = if ts_component_props_in_part_a {
+        (part_b_prefix, "")
+    } else if alias_copy_in_part_b.is_some() {
+        ("", "")
     } else {
-        &ts_component_props_before_render
+        (part_b_prefix, ts_component_props_before_render.as_str())
     };
-    let part_b = format!(
-        "{part_b_prefix}{part_b_component_props}{template_comment}{async_prefix}function $$render{render_generics}() {{{dollar_decls}{ts_component_props_inside_render}{trailing_newline}"
+    // TypeScript's `$$render<…>` keeps the `generics` attribute's value where it
+    // is, between the overwrites of the tag around it, as upstream does, so
+    // that its type parameters map back to the attribute: a rename of `T` or an
+    // error in its constraint lands there, not on the `<script` tag (0:1).
+    let generics_in_place = generics_value
+        .filter(|range| {
+            split_pos.is_some()
+                && options.is_ts_file
+                && exported_names.dollar_generics.is_empty()
+                && !range.is_empty()
+        })
+        .map(|range| {
+            let offset = |at: usize| script_start + u32::try_from(at).expect("tag offset fits");
+            (offset(range.start), offset(range.end))
+        });
+    let (generics_open, generics_close) = if generics_in_place.is_some() {
+        ("<", ">")
+    } else {
+        (render_generics.as_str(), "")
+    };
+    let part_b_head = format!(
+        "{part_b_lead}{part_b_component_props}{template_comment}{async_prefix}function $$render{generics_open}"
     );
-
-    // Split position: right after the `<` of `<script>`. This matches
-    // the JS reference's `scriptTag.start + 1`, so moved chunks land
-    // between the `;` (from the `<` overwrite) and the function
-    // declaration that replaces the rest of the script tag. The JS
-    // reference always splits there (`overwrite(start, start + 1, ';')`
-    // then `overwrite(start + 1, scriptTagEnd, …)`).
-    let split_pos = if content_start > script_start + 1 {
-        Some(script_start + 1)
-    } else {
-        None
-    };
+    let part_b_tail = format!(
+        "{generics_close}() {{{dollar_decls}{ts_component_props_inside_render}{trailing_newline}"
+    );
     if let Some(sp) = split_pos {
         if script_start < sp {
             str.overwrite(script_start, sp, &part_a);
@@ -285,11 +325,23 @@ pub fn process_instance_script_tag(
             has_module_script,
             str,
         );
-        if ts_component_props_in_part_a && let Some(last) = imports.last() {
-            str.append_left_fmt(
-                content_start + last.end,
-                format_args!("\n{ts_component_props_before_render}"),
-            );
+        if ts_component_props_in_part_a {
+            if let Some((start, end)) = alias_copy {
+                // After the imports and before the hoisted types, where `part_a`
+                // or the last import's outro would carry it as text.
+                str.insert_copy(
+                    sp,
+                    &format!("\n{type_decl_prefix}{COMPONENT_PROPS_ALIAS_HEAD}"),
+                    start,
+                    end,
+                    ";",
+                );
+            } else if let Some(last) = imports.last() {
+                str.append_left_fmt(
+                    content_start + last.end,
+                    format_args!("\n{ts_component_props_before_render}"),
+                );
+            }
         }
         // Move hoistable type/interface declarations first so they
         // sit BEFORE the snippets in the chunk list, matching the JS
@@ -351,12 +403,30 @@ pub fn process_instance_script_tag(
         for (s, e) in hoistable_snippet_ranges {
             str.move_range(*s, *e, sp);
         }
-        str.overwrite(sp, content_start, &part_b);
+        if let Some((start, end)) = alias_copy_in_part_b {
+            str.insert_copy(
+                sp,
+                &format!("{part_b_prefix}{type_decl_prefix}{COMPONENT_PROPS_ALIAS_HEAD}"),
+                start,
+                end,
+                ";",
+            );
+        }
+        if let Some((value_start, value_end)) = generics_in_place {
+            str.overwrite(sp, value_start, &part_b_head);
+            str.overwrite(value_end, content_start, &part_b_tail);
+        } else {
+            str.overwrite_fmt(
+                sp,
+                content_start,
+                format_args!("{part_b_head}{part_b_tail}"),
+            );
+        }
     } else if script_start < content_start {
         str.overwrite_fmt(
             script_start,
             content_start,
-            format_args!("{part_a}{part_b}"),
+            format_args!("{part_a}{part_b_head}{part_b_tail}"),
         );
     }
 
@@ -367,7 +437,7 @@ pub fn process_instance_script_tag(
         )
     {
         let decl = if force_inside_render {
-            format!(";type $$ComponentProps =  {type_text};")
+            format!("{COMPONENT_PROPS_ALIAS_HEAD}{type_text};")
         } else {
             // type_already_inserted (auto-generated SvelteKit / fallback type).
             // JS reference wraps in surroundWithIgnoreComments.
@@ -382,7 +452,10 @@ pub fn process_instance_script_tag(
         // one to the left chunk's outro only when the declaration opens the
         // script; elsewhere the right chunk also prevents a preceding import
         // from carrying the alias away when it is hoisted.
-        if force_inside_render && let_pos == content_start {
+        if force_inside_render && let Some((start, end)) = alias_copy {
+            // Before the declaration's leading trivia, where the text goes.
+            str.insert_copy(let_pos, COMPONENT_PROPS_ALIAS_HEAD, start, end, ";");
+        } else if force_inside_render && let_pos == content_start {
             str.append_left(let_pos, &decl);
         } else {
             str.append_right(let_pos, &decl);
@@ -425,6 +498,22 @@ pub fn process_instance_script_tag(
     // output oxfmt cannot reformat (so only blank-line stripping applies).
 
     has_top_level_await
+}
+
+/// How the `$$ComponentProps` alias starts; the props type and `;` follow.
+const COMPONENT_PROPS_ALIAS_HEAD: &str = ";type $$ComponentProps =  ";
+
+/// The instance script's `$props()` annotation that the `$$ComponentProps`
+/// alias repeats, when the alias repeats it verbatim (script recovery can
+/// have repaired the text the alias holds; then it stays text).
+fn props_alias_copy(exported_names: &ExportedNames, source: &str) -> Option<(u32, u32)> {
+    if exported_names.type_already_inserted() {
+        return None;
+    }
+    let (start, end) = exported_names.props_type_source?;
+    (start < end
+        && source.get(start as usize..end as usize) == exported_names.props_type_text.as_deref())
+    .then_some((start, end))
 }
 
 /// Hoist the instance script's top-level imports above `$$render()` by

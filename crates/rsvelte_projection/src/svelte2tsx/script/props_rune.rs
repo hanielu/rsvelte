@@ -67,6 +67,8 @@ pub(super) struct PropsRuneInfo {
     props_call_end: u32,
     /// Whether the declarator has a TS type annotation
     flags: PropsRuneFlags,
+    /// Start of the type annotation's type (relative to `raw_content`)
+    type_annotation_start: Option<u32>,
     /// End of the type annotation (relative to `raw_content`)
     type_annotation_end: Option<u32>,
     /// Text of the type annotation
@@ -212,6 +214,7 @@ pub(super) fn apply_props_typedef(
             );
         }
         exported_names.set_has_component_props_typedef(true);
+        record_props_type_source(info, offset, exported_names);
         // Track the position right BEFORE the leading whitespace of the
         // `let { ... } = $props()` declaration so the caller can insert
         // `;type $$ComponentProps = ...;` there when the type cannot be
@@ -244,6 +247,7 @@ pub(super) fn apply_props_typedef(
             );
         }
         exported_names.set_has_component_props_typedef(true);
+        record_props_type_source(info, offset, exported_names);
         // props_type_text is the original type text (set by detect_props_rune_oxc).
         // svelte2tsx.rs uses it in `ts_component_props_before_render` to emit
         // `;type $$ComponentProps = <type_text>;` before `function $$render`.
@@ -536,6 +540,15 @@ pub(super) fn apply_props_typedef(
     }
 }
 
+/// Remember where the annotation that becomes the `$$ComponentProps` alias
+/// sits, so the alias can be emitted as a mapped copy of it.
+fn record_props_type_source(info: &PropsRuneInfo, offset: u32, exported_names: &mut ExportedNames) {
+    exported_names.props_type_source = info
+        .type_annotation_start
+        .zip(info.type_annotation_end)
+        .map(|(start, end)| (start + offset, end + offset));
+}
+
 /// Check if a variable declarator's init is a `$props()` call.
 pub(super) fn is_props_call_oxc(declarator: &oxc::VariableDeclarator) -> bool {
     if let Some(ref init) = declarator.init
@@ -732,6 +745,7 @@ pub(super) fn collect_props_rune_info(
     // Also detect if the type is "hoistable" (inline object type vs named type reference)
     let TypeAnnotationInfo {
         has_type_annotation,
+        type_annotation_start,
         type_annotation_end,
         type_text,
         is_hoistable_type,
@@ -793,6 +807,7 @@ pub(super) fn collect_props_rune_info(
         destructure_end,
         props_call_end,
         flags,
+        type_annotation_start,
         type_annotation_end,
         type_text,
         jsdoc_type,
@@ -869,6 +884,7 @@ fn collect_binding_property(
 
 struct TypeAnnotationInfo {
     has_type_annotation: bool,
+    type_annotation_start: Option<u32>,
     type_annotation_end: Option<u32>,
     type_text: Option<String>,
     is_hoistable_type: bool,
@@ -880,6 +896,7 @@ fn type_annotation_info(declarator: &oxc::VariableDeclarator, source: &str) -> T
     declarator.type_annotation.as_ref().map_or(
         TypeAnnotationInfo {
             has_type_annotation: false,
+            type_annotation_start: None,
             type_annotation_end: None,
             type_text: None,
             is_hoistable_type: false,
@@ -894,6 +911,7 @@ fn type_annotation_info(declarator: &oxc::VariableDeclarator, source: &str) -> T
                 .then(|| source[start..end].to_string());
             TypeAnnotationInfo {
                 has_type_annotation: true,
+                type_annotation_start: Some(ty.span().start),
                 type_annotation_end: Some(ty.span().end),
                 type_text: text,
                 is_hoistable_type: matches!(ty, oxc::TSType::TSTypeLiteral(_)),
