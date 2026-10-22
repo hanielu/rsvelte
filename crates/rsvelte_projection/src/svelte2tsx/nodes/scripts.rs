@@ -32,6 +32,20 @@ pub fn find_script_close_tag_start(source: &str, script_end: u32) -> u32 {
     script_end
 }
 
+/// Where `script`'s content ends: its closing tag, searched only after the
+/// content starts, or the element's end when it has none. A script that is not
+/// closed yet can hold `</script>` in an attribute value (`<script
+/// a="</script>"/`), which must not end the content before it starts.
+pub(crate) fn script_content_end(script: &crate::ast::template::Script, source: &str) -> usize {
+    let content_start = script.content_offset as usize;
+    let script_end = (script.end as usize).max(content_start);
+    let content = slice_src(source, content_start, script_end);
+    content
+        .rfind("</script>")
+        .or_else(|| content.rfind("</Script>"))
+        .map_or(script_end, |close| content_start + close)
+}
+
 /// A leading comment that travels with its import when the import is hoisted.
 /// Positions are relative to the script content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,13 +82,7 @@ pub fn find_instance_imports(
     program: &oxc_ast::ast::Program,
 ) -> Vec<LiftedImport> {
     let content_start = script.content_offset as usize;
-    let script_source = slice_src(source, script.start as usize, script.end as usize);
-    let close_tag_offset = script_source
-        .rfind("</script>")
-        .or_else(|| script_source.rfind("</Script>"))
-        .unwrap_or(script_source.len());
-    let content_end = script.start as usize + close_tag_offset;
-    let raw_content = &source[content_start..content_end];
+    let raw_content = slice_src(source, content_start, script_content_end(script, source));
 
     // Fast path: an `import` substring is required for any import
     // declaration to exist. Skip the OXC parse entirely for the majority
