@@ -70,12 +70,20 @@ pub fn hover(text: &str, offset: usize, markdown: bool) -> Option<Hover> {
             .map(|(answer, span)| ranged(css_answer(markdown, answer), text, span));
     }
     // `HTMLPlugin.doHover` bails on `possiblyComponent(node)`, so a component's
-    // attributes get no HTML description.
+    // attributes get no HTML description. `getAttrHover` (`htmlHover.js:49-69`)
+    // answers only for an entry with a description, the last such one, so an
+    // attribute without one (`<input placeholder>`) is left to TypeScript.
     if !attribute.in_value
         && !attribute.on_a_component()
         && let Some(provided) = provider::attributes(attribute.element_tag)
             .into_iter()
-            .find(|provided| provided.name == attribute.name)
+            .rfind(|provided| {
+                provided.name == attribute.name
+                    && provided
+                        .data
+                        .description
+                        .is_some_and(|text| !text.is_empty())
+            })
         && let Some(value) = documentation(
             &Entry {
                 description: provided.data.description,
@@ -549,6 +557,16 @@ mod tests {
                 lsp_types::Position::new(0, 9)
             ))
         );
+    }
+
+    /// `<input placeholder>` has browser data but no description, which
+    /// `getAttrHover` requires; `<textarea placeholder>` has one.
+    #[test]
+    fn an_attribute_without_a_description_has_no_html_hover() {
+        let input = "<input placeholder=\"p\" />";
+        expect_none(input, input.find("placeholder").unwrap() + 2);
+        let textarea = "<textarea placeholder=\"p\"></textarea>";
+        assert!(hovered_tag(textarea, textarea.find("placeholder").unwrap() + 2).is_some());
     }
 
     #[test]
