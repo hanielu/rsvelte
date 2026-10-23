@@ -1,8 +1,14 @@
 //! Svelte-specific normalization for tsgo code actions.
 
+use std::path::Path;
+
 use lsp_types::{Position, Range, Uri};
 use rsvelte_core::{Allocator, ParseOptions, parse};
 use serde_json::{Map, Value, json};
+
+use crate::context::script_bodies;
+use crate::tsgo_completion::{ImportPlacement, is_new_import_edit, place_new_import_edit};
+use crate::tsgo_overlay::TsgoOverlay;
 
 use crate::text::LineIndex;
 
@@ -765,6 +771,131 @@ fn newline(source: &str) -> &'static str {
     }
 }
 
+/// Marker a code action carries while its new imports are held out of the
+/// mapping ([`take_new_imports`]); its value indexes the held edits.
+const NEW_IMPORTS_KEY: &str = "__rsvelte_new_imports";
+
+/// [`crate::tsgo_completion::take_new_import_edits`] for a code-action
+/// response: upstream places an import fix's edits with the same function
+/// (`CodeActionsProvider.convertAndFixCodeFixAction` calls
+/// `codeActionChangeToTextEdit`). Each action's new-import edits in the shadow
+/// are taken out, placed in source coordinates and held; the action keeps a
+/// marker [`restore_new_imports`] puts them back by after the mapping. A
+/// component without a `<script>` is left to [`wrap_import_edits_in_script`].
+pub fn take_new_imports(
+    value: &mut Value,
+    overlay: &TsgoOverlay,
+    shadow_path: &Path,
+    shadow_uri: &str,
+    placement: &ImportPlacement<'_>,
+) -> Vec<Vec<Value>> {
+    let bodies = script_bodies(placement.source);
+    if bodies.instance.is_none() && bodies.module.is_none() {
+        return Vec::new();
+    }
+    let Some(actions) = code_actions_mut(value) else {
+        return Vec::new();
+    };
+    let mut held = Vec::new();
+    for action in actions {
+        let mut imports = Vec::new();
+        let mut take = |edits: &mut Value| {
+            if let Some(edits) = edits.as_array_mut() {
+                let (new, rest): (Vec<Value>, Vec<Value>) = std::mem::take(edits)
+                    .into_iter()
+                    .partition(is_new_import_edit);
+                *edits = rest;
+                imports.extend(new);
+            }
+        };
+        let Some(edit) = action.get_mut("edit").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        if let Some(edits) = edit
+            .get_mut("changes")
+            .and_then(Value::as_object_mut)
+            .and_then(|changes| changes.get_mut(shadow_uri))
+        {
+            take(edits);
+        }
+        for change in edit
+            .get_mut("documentChanges")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            if change.pointer("/textDocument/uri").and_then(Value::as_str) == Some(shadow_uri)
+                && let Some(edits) = change.get_mut("edits")
+            {
+                take(edits);
+            }
+        }
+        if imports.is_empty() {
+            continue;
+        }
+        action[NEW_IMPORTS_KEY] = json!(held.len());
+        held.push(
+            imports
+                .into_iter()
+                .filter_map(|edit| place_new_import_edit(overlay, shadow_path, placement, edit))
+                .collect(),
+        );
+    }
+    held
+}
+
+/// Put the edits [`take_new_imports`] held back into their actions, now in
+/// the source document `source_uri`.
+pub fn restore_new_imports(value: &mut Value, source_uri: &str, mut held: Vec<Vec<Value>>) {
+    let Some(actions) = code_actions_mut(value) else {
+        return;
+    };
+    for action in actions {
+        let Some(object) = action.as_object_mut() else {
+            continue;
+        };
+        let Some(index) = object
+            .remove(NEW_IMPORTS_KEY)
+            .and_then(|index| index.as_u64())
+            .and_then(|index| usize::try_from(index).ok())
+        else {
+            continue;
+        };
+        let Some(edits) = held.get_mut(index).map(std::mem::take) else {
+            continue;
+        };
+        let edit = object.entry("edit").or_insert_with(|| json!({}));
+        if let Some(changes) = edit
+            .get_mut("documentChanges")
+            .and_then(Value::as_array_mut)
+        {
+            match changes.iter_mut().find(|change| {
+                change.pointer("/textDocument/uri").and_then(Value::as_str) == Some(source_uri)
+            }) {
+                Some(change) => {
+                    if let Some(list) = change.get_mut("edits").and_then(Value::as_array_mut) {
+                        list.extend(edits);
+                    }
+                }
+                None => changes.push(json!({
+                    "textDocument": { "uri": source_uri, "version": null },
+                    "edits": edits,
+                })),
+            }
+        } else if let Some(edit) = edit.as_object_mut() {
+            let changes = edit.entry("changes").or_insert_with(|| json!({}));
+            if let Some(changes) = changes.as_object_mut() {
+                let list = changes
+                    .entry(source_uri.to_string())
+                    .or_insert_with(|| json!([]));
+                if let Some(list) = list.as_array_mut() {
+                    list.extend(edits);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -777,6 +908,88 @@ mod tests {
 
     fn context<'a>(uri: &'a Uri, source: &'a str) -> TsgoCodeActionContext<'a> {
         TsgoCodeActionContext::new(uri, source)
+    }
+
+    /// `source` as `App.svelte` beside `Widget.svelte`, projected: the
+    /// overlay, the component's path and its shadow's path.
+    fn projected(source: &str) -> (std::path::PathBuf, std::path::PathBuf, TsgoOverlay) {
+        // Tests run in parallel: a counter keeps their workspaces apart.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "rsvelte-component-import-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Widget.svelte"), "<p>w</p>\n").unwrap();
+        let path = root.join("App.svelte");
+        std::fs::write(&path, source).unwrap();
+        let overlay = TsgoOverlay::build_with(&root, None, None).unwrap();
+        let shadow = crate::uri::uri_to_path(
+            overlay
+                .shadow_for_source(&path)
+                .unwrap()
+                .shadow_uri
+                .as_str(),
+        );
+        (path, shadow, overlay)
+    }
+
+    /// A code action's new import goes where a completion's does, and tsgo's
+    /// import put before the script's first import lands at the start of that
+    /// import's line, not after its indentation.
+    #[test]
+    fn a_code_actions_new_import_is_placed_like_a_completions() {
+        let source = "<script lang=\"ts\">\n\timport Widget from './Widget.svelte';\n\tlet on = true;\n</script>\n\n<Widget />\n";
+        let (path, shadow, overlay) = projected(source);
+        let shadow_uri = overlay
+            .shadow_for_source(&path)
+            .unwrap()
+            .shadow_uri
+            .to_string();
+        let text = overlay.shadow_text(&shadow).unwrap();
+        let first_import = text
+            .lines()
+            .position(|line| line.starts_with("import "))
+            .unwrap();
+        let import = "import { helper } from './helpers';\n";
+        let mut response = json!([{
+            "title": "Add import from \"./helpers\"",
+            "kind": "quickfix",
+            "edit": { "changes": { shadow_uri.clone(): [{
+                "range": {
+                    "start": { "line": first_import, "character": 0 },
+                    "end": { "line": first_import, "character": 0 },
+                },
+                "newText": import,
+            }]}},
+        }]);
+        let placement = ImportPlacement {
+            source,
+            trigger: None,
+            script_language: None,
+        };
+        let held = take_new_imports(&mut response, &overlay, &shadow, &shadow_uri, &placement);
+        assert_eq!(response[0]["edit"]["changes"][&shadow_uri], json!([]));
+        // The mapping moves `changes` to the source document's URI.
+        let source_uri = "file:///App.svelte";
+        let edits = response[0]["edit"]["changes"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&shadow_uri)
+            .unwrap();
+        response[0]["edit"]["changes"][source_uri] = edits;
+        restore_new_imports(&mut response, source_uri, held);
+        assert_eq!(
+            response[0]["edit"]["changes"][source_uri],
+            json!([{
+                "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 0 } },
+                "newText": import,
+            }])
+        );
+        assert!(response[0].get(NEW_IMPORTS_KEY).is_none());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

@@ -51,7 +51,8 @@ use crate::settings::Settings;
 use crate::text::LineIndex;
 use crate::tsgo_client::{OpenBuffer, TsgoClient, TsgoClientClosed, TsgoConfig, TsgoEvent};
 use crate::tsgo_code_actions::{
-    TsgoCodeActionContext, document_has_parser_error, rewrite_code_action_response,
+    TsgoCodeActionContext, document_has_parser_error, restore_new_imports,
+    rewrite_code_action_response, take_new_imports,
 };
 use crate::tsgo_completion::{
     CompletionAction, CompletionRewriteContext, CompletionSite, ImportPlacement,
@@ -5188,14 +5189,20 @@ impl Server {
                     }
                     // New imports are placed before mapping, from the generated
                     // line before them (`CompletionProvider.ts:1135-1143`).
-                    let new_imports = if method == "completionItem/resolve"
-                        && let Some(runtime) = &self.tsgo
-                        && let Some(source) = source_path.as_deref()
-                        && let Some(overlay) = runtime.overlay_for_source(source)
-                        && let Some(shadow) = overlay.shadow_for_source(source)
-                        && let Some(text) = source_uri
-                            .as_ref()
-                            .and_then(|uri| self.documents.get(uri))
+                    // Code actions' import fixes are placed the same way
+                    // (`CodeActionsProvider.ts:790-807`).
+                    let mut new_imports = Vec::new();
+                    let mut code_action_imports = Vec::new();
+                    if matches!(
+                        method.as_str(),
+                        "completionItem/resolve" | "textDocument/codeAction"
+                    ) && let Some(runtime) = &self.tsgo
+                        && let Some(document) = document.as_ref()
+                        && let Some((overlay, shadow_path)) =
+                            shadow_overlay(&runtime.overlays, document)
+                        && let Some(text) = self
+                            .documents
+                            .get(document.source_uri())
                             .map(Document::text)
                     {
                         let placement = ImportPlacement {
@@ -5207,11 +5214,19 @@ impl Server {
                                 self.settings.svelte.default_script_language.as_str(),
                             ),
                         };
-                        let shadow_path = uri_to_path(shadow.shadow_uri.as_str());
-                        take_new_import_edits(result, overlay, &shadow_path, &placement)
-                    } else {
-                        Vec::new()
-                    };
+                        if method == "completionItem/resolve" {
+                            new_imports =
+                                take_new_import_edits(result, overlay, &shadow_path, &placement);
+                        } else {
+                            code_action_imports = take_new_imports(
+                                result,
+                                overlay,
+                                &shadow_path,
+                                document.shadow_uri().as_str(),
+                                &placement,
+                            );
+                        }
+                    }
                     if let Some(runtime) = &self.tsgo {
                         let mut mapper = TsgoResponseMapper::for_overlays_with_default_document(
                             &runtime.overlays,
@@ -5225,6 +5240,11 @@ impl Server {
                             );
                         }
                         mapper.map_response(&method, result);
+                    }
+                    if !code_action_imports.is_empty()
+                        && let Some(uri) = source_uri.as_ref()
+                    {
+                        restore_new_imports(result, uri.as_str(), code_action_imports);
                     }
                     if !new_imports.is_empty()
                         && let Some(item) = result.as_object_mut()
@@ -7111,6 +7131,20 @@ fn incomplete_completion_filter(text: &str, position: &serde_json::Value) -> Str
         .next_back()
         .unwrap_or(0);
     window[start..].to_lowercase()
+}
+
+/// The project whose shadow a request was mapped to, and that shadow's path.
+fn shadow_overlay<'a>(
+    overlays: &'a [TsgoOverlay],
+    document: &RequestDocumentContext,
+) -> Option<(&'a TsgoOverlay, PathBuf)> {
+    let source_path = uri_to_path(document.source_uri().as_str());
+    let overlay = overlays.iter().find(|overlay| {
+        overlay
+            .shadow_for_source(&source_path)
+            .is_some_and(|shadow| &shadow.shadow_uri == document.shadow_uri())
+    })?;
+    Some((overlay, uri_to_path(document.shadow_uri().as_str())))
 }
 
 /// `isInScript` (`plugins/typescript/utils.ts`): whether the cursor sits in an

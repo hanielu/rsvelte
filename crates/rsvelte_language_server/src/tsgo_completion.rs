@@ -182,28 +182,40 @@ pub fn take_new_import_edits(
     else {
         return Vec::new();
     };
-    let is_new_import = |edit: &Value| {
-        edit.get("newText")
-            .and_then(Value::as_str)
-            .is_some_and(|text| text.trim_start().starts_with("import "))
-    };
-    let (imports, rest): (Vec<Value>, Vec<Value>) =
-        std::mem::take(edits).into_iter().partition(is_new_import);
+    let (imports, rest): (Vec<Value>, Vec<Value>) = std::mem::take(edits)
+        .into_iter()
+        .partition(is_new_import_edit);
     *edits = rest;
     imports
         .into_iter()
-        .filter_map(|mut edit| {
-            let range = serde_json::from_value::<Range>(edit.get("range")?.clone()).ok()?;
-            let text = edit.get("newText")?.as_str()?.to_string();
-            let (range, text) = place_new_import(overlay, shadow_path, placement, range, text);
-            edit["range"] = json!(range);
-            edit["newText"] = Value::String(text);
-            Some(edit)
-        })
+        .filter_map(|edit| place_new_import_edit(overlay, shadow_path, placement, edit))
         .collect()
 }
 
-fn place_new_import(
+/// Whether an edit writes a new import statement.
+pub(crate) fn is_new_import_edit(edit: &Value) -> bool {
+    edit.get("newText")
+        .and_then(Value::as_str)
+        .is_some_and(|text| text.trim_start().starts_with("import "))
+}
+
+/// Place one new import edit tsgo answered in the shadow (see
+/// [`take_new_import_edits`]); `None` for an edit without a range or text.
+pub(crate) fn place_new_import_edit(
+    overlay: &TsgoOverlay,
+    shadow_path: &Path,
+    placement: &ImportPlacement<'_>,
+    mut edit: Value,
+) -> Option<Value> {
+    let range = serde_json::from_value::<Range>(edit.get("range")?.clone()).ok()?;
+    let text = edit.get("newText")?.as_str()?.to_string();
+    let (range, text) = place_new_import(overlay, shadow_path, placement, range, text);
+    edit["range"] = json!(range);
+    edit["newText"] = Value::String(text);
+    Some(edit)
+}
+
+pub(crate) fn place_new_import(
     overlay: &TsgoOverlay,
     shadow_path: &Path,
     placement: &ImportPlacement<'_>,
@@ -236,14 +248,30 @@ fn place_new_import(
         body.as_ref()
             .is_some_and(|body| body.start <= offset && offset <= body.end)
     };
-    // A new import that cannot map takes its line from the line before it.
+    // A new import that cannot map takes its line from the line before it,
+    // and one put before an existing import (whose line before is
+    // svelte2tsx's) from the start of that import's own line.
     let mapped = if generated.start.character == 0 && generated.start.line > 1 {
         let line_after = |position: Position| {
             overlay
                 .map_generated_position(shadow_path, Position::new(position.line - 1, 0))
                 .map(|before| Position::new(before.line + 1, 0))
         };
-        line_after(generated.start).zip(line_after(generated.end))
+        let line_start = |position: Position| {
+            overlay
+                .map_generated_position(shadow_path, Position::new(position.line, 0))
+                .filter(|at| {
+                    index
+                        .line_text(source, at.line as usize)
+                        .chars()
+                        .take(at.character as usize)
+                        .all(char::is_whitespace)
+                })
+                .map(|at| Position::new(at.line, 0))
+        };
+        line_after(generated.start)
+            .zip(line_after(generated.end))
+            .or_else(|| line_start(generated.start).zip(line_start(generated.end)))
     } else {
         overlay
             .map_generated_position(shadow_path, generated.start)
