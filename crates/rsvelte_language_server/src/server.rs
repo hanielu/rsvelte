@@ -1666,6 +1666,12 @@ impl Server {
             "textDocument/documentColor" => self.on_document_color(request),
             "textDocument/colorPresentation" => self.on_color_presentation(request),
             "textDocument/diagnostic" => self.on_document_diagnostic(request),
+            // `server.ts`'s `onCompletionResolve` answers an item without
+            // `data` — every Svelte, HTML, CSS and Emmet item — with the item
+            // itself; only TypeScript's items carry any to resolve with.
+            "completionItem/resolve" if !has_resolve_data(&request.params) => {
+                self.respond(Response::new_ok(request.id, request.params));
+            }
             "completionItem/resolve"
             | "textDocument/definition"
             | "textDocument/typeDefinition"
@@ -7434,6 +7440,17 @@ fn merge_tsgo_result(method: &str, result: &mut serde_json::Value, fallback: ser
 }
 
 /// The cache key for one completion site.
+/// JavaScript's `!completionItem.data` is false.
+fn has_resolve_data(item: &serde_json::Value) -> bool {
+    match item.get("data") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(serde_json::Value::Number(number)) => number.as_f64().is_some_and(|n| n != 0.0),
+        Some(serde_json::Value::String(text)) => !text.is_empty(),
+        Some(_) => true,
+    }
+}
+
 fn completion_data_key(uri: &str, position: &serde_json::Value) -> String {
     format!("{uri}|{position}")
 }

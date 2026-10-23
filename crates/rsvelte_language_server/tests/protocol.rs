@@ -1132,6 +1132,25 @@ fn the_client_content_format_reaches_hover_and_completion_separately() {
 
 /// Completion and hover over the wire, on a document that does not parse — the
 /// state a component is in for most of the time it is being typed.
+/// `server.ts`'s `onCompletionResolve` answers an item without `data` with
+/// the item itself; tsgo, which knows only its own items, would reject it.
+#[test]
+fn an_item_without_data_resolves_to_itself() {
+    let dir = temp_dir("resolve-native");
+    let uri = file_uri(&dir.join("App.svelte"));
+    let mut server = initialized_server();
+    did_open(&mut server, &uri, "{#");
+    let item = server
+        .completion(&uri, 0, 2)
+        .into_iter()
+        .find(|item| item["label"] == "if")
+        .unwrap();
+    assert_eq!(item.get("data"), None);
+    let resolve = server.request("completionItem/resolve", item.clone());
+    assert_eq!(server.response(resolve), item);
+    assert_eq!(server.shutdown(), Some(0));
+}
+
 /// `HTMLPlugin`'s Emmet participant in markup content, an incomplete list,
 /// unless `svelte.plugin.html.completions.emmet` turns it off.
 #[test]
@@ -1182,6 +1201,9 @@ fn emmet_abbreviations_follow_the_html_emmet_setting() {
                     }
                 })]
             );
+            // An item without `data` resolves to itself, as upstream's does.
+            let resolve = server.request("completionItem/resolve", emmet_items[0].clone());
+            assert_eq!(server.response(resolve), emmet_items[0]);
         } else {
             assert!(emmet_items.is_empty(), "{response}");
         }
