@@ -77,6 +77,12 @@ fn build_completions(
                 close_tag_completions(text, offset, offset, true, offset, markdown_documentation)
                     .items,
             );
+            // A `<` with no name yet is a Svelte parse error, and upstream's
+            // TypeScript plugin answers a document it cannot parse with an
+            // incomplete list (`CompletionProvider.ts:303`, `:451`), which
+            // `PluginHost.ts` ORs into the answer: the editor asks again as
+            // the name is typed, and TypeScript then offers the components.
+            list.is_incomplete = true;
         }
         let lang = lang_completions(&list.items);
         list.items.extend(lang);
@@ -1523,6 +1529,16 @@ mod tests {
         assert!(close_tags("<\n", 1).is_empty());
         // A partly typed name is an open tag alone.
         assert!(close_tags("<div>\n  <sp\n</div>\n", 11).is_empty());
+    }
+
+    /// The list after a bare `<` is incomplete, as upstream's is for the
+    /// document it cannot parse; once a name is typed, it is complete.
+    #[test]
+    fn a_bare_open_bracket_answers_an_incomplete_list() {
+        let text = "<p>x</p>\n<";
+        assert!(completions(text, text.len()).unwrap().is_incomplete);
+        let named = "<p>x</p>\n<d";
+        assert!(!completions(named, named.len()).unwrap().is_incomplete);
     }
 
     /// A tag is read as upstream's `parseHtml` reads it: a `>` in a `{…}` value
