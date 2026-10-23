@@ -1525,6 +1525,24 @@ mod tests {
         assert!(close_tags("<div>\n  <sp\n</div>\n", 11).is_empty());
     }
 
+    /// A tag is read as upstream's `parseHtml` reads it: a `>` in a `{…}` value
+    /// or a quoted one ends nothing, so a self-closed component whose handler
+    /// has an arrow is no ancestor, and neither is a TypeScript generic in the
+    /// script nor a `<` in a text expression.
+    #[test]
+    fn a_tag_ends_at_its_own_bracket() {
+        let text = "<script lang=\"ts\">\n\tlet user = $state.raw<User | null>(null);\n</script>\n\n<p>{a<b}</p>\n<Confirm\n\tonconfirm={() => (user ? go() : false)}\n\ttitle=\"a > b {f(\"x\")}\"\n/>\n<";
+        assert!(
+            close_tags(text, text.len()).is_empty(),
+            "{:?}",
+            close_tags(text, text.len())
+        );
+        let open = "<div title=\"a > b\" onclick={() => go()}>\n\t<\n</div>\n";
+        let offered = close_tags(open, open.find("\t<").unwrap() + 2);
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].0, "/div");
+    }
+
     /// A script body, a style body and a mustache belong to other providers.
     #[test]
     fn an_end_tag_inside_another_region_is_not_completed() {

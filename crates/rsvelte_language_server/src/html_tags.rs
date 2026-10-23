@@ -8,6 +8,7 @@ use std::ops::Range as ByteRange;
 
 use lsp_types::{DocumentHighlight, DocumentHighlightKind, LinkedEditingRanges, Range};
 
+use crate::context::skip_braces;
 use crate::text::LineIndex;
 
 const HTML_COMMENT_OPEN: &str = "<!--";
@@ -88,6 +89,11 @@ struct OpenTag {
     close_lt: Option<usize>,
 }
 
+/// The start and end tags of a document, read as upstream's `parseHtml`
+/// (`lib/documents/parseHtml.ts`) reads them: a `{…}` in text is an
+/// expression, where `<` opens no tag; a start tag ends at the `>` outside its
+/// `{…}` values and quotes ([`start_tag_end`]); and a `<script>` or `<style>`
+/// body is raw text, where a TypeScript generic (`$state<User>()`) is no tag.
 fn scan_open_tags(text: &str) -> Vec<OpenTag> {
     let mut all: Vec<OpenTag> = Vec::new();
     let mut stack: Vec<usize> = Vec::new();
@@ -95,10 +101,14 @@ fn scan_open_tags(text: &str) -> Vec<OpenTag> {
     let mut cursor = 0;
 
     while cursor < bytes.len() {
-        let Some(relative) = text[cursor..].find('<') else {
+        let Some(relative) = text[cursor..].find(['<', '{']) else {
             break;
         };
         let start = cursor + relative;
+        if bytes[start] == b'{' {
+            cursor = skip_braces(text, start);
+            continue;
+        }
         if text[start..].starts_with(HTML_COMMENT_OPEN) {
             cursor = text[start + 4..]
                 .find("-->")
@@ -124,16 +134,22 @@ fn scan_open_tags(text: &str) -> Vec<OpenTag> {
             cursor = start + 1;
             continue;
         }
-        let Some(end) = text[name_end..].find('>').map(|end| name_end + end) else {
-            break;
-        };
         let name = &text[name_start..name_end];
         if closing {
+            let Some(end) = text[name_end..].find('>').map(|end| name_end + end) else {
+                break;
+            };
             if let Some(position) = stack.iter().rposition(|&index| all[index].name == name) {
                 let index = stack.remove(position);
                 all[index].close_lt = Some(start);
             }
-        } else if !is_void(name) && !text[name_end..end].trim_end().ends_with('/') {
+            cursor = end + 1;
+            continue;
+        }
+        let Some((end, self_closing)) = start_tag_end(text, name_end) else {
+            break;
+        };
+        if !is_void(name) && !self_closing {
             all.push(OpenTag {
                 name: name.to_string(),
                 lt: start,
@@ -141,9 +157,58 @@ fn scan_open_tags(text: &str) -> Vec<OpenTag> {
             });
             stack.push(all.len() - 1);
         }
-        cursor = end + 1;
+        cursor = match name {
+            "script" | "style" if !self_closing => text[end..]
+                .find(&format!("</{name}"))
+                .map_or(bytes.len(), |body_end| end + body_end),
+            _ => end,
+        };
     }
     all
+}
+
+/// Where a start tag whose name ends at `from` ends, just past its `>`, and
+/// whether it closes itself (`/>`). A `{…}` (an expression value, a spread, an
+/// attachment), a quoted value and a `//` or `/* */` comment are read whole,
+/// so the `>` of `onclick={() => go()}` or `title="a > b"` ends nothing.
+/// `None` while the tag is unterminated.
+fn start_tag_end(text: &str, from: usize) -> Option<(usize, bool)> {
+    let bytes = text.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        match (bytes[i], bytes.get(i + 1)) {
+            (b'>', _) => return Some((i + 1, false)),
+            (b'/', Some(b'>')) => return Some((i + 2, true)),
+            (b'/', Some(b'/')) => {
+                i = text[i..].find('\n').map_or(bytes.len(), |end| i + end);
+                continue;
+            }
+            (b'/', Some(b'*')) => {
+                i = text[i + 2..]
+                    .find("*/")
+                    .map_or(bytes.len(), |end| i + 2 + end + 2);
+                continue;
+            }
+            (b'{', _) => {
+                i = skip_braces(text, i);
+                continue;
+            }
+            (quote @ (b'"' | b'\''), _) if bytes[from..i].trim_ascii_end().ends_with(b"=") => {
+                // A quoted value, whose `{…}` may hold quotes of its own.
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i = if bytes[i] == b'{' {
+                        skip_braces(text, i)
+                    } else {
+                        i + 1
+                    };
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn range(index: &LineIndex, text: &str, span: ByteRange<usize>) -> Range {
