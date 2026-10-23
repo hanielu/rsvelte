@@ -165,13 +165,17 @@ mod tests {
         );
     }
 
+    /// The standard library's path, less the verbatim prefix it adds on
+    /// Windows; elsewhere the two are the same.
     #[test]
     fn canonicalize_resolves_like_the_standard_library() {
         let here = std::env::current_dir().unwrap();
+        let resolved = canonicalize(&here).unwrap();
         assert_eq!(
-            canonicalize(&here).unwrap(),
-            std::fs::canonicalize(&here).unwrap()
+            resolved,
+            strip_verbatim(std::fs::canonicalize(&here).unwrap())
         );
+        assert!(!resolved.to_string_lossy().starts_with(r"\\?\"));
     }
 
     #[test]
