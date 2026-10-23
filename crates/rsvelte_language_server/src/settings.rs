@@ -237,6 +237,12 @@ impl Settings {
             || self.css.enable && self.css.completions
     }
 
+    /// Emmet in markup: the HTML plugin's completions, and its `emmet` switch.
+    #[must_use]
+    pub const fn html_emmet_enabled(&self) -> bool {
+        self.html.enable && self.html.completions && self.html.emmet
+    }
+
     #[must_use]
     pub fn native_hover_enabled(&self) -> bool {
         self.svelte.enable && self.svelte.hover

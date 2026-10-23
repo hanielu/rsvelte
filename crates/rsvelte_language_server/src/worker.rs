@@ -81,6 +81,7 @@ pub enum Job {
         offset: usize,
         strict_mode: bool,
         markdown_documentation: bool,
+        emmet: bool,
     },
     Hover {
         id: RequestId,
@@ -436,6 +437,7 @@ fn run(jobs: &Receiver<Job>, outcomes: &Sender<Outcome>, stopping: &AtomicBool) 
                 offset,
                 strict_mode,
                 markdown_documentation,
+                emmet,
             } => Outcome::Completed {
                 id,
                 list: guard("completion", &path, || {
@@ -444,6 +446,7 @@ fn run(jobs: &Receiver<Job>, outcomes: &Sender<Outcome>, stopping: &AtomicBool) 
                         offset,
                         strict_mode,
                         markdown_documentation,
+                        emmet,
                     )
                 })
                 .flatten(),
@@ -851,6 +854,7 @@ mod tests {
             offset: 0,
             strict_mode: false,
             markdown_documentation: true,
+            emmet: true,
         });
         assert!(
             matches!(next(&outcomes), Outcome::Completed { id, .. } if id == RequestId::from(2)),

@@ -1830,6 +1830,7 @@ impl Server {
                     offset,
                     strict_mode: self.settings.format_config.strict_mode.unwrap_or(false),
                     markdown_documentation: self.client.markdown_documentation,
+                    emmet: self.settings.html_emmet_enabled(),
                 });
             }
             None => self.forward_tsgo_request(tsgo_fallback),

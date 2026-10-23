@@ -20,6 +20,7 @@ pub mod css_data;
 pub mod css_selector;
 pub mod diagnostics;
 pub mod document;
+pub mod emmet;
 pub mod extract;
 pub mod folding;
 pub mod format;

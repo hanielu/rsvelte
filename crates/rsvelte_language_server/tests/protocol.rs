@@ -1132,6 +1132,63 @@ fn the_client_content_format_reaches_hover_and_completion_separately() {
 
 /// Completion and hover over the wire, on a document that does not parse — the
 /// state a component is in for most of the time it is being typed.
+/// `HTMLPlugin`'s Emmet participant in markup content, an incomplete list,
+/// unless `svelte.plugin.html.completions.emmet` turns it off.
+#[test]
+fn emmet_abbreviations_follow_the_html_emmet_setting() {
+    let dir = temp_dir("emmet");
+    let uri = file_uri(&dir.join("App.svelte"));
+    for (emmet, offered) in [(Value::Null, true), (json!(false), false)] {
+        let mut server = Server::start();
+        if !emmet.is_null() {
+            server.official_settings =
+                json!({ "plugin": { "html": { "completions": { "emmet": emmet } } } });
+        }
+        let initialize = server.request(
+            "initialize",
+            json!({
+                "processId": Value::Null,
+                "rootUri": Value::Null,
+                "capabilities": { "workspace": { "configuration": true } }
+            }),
+        );
+        server.response(initialize);
+        server.notify("initialized", json!({}));
+        server.settle_configuration();
+        did_open(&mut server, &uri, "<main>\n\tul>li*2\n</main>");
+        let response = server.completion_response(&uri, 1, 8);
+        let emmet_items: Vec<Value> = response["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item["detail"] == "Emmet Abbreviation")
+            .cloned()
+            .collect();
+        if offered {
+            assert_eq!(response["isIncomplete"], json!(true));
+            assert_eq!(
+                emmet_items,
+                vec![json!({
+                    "label": "ul>li*2",
+                    "detail": "Emmet Abbreviation",
+                    "documentation": "<ul>\n\t<li>|</li>\n\t<li>|</li>\n</ul>",
+                    "insertTextFormat": 2,
+                    "textEdit": {
+                        "range": {
+                            "start": { "line": 1, "character": 1 },
+                            "end": { "line": 1, "character": 8 }
+                        },
+                        "newText": "<ul>\n\t<li>${1}</li>\n\t<li>${0}</li>\n</ul>"
+                    }
+                })]
+            );
+        } else {
+            assert!(emmet_items.is_empty(), "{response}");
+        }
+        assert_eq!(server.shutdown(), Some(0));
+    }
+}
+
 #[test]
 fn serves_completions_and_hover() {
     let dir = temp_dir("completion");

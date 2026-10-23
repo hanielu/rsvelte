@@ -18,9 +18,9 @@ use crate::text::LineIndex;
 
 /// The characters that put the client in a position to want completions.
 ///
-/// A character absent here never reaches the server at all, so the TypeScript
-/// and Emmet triggers upstream declares belong in the list even though this
-/// module answers none of them — `.` alone is every member completion.
+/// A character absent here never reaches the server at all, so every trigger
+/// upstream declares is in the list: TypeScript's (`.` alone is every member
+/// completion) and Emmet's (`>`, `*`, `#`, `$`, `+`, `^`, `(`, `[`, `@`, `-`).
 pub const TRIGGER_CHARACTERS: [&str; 19] = [
     "<", " ", "#", "@", ":", "|", "/", ".", "\"", "'", "`", ">", "*", "$", "+", "^", "(", "[", "-",
 ];
@@ -31,19 +31,23 @@ const HTML_COMMENT_START: &str = "<!--";
 /// case, and short enough that a stray `{` far away cannot open a moustache.
 const WINDOW: usize = 10;
 
+/// The Svelte, HTML and CSS completions at `offset`, without Emmet.
 #[must_use]
 pub fn completions(text: &str, offset: usize) -> Option<CompletionList> {
-    completions_with_strict_mode(text, offset, false, true)
+    completions_with_strict_mode(text, offset, false, true, false)
 }
 
+/// `emmet` adds Emmet abbreviations in markup content, as the official HTML
+/// plugin does unless `svelte.plugin.html.completions.emmet` is off.
 #[must_use]
 pub fn completions_with_strict_mode(
     text: &str,
     offset: usize,
     strict_mode: bool,
     markdown_documentation: bool,
+    emmet: bool,
 ) -> Option<CompletionList> {
-    build_completions(text, offset, strict_mode, markdown_documentation)
+    build_completions(text, offset, strict_mode, markdown_documentation, emmet)
 }
 
 fn build_completions(
@@ -51,12 +55,14 @@ fn build_completions(
     offset: usize,
     strict_mode: bool,
     markdown_documentation: bool,
+    emmet: bool,
 ) -> Option<CompletionList> {
     let embedded = EmbeddedRegions::new(text);
     if let Some(style) = embedded.style_at(offset) {
         // `shouldExcludeCompletion` (`CSSPlugin.ts:585-593`) — `sass` is not on
-        // upstream's list because it is answered by emmet, which rsvelte has no
-        // port of, so it stays with the CSS provider rather than going silent.
+        // upstream's list because it is answered by emmet, which rsvelte ports
+        // for markup only, so it stays with the CSS provider rather than going
+        // silent.
         if matches!(style.language.as_deref(), Some("stylus" | "styl")) {
             return None;
         }
@@ -181,7 +187,73 @@ fn build_completions(
         ));
     }
 
-    component_documentation(before)
+    if let Some(list) = component_documentation(before) {
+        return Some(list);
+    }
+    if !emmet {
+        return None;
+    }
+    let items = emmet_completions(text, offset);
+    // An abbreviation changes with every keystroke, so `HTMLPlugin`'s
+    // `getCompletions` never calls a list holding one complete.
+    (!items.is_empty()).then_some(CompletionList {
+        is_incomplete: true,
+        items,
+    })
+}
+
+/// emmet-helper's suggestions where the HTML language service reaches its
+/// `onHtmlContent` participant: text between tags, outside any start tag,
+/// moustache or comment. Every other position was answered above.
+fn emmet_completions(text: &str, offset: usize) -> Vec<CompletionItem> {
+    if !matches!(start_tag_context(text, offset), StartTag::None) || in_html_comment(text, offset) {
+        return Vec::new();
+    }
+    // `HTMLPlugin`'s `isInsideMoustacheTag` seeds the check with the
+    // enclosing element, or the document's start.
+    let seed = crate::html_tags::enclosing_open_tag(text, offset).map_or(0, |(_, lt)| lt);
+    if inside_moustache(text, seed, offset) {
+        return Vec::new();
+    }
+    let index = LineIndex::new(text);
+    let position = index.position(text, offset);
+    let line = index.line_text(text, position.line as usize);
+    crate::emmet::suggestions(line, position.character as usize)
+        .into_iter()
+        .map(|suggestion| {
+            let at = |character: usize| {
+                lsp_types::Position::new(
+                    position.line,
+                    u32::try_from(character).unwrap_or(u32::MAX),
+                )
+            };
+            CompletionItem {
+                label: suggestion.label,
+                detail: Some("Emmet Abbreviation".to_string()),
+                documentation: Some(Documentation::String(suggestion.documentation)),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                text_edit: Some(lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range: lsp_types::Range::new(at(suggestion.start), at(suggestion.end)),
+                    new_text: suggestion.new_text,
+                })),
+                ..CompletionItem::default()
+            }
+        })
+        .collect()
+}
+
+/// Inside `<!-- … -->`, where the HTML scanner yields a comment token.
+fn in_html_comment(text: &str, offset: usize) -> bool {
+    let Some(start) = text
+        .get(..offset)
+        .and_then(|before| before.rfind(HTML_COMMENT_START))
+    else {
+        return false;
+    };
+    let body = start + HTML_COMMENT_START.len();
+    text.get(body..)
+        .and_then(|rest| rest.find("-->"))
+        .is_none_or(|end| body + end + "-->".len() >= offset)
 }
 
 /// The `<` of the end tag being typed at `offset`, restating positionally the
@@ -1128,7 +1200,7 @@ mod tests {
     #[test]
     fn only_the_html_tables_follow_the_client_documentation_format() {
         let kind = |source: &str, offset: usize, label: &str, markdown: bool| {
-            let items = completions_with_strict_mode(source, offset, false, markdown)
+            let items = completions_with_strict_mode(source, offset, false, markdown, false)
                 .unwrap()
                 .items;
             let item = items.iter().find(|i| i.label == label).unwrap();
