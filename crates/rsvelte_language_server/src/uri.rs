@@ -50,7 +50,7 @@ pub fn strip_verbatim(path: PathBuf) -> PathBuf {
 }
 
 /// The plain form of a verbatim drive or UNC path.
-fn plain_form(text: &str) -> Option<String> {
+pub(crate) fn plain_form(text: &str) -> Option<String> {
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
         return Some(format!(r"\\{rest}"));
     }

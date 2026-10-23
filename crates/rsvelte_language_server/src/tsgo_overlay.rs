@@ -4179,8 +4179,14 @@ fn external_imports_options(
     }
 }
 
+/// A path as TypeScript spells it: `/`-separated, and never in Windows'
+/// verbatim form (`\\?\C:\…`), which tsgo cannot open. Go reaches a long path
+/// without the prefix, so it goes at any length.
 fn path_for_tsconfig(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    let path = path.to_string_lossy();
+    crate::uri::plain_form(&path)
+        .unwrap_or_else(|| path.into_owned())
+        .replace('\\', "/")
 }
 
 fn path_to_uri(path: &Path) -> Result<Uri, TsgoOverlayError> {
@@ -5596,6 +5602,33 @@ mod tests {
         let files = files.as_array().unwrap();
         assert!(files.contains(&json!(path_for_tsconfig(&package.join("svelte-html.d.ts")))));
         assert!(!files.contains(&json!(rsvelte_check::overlay::SHIM_JSX_V4_NAME)));
+    }
+
+    /// Windows' `fs::canonicalize` answers verbatim paths (`\\?\C:\…`), which
+    /// is how `global_type_files` finds the project's `svelte`. TypeScript has
+    /// no such form: a config listing `//?/C:/…/svelte-html.d.ts` stopped
+    /// tsgo with TS6053 and lost the HTML element types. Go reaches a long
+    /// path without the prefix, so it goes at any length. Plain strings: this
+    /// runs on every platform.
+    #[test]
+    fn a_verbatim_path_is_written_plain_into_the_tsconfig() {
+        assert_eq!(
+            path_for_tsconfig(Path::new(r"\\?\C:\w\node_modules\svelte\svelte-html.d.ts")),
+            "C:/w/node_modules/svelte/svelte-html.d.ts"
+        );
+        assert_eq!(
+            path_for_tsconfig(Path::new(r"\\?\UNC\server\share\w\App.svelte")),
+            "//server/share/w/App.svelte"
+        );
+        let long = "a".repeat(300);
+        assert_eq!(
+            path_for_tsconfig(Path::new(&format!(r"\\?\C:\{long}\App.svelte"))),
+            format!("C:/{long}/App.svelte")
+        );
+        assert_eq!(
+            path_for_tsconfig(Path::new("/home/u/App.svelte")),
+            "/home/u/App.svelte"
+        );
     }
 
     /// svelte2tsx's rewrite of imports that leave the workspace walks
