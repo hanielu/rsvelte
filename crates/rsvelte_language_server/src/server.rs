@@ -3161,39 +3161,8 @@ impl Server {
                 CompletionSite::Script
             });
         }
-        // A `<script>` / `<style>` start tag is not an `Element` in the Svelte
-        // AST — the block is hoisted to `instance` / `module` / `css` — so
-        // upstream's `svelteNode?.type === 'Element'` guard never fires there.
-        let start_tag = crate::context::start_tag_context(text, offset);
-        if let crate::context::StartTag::Attribute(attribute) = &start_tag
-            // An attribute value's `Text` has an `Attribute` parent, which is
-            // not in upstream's raw-text bail list, and `svelteNodeAt` answers
-            // `Text` rather than the element, so neither guard fires.
-            && attribute.in_value
-        {
-            return Some(CompletionSite::Unguarded);
-        }
-        if let Some((element_tag, in_tag_name)) = match &start_tag {
-            crate::context::StartTag::Attribute(attribute) => Some((attribute.element_tag, false)),
-            crate::context::StartTag::Bare { element_tag } => Some((*element_tag, false)),
-            crate::context::StartTag::TagName { element_tag } => Some((*element_tag, true)),
-            crate::context::StartTag::None => None,
-        } {
-            if is_embedded_tag(element_tag) {
-                return Some(CompletionSite::Unguarded);
-            }
-            return Some(
-                if element_tag.starts_with(|character: char| character.is_ascii_uppercase()) {
-                    CompletionSite::ComponentStartTag {
-                        // Upstream answers nothing at a component's own name;
-                        // narrowing is the shape that reproduces it.
-                        at_whitespace: in_tag_name
-                            || might_be_at_start_tag_whitespace(text, offset),
-                    }
-                } else {
-                    CompletionSite::ElementStartTag
-                },
-            );
+        if let Some(site) = start_tag_completion_site(text, offset) {
+            return Some(site);
         }
         let before = text.get(..offset)?;
         // `CompletionProvider.ts:204-214` tests the WORD at the cursor, which
@@ -7336,6 +7305,44 @@ const fn project_config_names() -> &'static [&'static str] {
     ]
 }
 
+/// The completion site of a cursor inside a start tag, if it is in one.
+fn start_tag_completion_site(text: &str, offset: usize) -> Option<CompletionSite> {
+    // A `<script>` / `<style>` start tag is not an `Element` in the Svelte
+    // AST — the block is hoisted to `instance` / `module` / `css` — so
+    // upstream's `svelteNode?.type === 'Element'` guard never fires there.
+    let element_tag = match crate::context::start_tag_context(text, offset) {
+        // An attribute value's `Text` has an `Attribute` parent, which is
+        // not in upstream's raw-text bail list, and `svelteNodeAt` answers
+        // `Text` rather than the element, so neither guard fires.
+        crate::context::StartTag::Attribute(attribute) if attribute.in_value => {
+            return Some(CompletionSite::Unguarded);
+        }
+        crate::context::StartTag::Attribute(attribute) => attribute.element_tag,
+        crate::context::StartTag::Bare { element_tag }
+        | crate::context::StartTag::TagName { element_tag } => element_tag,
+        crate::context::StartTag::None => return None,
+    };
+    if is_embedded_tag(element_tag) {
+        return Some(CompletionSite::Unguarded);
+    }
+    // The Svelte parser makes a capitalised or dotted tag an `InlineComponent`.
+    Some(
+        if element_tag.starts_with(|character: char| character.is_ascii_uppercase())
+            || element_tag.contains('.')
+        {
+            CompletionSite::ComponentStartTag {
+                // `CompletionProvider.ts:252-283` narrows only in the
+                // whitespace after the name; in the name itself (`<MyCom`) it
+                // forwards to TypeScript, which completes the component's
+                // identifier and offers auto-imports.
+                at_whitespace: might_be_at_start_tag_whitespace(text, offset),
+            }
+        } else {
+            CompletionSite::ElementStartTag
+        },
+    )
+}
+
 /// Whether a start tag opens a block the Svelte parser hoists out of the
 /// template rather than keeping as an element.
 fn is_embedded_tag(tag: &str) -> bool {
@@ -7349,6 +7356,50 @@ fn might_be_at_start_tag_whitespace(text: &str, offset: usize) -> bool {
     let at = text.get(offset..).and_then(|text| text.chars().next());
     before.is_some_and(char::is_whitespace)
         && at.is_some_and(|character| character.is_whitespace() || matches!(character, '>' | '/'))
+}
+
+#[cfg(test)]
+mod start_tag_completion_site_tests {
+    use super::{CompletionSite, start_tag_completion_site};
+
+    fn site(text_with_cursor: &str) -> Option<CompletionSite> {
+        let offset = text_with_cursor.find('|').expect("cursor");
+        let text = text_with_cursor.replacen('|', "", 1);
+        start_tag_completion_site(&text, offset)
+    }
+
+    /// Typing a component's name is answered by TypeScript, as upstream
+    /// does: only the whitespace after the name narrows to props.
+    #[test]
+    fn a_component_name_being_typed_is_not_narrowed() {
+        for typing in ["<MyCom|", "<MyCom|\n", "<p>x</p>\n<Other|", "<ui.But|"] {
+            assert_eq!(
+                site(typing),
+                Some(CompletionSite::ComponentStartTag {
+                    at_whitespace: false
+                }),
+                "{typing:?}"
+            );
+        }
+        for after_name in [
+            "<MyComponent | />",
+            "<ui.Button | />",
+            "<MyComponent | x={1} />",
+        ] {
+            assert_eq!(
+                site(after_name),
+                Some(CompletionSite::ComponentStartTag {
+                    at_whitespace: true
+                }),
+                "{after_name:?}"
+            );
+        }
+        assert_eq!(site("<inp|"), Some(CompletionSite::ElementStartTag));
+        assert_eq!(
+            site("<input value=\"|\" />"),
+            Some(CompletionSite::Unguarded)
+        );
+    }
 }
 
 #[cfg(test)]
