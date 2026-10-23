@@ -2227,11 +2227,11 @@ impl TsgoOverlay {
             // `LSAndTSDocResolver.ts:138`: the language server projects a
             // half-typed document; `svelte-check` deliberately does not.
             emit_on_template_error: true,
-            rewrite_external_imports: Some(RewriteExternalImportsOptions {
-                source_path: source_path.display().to_string(),
-                generated_path: shadow_path.display().to_string(),
-                workspace_path: self.workspace.display().to_string(),
-            }),
+            rewrite_external_imports: Some(external_imports_options(
+                source_path,
+                shadow_path,
+                &self.workspace,
+            )),
             ..Svelte2TsxOptions::default()
         }
     }
@@ -4135,6 +4135,22 @@ fn absolute_normalized(path: &Path) -> PathBuf {
     normalized
 }
 
+/// The paths svelte2tsx's rewrite of workspace-escaping imports walks. It
+/// splits on `/` only, as upstream hands it normalised paths: given Windows'
+/// `\` it found no directory to climb out of, and every `../` import lost its
+/// `../`.
+fn external_imports_options(
+    source_path: &Path,
+    shadow_path: &Path,
+    workspace: &Path,
+) -> RewriteExternalImportsOptions {
+    RewriteExternalImportsOptions {
+        source_path: path_for_tsconfig(source_path),
+        generated_path: path_for_tsconfig(shadow_path),
+        workspace_path: path_for_tsconfig(workspace),
+    }
+}
+
 fn path_for_tsconfig(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
@@ -5552,6 +5568,47 @@ mod tests {
         let files = files.as_array().unwrap();
         assert!(files.contains(&json!(path_for_tsconfig(&package.join("svelte-html.d.ts")))));
         assert!(!files.contains(&json!(rsvelte_check::overlay::SHIM_JSX_V4_NAME)));
+    }
+
+    /// svelte2tsx's rewrite of imports that leave the workspace walks
+    /// `/`-separated paths, as upstream hands it normalised ones. Given
+    /// Windows' `\` it found no directory to climb out of, so every `../`
+    /// import lost its `../` (`'../dnd-monitor/index.js'` became the bare
+    /// `'dnd-monitor/index.js'`, which tsgo looked up in `node_modules`).
+    /// Plain strings: this runs on every platform.
+    #[test]
+    fn imports_keep_their_parent_steps_in_a_windows_shadow() {
+        let source = r"C:\w\src\lib\dnd-context\Context.svelte";
+        let options = Svelte2TsxOptions {
+            filename: source.to_string(),
+            mode: Svelte2TsxMode::Ts,
+            rewrite_external_imports: Some(external_imports_options(
+                Path::new(source),
+                Path::new(
+                    r"C:\w\.svelte-language-server-rs\projects\tsgo\svelte\src\lib\dnd-context\Context.svelte.tsx",
+                ),
+                Path::new(r"C:\w"),
+            )),
+            ..Svelte2TsxOptions::default()
+        };
+        let code = ProjectionEngine::new()
+            .project(
+                "<script lang=\"ts\">\n\
+                 \timport { inside } from '../dnd-monitor/index.js';\n\
+                 \timport { outside } from '../../../../shared/index.js';\n\
+                 </script>",
+                options,
+            )
+            .unwrap()
+            .code;
+        assert!(
+            code.contains("'../dnd-monitor/index.js'"),
+            "inside the workspace, as written:\n{code}"
+        );
+        assert!(
+            code.contains("'../../../../../../../../shared/index.js'"),
+            "outside it, from the shadow's directory:\n{code}"
+        );
     }
 
     #[test]
