@@ -13,7 +13,21 @@ use serde::{Deserialize, Serialize};
 const SCRIPT: &str = include_str!("preprocess_sidecar.mjs");
 const WIRE_PREFIX: &str = "\u{1e}RSVELTE";
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Configs that can carry preprocessors, in the sidecar's per-directory order: a
+/// Vite config with a SvelteKit or vite-plugin-svelte plugin (SvelteKit 2.62+
+/// takes `preprocess` inline there), then a Svelte config. A Vite config counts
+/// only when it names `preprocess` ([`configures_preprocessing`]): resolving one
+/// loads Vite and every plugin into the sidecar (~150 MB), and without the word
+/// it can only carry vite-plugin-svelte's implicit `vitePreprocess` for
+/// `<style lang>` blocks. A Vite config without a Svelte plugin is answered "no
+/// preprocessor" by the sidecar.
 const CONFIG_NAMES: &[&str] = &[
+    "vite.config.js",
+    "vite.config.mjs",
+    "vite.config.ts",
+    "vite.config.cjs",
+    "vite.config.mts",
+    "vite.config.cts",
     "svelte.config.js",
     "svelte.config.mjs",
     "svelte.config.cjs",
@@ -739,7 +753,10 @@ pub fn find_preprocess_config(filename: &Path, workspace: &Path) -> Option<PathB
             let Ok(candidate) = fs::canonicalize(candidate) else {
                 continue;
             };
-            if candidate.starts_with(&workspace) && candidate.is_file() {
+            if candidate.starts_with(&workspace)
+                && candidate.is_file()
+                && configures_preprocessing(&candidate)
+            {
                 return Some(candidate);
             }
         }
@@ -748,6 +765,16 @@ pub fn find_preprocess_config(filename: &Path, workspace: &Path) -> Option<PathB
         }
         current = current.parent()?.to_path_buf();
     }
+}
+
+/// Whether a config can name preprocessors: every Svelte config, and a Vite config
+/// whose text mentions `preprocess` (see [`CONFIG_NAMES`]).
+fn configures_preprocessing(config: &Path) -> bool {
+    let is_vite = config
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("vite.config."));
+    !is_vite || fs::read_to_string(config).is_ok_and(|text| text.contains("preprocess"))
 }
 
 /// [`find_preprocess_config`] answered once per directory. The server asks it
@@ -794,7 +821,10 @@ impl PreprocessConfigCache {
         }
         let mut found = CONFIG_NAMES.iter().find_map(|name| {
             let candidate = fs::canonicalize(directory.join(name)).ok()?;
-            (candidate.starts_with(workspace) && candidate.is_file()).then_some(candidate)
+            (candidate.starts_with(workspace)
+                && candidate.is_file()
+                && configures_preprocessing(&candidate))
+            .then_some(candidate)
         });
         if found.is_none()
             && directory != workspace
@@ -811,6 +841,44 @@ impl PreprocessConfigCache {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn a_vite_config_that_names_preprocessors_is_a_preprocess_config() {
+        let root = temp_dir("vite-config");
+        fs::create_dir_all(root.join("lib/src")).unwrap();
+        fs::create_dir_all(root.join("app/src")).unwrap();
+        fs::write(
+            root.join("lib/vite.config.ts"),
+            "export default { plugins: [sveltekit({ preprocess: [lexicalPreprocess()] })] };",
+        )
+        .unwrap();
+        // No `preprocess` here: vite-plugin-svelte's implicit default only, so the
+        // Svelte config beside it (or none) decides.
+        fs::write(
+            root.join("app/vite.config.ts"),
+            "export default { plugins: [svelte()] };",
+        )
+        .unwrap();
+        fs::write(root.join("app/svelte.config.js"), "export default {};").unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        assert_eq!(
+            find_preprocess_config(&root.join("lib/src/A.svelte"), &root),
+            Some(root.join("lib/vite.config.ts"))
+        );
+        assert_eq!(
+            find_preprocess_config(&root.join("app/src/A.svelte"), &root),
+            Some(root.join("app/svelte.config.js"))
+        );
+        let mut cache = PreprocessConfigCache::default();
+        assert_eq!(
+            cache.find(&root.join("lib/src/A.svelte"), &root),
+            Some(root.join("lib/vite.config.ts"))
+        );
+        assert_eq!(
+            cache.find(&root.join("app/src/A.svelte"), &root),
+            Some(root.join("app/svelte.config.js"))
+        );
+    }
 
     #[test]
     fn the_cache_answers_exactly_as_the_walk_does() {

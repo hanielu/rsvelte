@@ -1,10 +1,22 @@
 import { createRequire } from 'node:module';
 import { createInterface } from 'node:readline';
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const CONFIG_NAMES = [
+// In each directory a `vite.config.*` that configures SvelteKit or
+// vite-plugin-svelte wins over a `svelte.config.*`, as in `@sveltejs/load-config`,
+// which svelte-language-server uses: SvelteKit 2.62+ and vite-plugin-svelte take
+// their options (preprocess included) inline in the Vite config.
+const VITE_CONFIG_NAMES = [
+  'vite.config.js',
+  'vite.config.mjs',
+  'vite.config.ts',
+  'vite.config.cjs',
+  'vite.config.mts',
+  'vite.config.cts',
+];
+const SVELTE_CONFIG_NAMES = [
   'svelte.config.js',
   'svelte.config.mjs',
   'svelte.config.cjs',
@@ -25,23 +37,41 @@ function send(value) {
   protocolWrite(`\u001eRSVELTE${JSON.stringify(value)}\n`);
 }
 
-function findConfig(filename, workspace) {
+function insideRoot(root, candidate) {
+  const fromRoot = relative(root, candidate);
+  return !(
+    fromRoot === '..' ||
+    fromRoot.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) ||
+    isAbsolute(fromRoot)
+  );
+}
+
+function firstExisting(directory, names, root) {
+  for (const name of names) {
+    const candidate = join(directory, name);
+    if (!existsSync(candidate)) continue;
+    const canonical = realpathSync(candidate);
+    if (insideRoot(root, canonical)) return canonical;
+  }
+  return null;
+}
+
+/// The nearest config with Svelte options, walking up from the component within
+/// the workspace: per directory a Vite config whose Svelte plugin has options,
+/// else a Svelte config.
+async function findConfig(filename, workspace) {
   const root = realpathSync(resolve(workspace));
   let current = realpathSync(dirname(resolve(filename)));
   while (current === root || current.startsWith(`${root}/`) || current.startsWith(`${root}\\`)) {
-    for (const name of CONFIG_NAMES) {
-      const candidate = join(current, name);
-      if (!existsSync(candidate)) continue;
-      const canonical = realpathSync(candidate);
-      const fromRoot = relative(root, canonical);
-      const outside =
-        fromRoot === '..' ||
-        fromRoot.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) ||
-        isAbsolute(fromRoot);
-      if (!outside) {
-        return canonical;
-      }
+    const vite = firstExisting(current, VITE_CONFIG_NAMES, root);
+    // Only a Vite config that names preprocessors is resolved (the server applies
+    // the same test before it asks): resolving loads Vite and every plugin.
+    if (vite && readFileSync(vite, 'utf8').includes('preprocess')) {
+      const options = await loadViteConfig(current, vite);
+      if (options) return { path: vite, config: options };
     }
+    const svelte = firstExisting(current, SVELTE_CONFIG_NAMES, root);
+    if (svelte) return { path: svelte, config: await loadSvelteConfig(svelte) };
     const parent = dirname(current);
     if (parent === current) break;
     current = parent;
@@ -49,12 +79,76 @@ function findConfig(filename, workspace) {
   return null;
 }
 
-async function loadConfig(path) {
-  if (!path) return null;
+async function loadSvelteConfig(path) {
   let cached = configs.get(path);
   if (!cached) {
     cached = import(pathToFileURL(path).href).then((module) => module.default ?? module);
     configs.set(path, cached);
+  }
+  return cached;
+}
+
+function exportPath(entry) {
+  if (typeof entry === 'string') return entry;
+  if (!entry || typeof entry !== 'object') return undefined;
+  for (const condition of ['import', 'default', 'node']) {
+    const found = exportPath(entry[condition]);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/// The project's own Vite, resolved from the config's directory.
+async function importVite(root) {
+  const require = createRequire(join(root, '__rsvelte_preprocess__.cjs'));
+  const manifest = require.resolve('vite/package.json');
+  const pkg = JSON.parse(readFileSync(manifest, 'utf8'));
+  const entry = exportPath(pkg.exports?.['.']) ?? pkg.module ?? pkg.main;
+  if (!entry) return null;
+  return import(pathToFileURL(join(dirname(manifest), entry)).href);
+}
+
+/// The Svelte options of a Vite config, as `@sveltejs/load-config` reads them:
+/// resolve the config with the project's Vite and take the options the SvelteKit
+/// or vite-plugin-svelte plugin exposes. `null` when it has no Svelte plugin or
+/// cannot be loaded, so the directory's Svelte config (if any) is used instead.
+async function loadViteConfig(root, configFile) {
+  let cached = configs.get(configFile);
+  if (!cached) {
+    cached = (async () => {
+      let vite;
+      try {
+        vite = await importVite(root);
+      } catch {
+        return null;
+      }
+      if (!vite?.resolveConfig) return null;
+      // SvelteKit < 3 looks its config up from the cwd. Requests are handled one
+      // at a time, so changing it here cannot race another resolution.
+      const cwd = process.cwd();
+      try {
+        process.chdir(root);
+      } catch {}
+      try {
+        const resolved = await vite.resolveConfig({ root, configFile, logLevel: 'error' }, 'serve');
+        const plugins = resolved?.plugins ?? [];
+        return (
+          plugins.find((plugin) => plugin.name === 'vite-plugin-sveltekit-setup')?.api?.options ??
+          plugins.find((plugin) => plugin.name === 'vite-plugin-svelte:config')?.api?.options ??
+          null
+        );
+      } catch (error) {
+        process.stderr.write(
+          `rsvelte preprocess: could not load ${configFile}: ${error instanceof Error ? error.message : error}\n`,
+        );
+        return null;
+      } finally {
+        try {
+          process.chdir(cwd);
+        } catch {}
+      }
+    })();
+    configs.set(configFile, cached);
   }
   return cached;
 }
@@ -94,8 +188,9 @@ function normalizeMap(map) {
 }
 
 async function preprocess(request) {
-  const configPath = findConfig(request.filename, request.workspace);
-  if (!configPath) {
+  const found = await findConfig(request.filename, request.workspace);
+  const configPath = found?.path ?? null;
+  if (!found) {
     return {
       type: 'result',
       id: request.id,
@@ -108,8 +203,7 @@ async function preprocess(request) {
     };
   }
 
-  const config = await loadConfig(configPath);
-  const groups = config?.preprocess;
+  const groups = found.config?.preprocess;
   if (!groups) {
     return {
       type: 'result',
