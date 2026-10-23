@@ -4773,38 +4773,9 @@ impl Server {
                     output.config_path.as_deref(),
                     &output.dependencies,
                 );
-                let mut projection_error = None;
-                let editor_open = self.is_editor_document(&filename);
-                if let Some(runtime) = &mut self.tsgo
-                    && let Some(owner) = runtime.overlay_index_for_source(&filename)
-                {
-                    // The owner's projection decides; the copies other projects
-                    // keep for their imports follow it.
-                    let copies = runtime.copies_of(owner, &filename);
-                    let mut events = Vec::new();
-                    for index in std::iter::once(owner).chain(copies) {
-                        match runtime.overlays[index].open_or_update_preprocessed(
-                            &filename,
-                            &original,
-                            &output.code,
-                            output.map.as_deref(),
-                            output.version,
-                        ) {
-                            Ok(shadow) if editor_open => {
-                                open_shadow(&runtime.client, &mut runtime.open_shadows, &shadow);
-                            }
-                            Ok(shadow) => {
-                                runtime.deliver_disk_shadow(index, &shadow, &mut events);
-                            }
-                            Err(error) if index == owner => {
-                                projection_error = Some(error.to_string());
-                                break;
-                            }
-                            Err(_) => {}
-                        }
-                    }
-                    let _ = runtime.client.notify_watched_files(events);
-                }
+                // The preprocessed text is the compiler's; tsgo keeps checking the
+                // component as written (`DocumentSnapshot.ts`), which a script
+                // preprocessor would have stripped of its types.
                 let open_key = self
                     .documents
                     .iter()
@@ -4814,17 +4785,6 @@ impl Server {
                             && document.version == output.version
                     })
                     .map(|document| document.uri.as_str().to_string());
-                if let Some(error) = projection_error {
-                    let message = format!("could not project preprocessed document: {error}");
-                    log::warn(format_args!("{}: {message}", filename.display()));
-                    self.preprocess_documents.remove(&filename);
-                    self.preprocess_failures
-                        .insert(filename, (output.version, message));
-                    if let Some(key) = open_key {
-                        self.refresh_document_diagnostics(key);
-                    }
-                    return;
-                }
                 if let Some(key) = open_key {
                     self.refresh_document_diagnostics(key);
                 }
@@ -4850,40 +4810,6 @@ impl Server {
                         .insert(filename.clone(), (version, message));
                     self.preprocess_documents.remove(&filename);
                     self.preprocess_dependencies.remove(&filename);
-                    let editor_open = self.is_editor_document(&filename);
-                    if let Some(runtime) = &mut self.tsgo
-                        && let Some(index) = runtime.overlay_index_for_source(&filename)
-                        && let Some(original) = self
-                            .documents
-                            .iter()
-                            .find(|document| {
-                                let path = uri_to_path(document.uri.as_str());
-                                crate::uri::canonicalize(&path).unwrap_or(path) == filename
-                                    && document.version == version
-                            })
-                            .map(|document| document.text().to_string())
-                            .or_else(|| {
-                                runtime.overlays[index]
-                                    .source_text(&filename)
-                                    .map(str::to_string)
-                            })
-                    {
-                        match runtime.overlays[index].open_or_update(&filename, &original, version)
-                        {
-                            Ok(shadow) if editor_open => {
-                                open_shadow(&runtime.client, &mut runtime.open_shadows, &shadow);
-                            }
-                            Ok(shadow) => {
-                                let mut events = Vec::new();
-                                runtime.deliver_disk_shadow(index, &shadow, &mut events);
-                                let _ = runtime.client.notify_watched_files(events);
-                            }
-                            Err(error) => log::warn(format_args!(
-                                "could not restore raw shadow for {}: {error}",
-                                filename.display()
-                            )),
-                        }
-                    }
                     let open_key = self
                         .documents
                         .iter()

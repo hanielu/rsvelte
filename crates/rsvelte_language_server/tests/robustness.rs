@@ -803,10 +803,10 @@ fn json_id(message: &str) -> &str {
 "###;
 
 /// Compile a fake tsgo that logs every buffer message and request it gets.
-#[cfg(unix)]
 fn traffic_recorder(dir: &Path) -> PathBuf {
     let source = dir.join("fake_tsgo_traffic.rs");
-    let helper = dir.join("fake-tsgo-traffic");
+    // Windows starts only a name with an executable's extension.
+    let helper = dir.join(format!("fake-tsgo-traffic{}", std::env::consts::EXE_SUFFIX));
     fs::write(&source, FAKE_TSGO_TRAFFIC).expect("write fake tsgo source");
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     assert!(
@@ -825,7 +825,6 @@ fn traffic_recorder(dir: &Path) -> PathBuf {
 
 /// The recorded traffic: one `<method> <uri>[ marked]` line per message, where
 /// `marked` says the text carried `RSVELTE_TEST_MARKER`.
-#[cfg(unix)]
 fn traffic(log: &Path) -> Vec<String> {
     fs::read_to_string(log)
         .unwrap_or_default()
@@ -834,13 +833,109 @@ fn traffic(log: &Path) -> Vec<String> {
         .collect()
 }
 
-#[cfg(unix)]
 fn hover(server: &mut Server, uri: &str) -> Value {
     let id = server.request(
         "textDocument/hover",
         json!({ "textDocument": { "uri": uri }, "position": { "line": 1, "character": 5 } }),
     );
     server.response(id, Duration::from_secs(5))
+}
+
+/// A preprocessor's output is for the compiler: tsgo checks the component as
+/// written, as upstream's TypeScript plugin does (`DocumentSnapshot.ts`,
+/// `preprocessSvelteFile`: svelte2tsx runs on `document.getText()`).
+/// Projected from `vitePreprocess({ script: true })`'s output, a TypeScript
+/// component had lost every type before tsgo saw it: annotated parameters were
+/// "implicitly any", and an error typed into it was never reported. Here the
+/// preprocessor drops the script's annotation and adds an `<img>` without
+/// `alt`, which only the compiler, reading its output, can report.
+#[test]
+fn tsgo_checks_the_component_as_written_and_the_compiler_as_preprocessed() {
+    if Command::new("node").arg("--version").output().is_err() {
+        return;
+    }
+    let dir = TestDir::new("preprocessed-script");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = rsvelte_language_server::uri::canonicalize(&dir.0)
+        .unwrap()
+        .join("ws");
+    let svelte = root.join("node_modules/svelte");
+    fs::create_dir_all(&svelte).unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    fs::write(root.join("tsconfig.json"), "{}").unwrap();
+    fs::write(
+        svelte.join("package.json"),
+        r#"{"name":"svelte","type":"module","exports":{"./compiler":"./compiler.js"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        svelte.join("compiler.js"),
+        "export async function preprocess(source, { markup }, options) {\n\
+         \tconst { code, map } = await markup({ content: source, filename: options?.filename });\n\
+         \treturn { code, map, dependencies: [] };\n\
+         }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("svelte.config.mjs"),
+        "export default { preprocess: { markup: ({ content }) => ({\n\
+         \tcode: content.replace(': TypedAway', '').replace('<p>', '<img><p>'),\n\
+         \tmap: { version: 3, sources: ['App.svelte'], names: [], mappings: 'AAAA;AACA;AACA;AACA' },\n\
+         }) } };\n",
+    )
+    .unwrap();
+    let source = "<script lang=\"ts\">\n\tlet value: TypedAway = 1;\n</script>\n<p>{value}</p>\n";
+    fs::write(root.join("App.svelte"), source).unwrap();
+    let mut server = Server::start_with_capabilities(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            ("RSVELTE_TEST_MARKER", Path::new("TypedAway")),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+        &json!({ "textDocument": { "diagnostic": {} } }),
+    );
+    let uri = file_uri(&root.join("App.svelte"));
+    server.open(&uri, source);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let pull = server.request(
+            "textDocument/diagnostic",
+            json!({ "textDocument": { "uri": uri } }),
+        );
+        let report = server.response(pull, Duration::from_secs(20));
+        let items = report["result"]["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if items
+            .iter()
+            .any(|item| item["code"] == "a11y_missing_attribute")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the compiler never read the preprocessed component: {report}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    hover(&mut server, &uri);
+    let sent = traffic(&log)
+        .into_iter()
+        .filter(|line| {
+            line.contains("App.svelte.tsx")
+                && (line.starts_with("textDocument/didOpen ")
+                    || line.starts_with("textDocument/didChange "))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !sent.is_empty() && sent.iter().all(|line| line.ends_with(" marked")),
+        "tsgo was sent the preprocessed component: {sent:?}"
+    );
+    server.shutdown();
 }
 
 /// A `Cannot find name` on a component's tag in the markup gets the
@@ -2637,7 +2732,6 @@ fn keystroke_states_that_panicked_the_projection_keep_the_server_answering() {
     server.shutdown();
 }
 
-#[cfg(unix)]
 const FAKE_TSGO_TRAFFIC: &str = r###"
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};

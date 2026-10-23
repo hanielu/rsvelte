@@ -347,7 +347,9 @@ fn temp_component(case: &str) -> PathBuf {
 }
 
 fn file_uri(path: &Path) -> String {
-    format!("file://{}", path.display())
+    url::Url::from_file_path(path)
+        .expect("absolute file path")
+        .to_string()
 }
 
 /// `initialize` + `initialized`, declaring `workspace/configuration` support.
