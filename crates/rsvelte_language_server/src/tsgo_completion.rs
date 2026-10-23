@@ -3,7 +3,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde_json::Value;
+use lsp_types::{Position, Range};
+use serde_json::{Value, json};
+
+use crate::context::script_bodies;
+use crate::text::LineIndex;
+use crate::tsgo_overlay::TsgoOverlay;
 
 const COMPONENT_SUFFIX: &str = "__SvelteComponent_";
 const RUNES: [&str; 4] = ["$props", "$state", "$derived", "$effect"];
@@ -144,6 +149,148 @@ pub fn rewrite_completion_item_for_context(item: &mut Value, context: Completion
     if context.kit_route {
         rewrite_kit_types_import_edits(item);
     }
+}
+
+/// The source a resolved completion's new imports are placed in.
+pub struct ImportPlacement<'a> {
+    /// The component's editor text.
+    pub source: &'a str,
+    /// Where the completion was asked for, in `source`.
+    pub trigger: Option<Position>,
+    /// `svelte.defaultScriptLanguage` for a component without a `<script>`.
+    pub script_language: Option<&'a str>,
+}
+
+/// Take a resolved completion's new-import edits out of `item`, placed in
+/// source coordinates, before the rest of it is mapped back from the shadow.
+///
+/// tsgo puts a new import at the start of the generated line after the last
+/// one, which svelte2tsx's own code fills: mapped like any other position it
+/// landed at `<|script`, splitting the tag. This is
+/// `CompletionProvider.codeActionChangeToTextEdit` (`:1087-1183`): a new import
+/// goes on the line after the source of the generated line before it, and one
+/// that maps nowhere in a `<script>` body goes at the start of the body.
+pub fn take_new_import_edits(
+    item: &mut Value,
+    overlay: &TsgoOverlay,
+    shadow_path: &Path,
+    placement: &ImportPlacement<'_>,
+) -> Vec<Value> {
+    let Some(edits) = item
+        .get_mut("additionalTextEdits")
+        .and_then(Value::as_array_mut)
+    else {
+        return Vec::new();
+    };
+    let is_new_import = |edit: &Value| {
+        edit.get("newText")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.trim_start().starts_with("import "))
+    };
+    let (imports, rest): (Vec<Value>, Vec<Value>) =
+        std::mem::take(edits).into_iter().partition(is_new_import);
+    *edits = rest;
+    imports
+        .into_iter()
+        .filter_map(|mut edit| {
+            let range = serde_json::from_value::<Range>(edit.get("range")?.clone()).ok()?;
+            let text = edit.get("newText")?.as_str()?.to_string();
+            let (range, text) = place_new_import(overlay, shadow_path, placement, range, text);
+            edit["range"] = json!(range);
+            edit["newText"] = Value::String(text);
+            Some(edit)
+        })
+        .collect()
+}
+
+fn place_new_import(
+    overlay: &TsgoOverlay,
+    shadow_path: &Path,
+    placement: &ImportPlacement<'_>,
+    generated: Range,
+    mut text: String,
+) -> (Range, String) {
+    let source = placement.source;
+    let index = LineIndex::new(source);
+    let newline = if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let bodies = script_bodies(source);
+    let Some(script) = bodies.instance.clone().or_else(|| bodies.module.clone()) else {
+        // No `<script>` yet: write one holding the import.
+        let text = text.trim_start_matches(['\r', '\n']);
+        let language = placement
+            .script_language
+            .filter(|language| *language != "none")
+            .map(|language| format!(" lang=\"{language}\""))
+            .unwrap_or_default();
+        let start = Position::new(0, 0);
+        return (
+            Range::new(start, start),
+            format!("<script{language}>{newline}{text}</script>{newline}"),
+        );
+    };
+    let in_body = |body: &Option<std::ops::Range<usize>>, offset: usize| {
+        body.as_ref()
+            .is_some_and(|body| body.start <= offset && offset <= body.end)
+    };
+    // A new import that cannot map takes its line from the line before it.
+    let mapped = if generated.start.character == 0 && generated.start.line > 1 {
+        let line_after = |position: Position| {
+            overlay
+                .map_generated_position(shadow_path, Position::new(position.line - 1, 0))
+                .map(|before| Position::new(before.line + 1, 0))
+        };
+        line_after(generated.start).zip(line_after(generated.end))
+    } else {
+        overlay
+            .map_generated_position(shadow_path, generated.start)
+            .zip(overlay.map_generated_position(shadow_path, generated.end))
+    };
+    let empty = generated.start == generated.end;
+    let range = mapped
+        .filter(|(start, _)| !(start.line == 0 && start.character <= 1 && empty))
+        .filter(|(start, _)| {
+            let offset = index.offset(source, *start);
+            in_body(&bodies.instance, offset) || in_body(&bodies.module, offset)
+        })
+        .map_or_else(
+            || {
+                // The body of the script the completion was asked in, else
+                // the instance script's.
+                let trigger = placement
+                    .trigger
+                    .map(|position| index.offset(source, position));
+                let body = trigger
+                    .and_then(|offset| {
+                        [&bodies.instance, &bodies.module]
+                            .into_iter()
+                            .find(|body| in_body(body, offset))
+                    })
+                    .and_then(Option::as_ref)
+                    .unwrap_or(&script);
+                let start = index.position(source, body.start);
+                Range::new(start, start)
+            },
+            |(start, end)| Range::new(start, end),
+        );
+    let start = index.offset(source, range.start);
+    // Not `<script>import …` on the tag's own line.
+    let at_body_start = [&bodies.instance, &bodies.module]
+        .into_iter()
+        .any(|body| body.as_ref().is_some_and(|body| body.start == start));
+    if at_body_start && !text.starts_with(['\r', '\n']) {
+        text.insert_str(0, newline);
+    }
+    // TypeScript adds a blank line after an import at the top of a file.
+    let end = index.offset(source, range.end);
+    if source[end..].starts_with(['\r', '\n']) {
+        text.truncate(text.trim_end().len());
+        text.push_str(newline);
+    }
+    (range, text)
 }
 
 /// Remove virtual component names and shadow extensions from editor-visible fields.
@@ -551,6 +698,107 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// Place one new import tsgo answered at `generated_line` of `source`'s
+    /// shadow (`None`: on the line after the shadow's last import).
+    fn placed_import(source: &str, generated_line: Option<u32>) -> Value {
+        // Tests run in parallel: a counter keeps their workspaces apart.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("rsvelte-new-import-{}-{nonce}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("src/App.svelte");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, source).unwrap();
+        let overlay = TsgoOverlay::build_with(&root, None, None).unwrap();
+        let shadow_path = crate::uri::uri_to_path(
+            overlay
+                .shadow_for_source(&path)
+                .unwrap()
+                .shadow_uri
+                .as_str(),
+        );
+        let shadow = overlay.shadow_text(&shadow_path).unwrap();
+        let line = generated_line.unwrap_or_else(|| {
+            let last = shadow
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.starts_with("import "))
+                .last()
+                .expect("an import in the shadow")
+                .0;
+            u32::try_from(last + 1).unwrap()
+        });
+        let mut item = json!({
+            "label": "Widget",
+            "additionalTextEdits": [{
+                "range": {
+                    "start": { "line": line, "character": 0 },
+                    "end": { "line": line, "character": 0 }
+                },
+                "newText": "import Widget from \"./Widget.svelte\";\n"
+            }]
+        });
+        let placement = ImportPlacement {
+            source,
+            trigger: None,
+            script_language: Some("ts"),
+        };
+        let placed = take_new_import_edits(&mut item, &overlay, &shadow_path, &placement);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            item["additionalTextEdits"],
+            json!([]),
+            "taken out of the item"
+        );
+        assert_eq!(placed.len(), 1);
+        placed.into_iter().next().unwrap()
+    }
+
+    /// tsgo's new import, at the start of the generated line after the last
+    /// import, lands on the source line after that import — not at
+    /// `<|script`, where it used to split the tag.
+    #[test]
+    fn a_new_import_goes_after_the_last_import() {
+        let source = "<script lang=\"ts\">\n\timport Other from './Other.svelte';\n\tlet count = 1;\n</script>\n\n<Other />\n";
+        let edit = placed_import(source, None);
+        assert_eq!(
+            edit["range"],
+            json!({ "start": { "line": 2, "character": 0 }, "end": { "line": 2, "character": 0 } })
+        );
+        assert_eq!(edit["newText"], "import Widget from \"./Widget.svelte\";\n");
+    }
+
+    /// With no import to follow, the import opens the script body on a line of
+    /// its own (`CompletionProvider.ts:1149-1175`).
+    #[test]
+    fn a_first_import_opens_the_script_body() {
+        let source = "<script lang=\"ts\">\n\tlet count = 1;\n</script>\n";
+        let edit = placed_import(source, Some(1));
+        assert_eq!(
+            edit["range"],
+            json!({ "start": { "line": 0, "character": 18 }, "end": { "line": 0, "character": 18 } })
+        );
+        assert_eq!(
+            edit["newText"],
+            "\nimport Widget from \"./Widget.svelte\";\n"
+        );
+    }
+
+    /// A component without a `<script>` gets one holding the import.
+    #[test]
+    fn a_component_without_a_script_gets_one() {
+        let edit = placed_import("<p>hello</p>\n", Some(1));
+        assert_eq!(
+            edit["range"],
+            json!({ "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } })
+        );
+        assert_eq!(
+            edit["newText"],
+            "<script lang=\"ts\">\nimport Widget from \"./Widget.svelte\";\n</script>\n"
+        );
+    }
 
     #[test]
     fn rewrites_visible_component_fields_but_not_resolve_data() {

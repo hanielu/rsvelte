@@ -54,10 +54,11 @@ use crate::tsgo_code_actions::{
     TsgoCodeActionContext, document_has_parser_error, rewrite_code_action_response,
 };
 use crate::tsgo_completion::{
-    CompletionAction, CompletionRewriteContext, CompletionSite, adopt_upstream_completion_data,
-    adopt_upstream_item_data, completion_action, restore_tsgo_completion_data,
-    rewrite_completion_item_for_context, rewrite_completion_response_for_context,
-    rewrite_visible_tsgo_response, upstream_completion_data_site,
+    CompletionAction, CompletionRewriteContext, CompletionSite, ImportPlacement,
+    adopt_upstream_completion_data, adopt_upstream_item_data, completion_action,
+    restore_tsgo_completion_data, rewrite_completion_item_for_context,
+    rewrite_completion_response_for_context, rewrite_visible_tsgo_response, take_new_import_edits,
+    upstream_completion_data_site,
 };
 use crate::tsgo_component_info::{
     ComponentCompletionSite, ComponentInfoAction, ComponentInfoQuery, ComponentInfoRequestId,
@@ -5185,6 +5186,32 @@ impl Server {
                         let shadow_path = uri_to_path(shadow.shadow_uri.as_str());
                         filter_generated_inlay_hints(result, overlay, &shadow_path);
                     }
+                    // New imports are placed before mapping, from the generated
+                    // line before them (`CompletionProvider.ts:1135-1143`).
+                    let new_imports = if method == "completionItem/resolve"
+                        && let Some(runtime) = &self.tsgo
+                        && let Some(source) = source_path.as_deref()
+                        && let Some(overlay) = runtime.overlay_for_source(source)
+                        && let Some(shadow) = overlay.shadow_for_source(source)
+                        && let Some(text) = source_uri
+                            .as_ref()
+                            .and_then(|uri| self.documents.get(uri))
+                            .map(Document::text)
+                    {
+                        let placement = ImportPlacement {
+                            source: text,
+                            trigger: completion_site_data.as_ref().and_then(|(_, position)| {
+                                serde_json::from_value(position.clone()).ok()
+                            }),
+                            script_language: Some(
+                                self.settings.svelte.default_script_language.as_str(),
+                            ),
+                        };
+                        let shadow_path = uri_to_path(shadow.shadow_uri.as_str());
+                        take_new_import_edits(result, overlay, &shadow_path, &placement)
+                    } else {
+                        Vec::new()
+                    };
                     if let Some(runtime) = &self.tsgo {
                         let mut mapper = TsgoResponseMapper::for_overlays_with_default_document(
                             &runtime.overlays,
@@ -5198,6 +5225,16 @@ impl Server {
                             );
                         }
                         mapper.map_response(&method, result);
+                    }
+                    if !new_imports.is_empty()
+                        && let Some(item) = result.as_object_mut()
+                    {
+                        let edits = item
+                            .entry("additionalTextEdits")
+                            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                        if let Some(edits) = edits.as_array_mut() {
+                            edits.extend(new_imports);
+                        }
                     }
                     // The same component can sit in several projects (its
                     // owner and the copies others keep for their imports),
