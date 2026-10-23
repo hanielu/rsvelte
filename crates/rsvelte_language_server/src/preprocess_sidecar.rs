@@ -742,15 +742,15 @@ fn restart_delay(config: &PreprocessSidecarConfig, consecutive_crashes: u32) -> 
 
 #[must_use]
 pub fn find_preprocess_config(filename: &Path, workspace: &Path) -> Option<PathBuf> {
-    let workspace = fs::canonicalize(workspace).ok()?;
-    let mut current = fs::canonicalize(filename.parent()?).ok()?;
+    let workspace = crate::uri::canonicalize(workspace).ok()?;
+    let mut current = crate::uri::canonicalize(filename.parent()?).ok()?;
     loop {
         if !current.starts_with(&workspace) {
             return None;
         }
         for name in CONFIG_NAMES {
             let candidate = current.join(name);
-            let Ok(candidate) = fs::canonicalize(candidate) else {
+            let Ok(candidate) = crate::uri::canonicalize(candidate) else {
                 continue;
             };
             if candidate.starts_with(&workspace)
@@ -806,7 +806,7 @@ impl PreprocessConfigCache {
         if let Some(known) = self.canonical.get(path) {
             return known.clone();
         }
-        let canonical = fs::canonicalize(path).ok();
+        let canonical = crate::uri::canonicalize(path).ok();
         self.canonical.insert(path.to_path_buf(), canonical.clone());
         canonical
     }
@@ -820,7 +820,7 @@ impl PreprocessConfigCache {
             return known.clone();
         }
         let mut found = CONFIG_NAMES.iter().find_map(|name| {
-            let candidate = fs::canonicalize(directory.join(name)).ok()?;
+            let candidate = crate::uri::canonicalize(directory.join(name)).ok()?;
             (candidate.starts_with(workspace)
                 && candidate.is_file()
                 && configures_preprocessing(&candidate))
@@ -860,7 +860,7 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("app/svelte.config.js"), "export default {};").unwrap();
-        let root = fs::canonicalize(&root).unwrap();
+        let root = crate::uri::canonicalize(&root).unwrap();
         assert_eq!(
             find_preprocess_config(&root.join("lib/src/A.svelte"), &root),
             Some(root.join("lib/vite.config.ts"))
@@ -1043,7 +1043,7 @@ module.exports = api;
         fs::write(&file, "<p />").unwrap();
         assert_eq!(
             find_preprocess_config(&file, &root),
-            Some(fs::canonicalize(root.join("packages/app/svelte.config.mjs")).unwrap())
+            Some(crate::uri::canonicalize(root.join("packages/app/svelte.config.mjs")).unwrap())
         );
         fs::remove_dir_all(root).ok();
     }

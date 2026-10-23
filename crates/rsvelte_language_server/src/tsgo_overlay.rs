@@ -636,7 +636,7 @@ impl TsgoOverlay {
         load: bool,
     ) -> Result<Self, TsgoOverlayError> {
         let workspace = absolute_normalized(workspace);
-        let workspace = fs::canonicalize(&workspace)?;
+        let workspace = crate::uri::canonicalize(&workspace)?;
         if !workspace.is_dir() {
             return Err(TsgoOverlayError::InvalidSource {
                 path: workspace,
@@ -644,7 +644,7 @@ impl TsgoOverlay {
             });
         }
         let mirror_root = match mirror_root {
-            Some(root) => fs::canonicalize(absolute_normalized(root))?,
+            Some(root) => crate::uri::canonicalize(absolute_normalized(root))?,
             None => workspace.clone(),
         };
         if !workspace.starts_with(&mirror_root) {
@@ -1355,7 +1355,7 @@ impl TsgoOverlay {
                 let targets =
                     self.svelte_targets(&path, directory, specifier, &aliases, &package_imports);
                 for target in targets {
-                    let target = fs::canonicalize(&target).unwrap_or(target);
+                    let target = crate::uri::canonicalize(&target).unwrap_or(target);
                     if module && target.starts_with(&self.mirror_root) && target.is_file() {
                         self.module_imports.insert(target.clone());
                     }
@@ -1420,7 +1420,7 @@ impl TsgoOverlay {
                 target.starts_with(&self.mirror_root)
                     && !self.entries.contains_key(target)
                     && (target.is_file() || is_open(target))
-                    && fs::canonicalize(target)
+                    && crate::uri::canonicalize(target)
                         .map_or(true, |canonical| !self.entries.contains_key(&canonical))
             })
         })
@@ -1490,7 +1490,7 @@ impl TsgoOverlay {
         walk_owned_files(&self.workspace, &mut owned_components, &mut owned_modules);
         let mut discovered = owned_components
             .into_iter()
-            .map(|path| fs::canonicalize(&path).unwrap_or(path))
+            .map(|path| crate::uri::canonicalize(&path).unwrap_or(path))
             .collect::<BTreeSet<_>>();
         self.owned = discovered.clone();
         let aliases = self.alias_patterns();
@@ -1514,7 +1514,7 @@ impl TsgoOverlay {
                 for target in
                     self.svelte_targets(&path, directory, specifier, aliases, &package_imports)
                 {
-                    let Ok(target) = fs::canonicalize(&target) else {
+                    let Ok(target) = crate::uri::canonicalize(&target) else {
                         if target.starts_with(&self.mirror_root) {
                             missing.insert(target);
                         }
@@ -1584,7 +1584,7 @@ impl TsgoOverlay {
                     let target = if self.entries.contains_key(&target) {
                         target
                     } else {
-                        fs::canonicalize(&target).unwrap_or(target)
+                        crate::uri::canonicalize(&target).unwrap_or(target)
                     };
                     if self.entries.contains_key(&target) && !seen.contains(&target) {
                         pending.push(target);
@@ -2666,7 +2666,7 @@ impl TsgoOverlay {
             });
         }
         let existing = nearest_existing_path(&lexical)?;
-        let real_existing = fs::canonicalize(existing)?;
+        let real_existing = crate::uri::canonicalize(existing)?;
         let suffix = lexical
             .strip_prefix(existing)
             .expect("nearest existing path is an ancestor");
@@ -2677,7 +2677,7 @@ impl TsgoOverlay {
                 reason: "source is redirected outside the workspace by a symlink",
             });
         }
-        Ok(fs::canonicalize(&real).unwrap_or(real))
+        Ok(crate::uri::canonicalize(&real).unwrap_or(real))
     }
 
     fn confined_any_source(&self, source_path: &Path) -> Result<PathBuf, TsgoOverlayError> {
@@ -2687,7 +2687,7 @@ impl TsgoOverlay {
             absolute_normalized(&self.workspace.join(source_path))
         };
         let existing = nearest_existing_path(&lexical)?;
-        let real_existing = fs::canonicalize(existing)?;
+        let real_existing = crate::uri::canonicalize(existing)?;
         let suffix = lexical
             .strip_prefix(existing)
             .expect("nearest existing path is an ancestor");
@@ -2698,7 +2698,7 @@ impl TsgoOverlay {
                 reason: "source is redirected outside the workspace by a symlink",
             });
         }
-        Ok(fs::canonicalize(&real).unwrap_or(real))
+        Ok(crate::uri::canonicalize(&real).unwrap_or(real))
     }
 
     fn lookup_source_path(&self, source_path: &Path) -> PathBuf {
@@ -2707,7 +2707,7 @@ impl TsgoOverlay {
         } else {
             absolute_normalized(&self.workspace.join(source_path))
         };
-        fs::canonicalize(&path).unwrap_or(path)
+        crate::uri::canonicalize(&path).unwrap_or(path)
     }
 
     fn remove_source(&mut self, source_path: &Path) -> Result<(), TsgoOverlayError> {
@@ -3450,12 +3450,12 @@ fn is_script_module(name: &str) -> bool {
 /// for a file that no longer exists (its directory usually does).
 fn canonical_event_path(path: &Path) -> PathBuf {
     let path = absolute_normalized(path);
-    if let Ok(canonical) = fs::canonicalize(&path) {
+    if let Ok(canonical) = crate::uri::canonicalize(&path) {
         return canonical;
     }
     match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) => {
-            fs::canonicalize(parent).map_or(path.clone(), |parent| parent.join(name))
+            crate::uri::canonicalize(parent).map_or(path.clone(), |parent| parent.join(name))
         }
         _ => path,
     }
@@ -4909,7 +4909,7 @@ mod tests {
         assert_eq!(
             overlay
                 .entries
-                .get(&fs::canonicalize(&app).unwrap())
+                .get(&crate::uri::canonicalize(&app).unwrap())
                 .unwrap()
                 .source_text,
             "<p>buffer</p>"
@@ -4922,7 +4922,7 @@ mod tests {
         assert_eq!(
             overlay
                 .entries
-                .get(&fs::canonicalize(&app).unwrap())
+                .get(&crate::uri::canonicalize(&app).unwrap())
                 .unwrap()
                 .source_text,
             "<p>disk</p>"
@@ -4945,7 +4945,7 @@ mod tests {
         let mut overlay = build_overlay(&workspace.0).unwrap();
         overlay.open_or_update(&app, "<p>buffer</p>", 3).unwrap();
         write(&other, "<p>changed</p>");
-        let app_path = fs::canonicalize(&app).unwrap();
+        let app_path = crate::uri::canonicalize(&app).unwrap();
         let mut editor = EditorBuffers::default();
         editor.insert(app_path.clone(), Arc::new("<p>buffer</p>".to_string()), 3);
 
@@ -5462,7 +5462,7 @@ mod tests {
         let workspace = TestWorkspace::new("svelte-fallback-html");
         let server = TestWorkspace::new("svelte-fallback-html-server");
         write_svelte_package(&server.0, true);
-        let package = fs::canonicalize(&server.0)
+        let package = crate::uri::canonicalize(&server.0)
             .unwrap()
             .join("node_modules/svelte");
         write(&workspace.0.join("src/App.svelte"), "<p />");
@@ -5753,7 +5753,7 @@ mod tests {
         // `findTsConfigPath` searches from the DOCUMENT's directory upward, so a
         // subdirectory carrying its own config is its own project (#4391).
         let workspace = TestWorkspace::new("nearest-tsconfig");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("tsconfig.json"), "{}");
         write(&root.join("docs/tsconfig.json"), "{}");
         write(&root.join("docs/src/App.svelte"), "<p />");
@@ -5772,7 +5772,7 @@ mod tests {
     #[test]
     fn a_jsconfig_answers_only_where_no_tsconfig_does() {
         let workspace = TestWorkspace::new("nearest-jsconfig");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("docs/jsconfig.json"), "{}");
         write(&root.join("docs/src/App.svelte"), "<p />");
         assert_eq!(
@@ -5791,7 +5791,7 @@ mod tests {
     #[test]
     fn the_search_stops_at_the_boundary_and_at_node_modules() {
         let workspace = TestWorkspace::new("nearest-boundary");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("tsconfig.json"), "{}");
         write(&root.join("node_modules/dep/src/App.svelte"), "<p />");
         write(&root.join("plain/App.svelte"), "<p />");
@@ -5819,7 +5819,7 @@ mod tests {
         // imports `../shared-comp.svelte`, which only a shadow at the same
         // position relative to the workspace can resolve.
         let workspace = TestWorkspace::new("nested-outside-import");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("tsconfig.json"), "{}");
         write(&root.join("nested/tsconfig.json"), "{}");
         write(
@@ -5871,7 +5871,7 @@ mod tests {
     #[test]
     fn a_project_owns_only_documents_whose_nearest_config_it_is() {
         let workspace = TestWorkspace::new("ownership");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("tsconfig.json"), "{}");
         write(&root.join("src/App.svelte"), "<p />");
         write(&root.join("docs/tsconfig.json"), "{}");
@@ -5898,7 +5898,7 @@ mod tests {
     #[test]
     fn a_configless_root_owns_only_documents_without_any_config() {
         let workspace = TestWorkspace::new("ownership-configless");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("App.svelte"), "<p />");
         write(&root.join("lib/Button.svelte"), "<p />");
         write(&root.join("app/tsconfig.json"), "{}");
@@ -5913,7 +5913,7 @@ mod tests {
     #[test]
     fn a_parallel_load_projects_exactly_what_one_thread_does() {
         let workspace = TestWorkspace::new("parallel-load");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         for index in 0..40 {
             write(
                 &root.join(format!("src/c{}/C{index}.svelte", index % 5)),
@@ -5948,7 +5948,7 @@ mod tests {
     fn file_events_touch_only_the_files_they_name() {
         use lsp_types::FileChangeType;
         let workspace = TestWorkspace::new("file-events");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("app/tsconfig.json"), "{}");
         write(&root.join("app/A.svelte"), "<p>a</p>");
         write(&root.join("app/B.svelte"), "<p>b</p>");
@@ -6091,7 +6091,7 @@ mod tests {
     #[test]
     fn a_nested_packages_node_modules_is_mirrored_into_the_cache() {
         let workspace = TestWorkspace::new("node-modules");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("node_modules/root-pkg/index.d.ts"), "export {};");
         write(
             &root.join("admin/node_modules/admin-pkg/index.d.ts"),
@@ -6144,7 +6144,7 @@ mod tests {
         // mirrored tree replaced the `app/node_modules` link with a real
         // directory, and every member under `app` lost its packages.
         let workspace = TestWorkspace::new("node-modules-member");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("tsconfig.json"), "{}");
         write(&root.join("src/App.svelte"), "<p />");
         write(&root.join("node_modules/pkg/dist/Comp.svelte"), "<p />");
@@ -6249,7 +6249,7 @@ mod tests {
         // What cde9cd4's servers left behind after shadowing a dependency's
         // component in the mirrored tree.
         let workspace = TestWorkspace::new("stale-node-modules-directory");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("tsconfig.json"), "{}");
         write(&root.join("app/src/App.svelte"), "<p />");
         write(&root.join("app/node_modules/dep/index.d.ts"), "");
@@ -6274,7 +6274,7 @@ mod tests {
     #[test]
     fn package_imports_resolve_from_shadows_as_from_their_sources() {
         let workspace = TestWorkspace::new("package-imports");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("package.json"), r#"{ "name": "root" }"#);
         write(
             &root.join("ui/package.json"),
@@ -6342,7 +6342,7 @@ mod tests {
     #[test]
     fn a_copy_resolves_its_package_imports_in_its_own_package() {
         let workspace = TestWorkspace::new("package-imports-copy");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("package.json"), r#"{ "name": "root" }"#);
         for package in ["ui", "rt"] {
             write(
@@ -6404,7 +6404,7 @@ mod tests {
     #[test]
     fn a_package_import_two_scopes_map_differently_keeps_the_projects_own() {
         let workspace = TestWorkspace::new("package-imports-conflict");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         for package in ["app", "lib", "other"] {
             write(
                 &root.join(package).join("package.json"),
@@ -6447,7 +6447,7 @@ mod tests {
     #[test]
     fn a_deferred_overlay_projects_nothing_until_loaded() {
         let workspace = TestWorkspace::new("deferred");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("src/App.svelte"), "<p />");
         let mut overlay = TsgoOverlay::build_mirrored(&root, None, None, None, false).unwrap();
         assert!(!overlay.is_loaded());
@@ -6469,7 +6469,7 @@ mod tests {
         // monorepo/admin/tests: a project with no component of its own, whose
         // tests import the app's components through an alias.
         let workspace = TestWorkspace::new("alias-closure");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("src/tsconfig.json"), "{}");
         write(
             &root.join("src/app/Error.svelte"),
@@ -6528,7 +6528,7 @@ mod tests {
     fn an_editor_documents_new_import_is_followed_before_and_after_a_save() {
         use lsp_types::FileChangeType;
         let workspace = TestWorkspace::new("open-importer");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("a/tsconfig.json"), "{}");
         write(&root.join("a/Plain.svelte"), "<p />");
         write(&root.join("b/tsconfig.json"), "{}");
@@ -6575,7 +6575,7 @@ mod tests {
     #[test]
     fn a_component_opened_before_it_exists_is_owned_by_its_project() {
         let workspace = TestWorkspace::new("owned-on-open");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("b/tsconfig.json"), "{}");
         write(&root.join("b/Other.svelte"), "<p />");
         let fresh = root.join("b/Fresh.svelte");
@@ -6598,7 +6598,7 @@ mod tests {
     fn deleting_a_directory_with_a_dot_in_its_name_removes_its_members() {
         use lsp_types::FileChangeType;
         let workspace = TestWorkspace::new("dotted-directory");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("tsconfig.json"), "{}");
         write(&root.join("src/ui.v1/Button.svelte"), "<p />");
         write(&root.join("src/ui.v1.svelte"), "<p />");
@@ -6639,7 +6639,7 @@ mod tests {
     #[test]
     fn javascript_components_an_open_document_reaches_are_the_ones_found() {
         let workspace = TestWorkspace::new("reachable-javascript");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("tsconfig.json"), "{}");
         write(
             &root.join("src/Page.svelte"),
@@ -6682,7 +6682,7 @@ mod tests {
     #[test]
     fn the_projects_that_own_components_are_found_in_one_walk() {
         let workspace = TestWorkspace::new("component-projects");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("App.svelte"), "<p />");
         write(&root.join("app/tsconfig.json"), "{}");
         write(&root.join("app/src/deep/Page.svelte"), "<p />");
@@ -6720,7 +6720,7 @@ mod tests {
     fn a_deleted_copy_comes_back_with_its_file() {
         use lsp_types::FileChangeType;
         let workspace = TestWorkspace::new("deleted-copy");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("a/tsconfig.json"), "{}");
         write(
             &root.join("a/Parent.svelte"),
@@ -6765,7 +6765,7 @@ mod tests {
     fn a_new_import_of_an_editor_open_component_copies_its_buffer() {
         use lsp_types::FileChangeType;
         let workspace = TestWorkspace::new("open-target");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("a/tsconfig.json"), "{}");
         write(&root.join("a/Plain.svelte"), "<p />");
         write(&root.join("b/tsconfig.json"), "{}");
@@ -6821,7 +6821,7 @@ mod tests {
         // The reason the split matters: `paths` declared one level down are
         // invisible to a single workspace-root project.
         let workspace = TestWorkspace::new("nested-paths");
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         write(&root.join("tsconfig.json"), "{}");
         write(
             &root.join("docs/tsconfig.json"),

@@ -2221,7 +2221,7 @@ mod tests {
     #[test]
     fn the_owner_wins_over_a_copy_at_equal_depth() {
         let workspace = Workspace::new();
-        let root = fs::canonicalize(&workspace.0).unwrap();
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
         for (path, text) in [
             ("a/tsconfig.json", "{}"),
             ("a/X.svelte", "<script lang=\"ts\">let value = 1;</script>"),

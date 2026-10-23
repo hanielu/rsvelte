@@ -639,7 +639,7 @@ fn a_document_loads_only_its_own_project_and_the_rest_is_read_from_disk() {
             .success(),
         "compile fake tsgo"
     );
-    let root = fs::canonicalize(&dir.0).unwrap();
+    let root = rsvelte_language_server::uri::canonicalize(&dir.0).unwrap();
     fs::write(root.join("package.json"), "{}").unwrap();
     for project in ["a", "b"] {
         fs::create_dir_all(root.join(project)).unwrap();
@@ -855,7 +855,9 @@ fn a_component_tag_without_an_import_is_offered_one() {
     let dir = TestDir::new("component-import-fix");
     let helper = traffic_recorder(&dir.0);
     let log = dir.0.join("tsgo.log");
-    let root = fs::canonicalize(&dir.0).unwrap().join("ws");
+    let root = rsvelte_language_server::uri::canonicalize(&dir.0)
+        .unwrap()
+        .join("ws");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("package.json"), "{}").unwrap();
     fs::write(root.join("tsconfig.json"), "{}").unwrap();
@@ -930,7 +932,9 @@ fn a_project_loaded_later_gets_the_unsaved_buffers_it_copies() {
     let dir = TestDir::new("late-copy");
     let helper = traffic_recorder(&dir.0);
     let log = dir.0.join("tsgo.log");
-    let root = fs::canonicalize(&dir.0).unwrap().join("ws");
+    let root = rsvelte_language_server::uri::canonicalize(&dir.0)
+        .unwrap()
+        .join("ws");
     fs::create_dir_all(root.join("a")).unwrap();
     fs::create_dir_all(root.join("b")).unwrap();
     fs::write(root.join("package.json"), "{}").unwrap();
@@ -987,7 +991,9 @@ fn component_attribute_completion_asks_the_owning_project() {
     let dir = TestDir::new("component-query-owner");
     let helper = traffic_recorder(&dir.0);
     let log = dir.0.join("tsgo.log");
-    let root = fs::canonicalize(&dir.0).unwrap().join("ws");
+    let root = rsvelte_language_server::uri::canonicalize(&dir.0)
+        .unwrap()
+        .join("ws");
     fs::create_dir_all(root.join("a")).unwrap();
     fs::create_dir_all(root.join("b")).unwrap();
     fs::write(root.join("package.json"), "{}").unwrap();
@@ -1053,7 +1059,9 @@ fn component_attribute_completion_probes_in_the_shadow_and_holds_other_requests(
     let dir = TestDir::new("component-query-in-place");
     let helper = traffic_recorder(&dir.0);
     let log = dir.0.join("tsgo.log");
-    let root = fs::canonicalize(&dir.0).unwrap().join("ws");
+    let root = rsvelte_language_server::uri::canonicalize(&dir.0)
+        .unwrap()
+        .join("ws");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("package.json"), "{}").unwrap();
     fs::write(root.join("tsconfig.json"), "{}").unwrap();
@@ -1148,7 +1156,9 @@ fn an_edit_during_a_probe_answers_the_held_requests_against_the_text_before_it()
     let dir = TestDir::new("component-query-held-before-edit");
     let helper = traffic_recorder(&dir.0);
     let log = dir.0.join("tsgo.log");
-    let root = fs::canonicalize(&dir.0).unwrap().join("ws");
+    let root = rsvelte_language_server::uri::canonicalize(&dir.0)
+        .unwrap()
+        .join("ws");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("package.json"), "{}").unwrap();
     fs::write(root.join("tsconfig.json"), "{}").unwrap();
@@ -1298,7 +1308,9 @@ fn a_request_sent_before_an_edit_reaches_tsgo_before_it() {
     let dir = TestDir::new("native-half-before-edit");
     let helper = traffic_recorder(&dir.0);
     let log = dir.0.join("tsgo.log");
-    let root = fs::canonicalize(&dir.0).unwrap().join("ws");
+    let root = rsvelte_language_server::uri::canonicalize(&dir.0)
+        .unwrap()
+        .join("ws");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("package.json"), "{}").unwrap();
     fs::write(root.join("tsconfig.json"), "{}").unwrap();
@@ -1381,7 +1393,9 @@ fn an_edit_after_a_diagnostic_pull_waits_for_neither_of_its_halves() {
     let dir = TestDir::new("pull-joins-its-halves");
     let helper = traffic_recorder(&dir.0);
     let log = dir.0.join("tsgo.log");
-    let root = fs::canonicalize(&dir.0).unwrap().join("ws");
+    let root = rsvelte_language_server::uri::canonicalize(&dir.0)
+        .unwrap()
+        .join("ws");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("package.json"), "{}").unwrap();
     fs::write(root.join("tsconfig.json"), "{}").unwrap();
@@ -1545,7 +1559,9 @@ fn a_request_tsgo_never_answers_is_answered_without_it_and_holds_nothing_back() 
 /// One project at `<dir>/ws` holding `X.svelte`; returns the workspace root.
 #[cfg(unix)]
 fn one_project(dir: &Path) -> PathBuf {
-    let root = fs::canonicalize(dir).unwrap().join("ws");
+    let root = rsvelte_language_server::uri::canonicalize(dir)
+        .unwrap()
+        .join("ws");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("package.json"), "{}").unwrap();
     fs::write(root.join("tsconfig.json"), "{}").unwrap();
@@ -2385,7 +2401,9 @@ fn answers_tsgo_sent_while_the_server_was_busy_are_not_counted_as_lost() {
 /// none, for the background-loading tests.
 #[cfg(unix)]
 fn three_projects(dir: &Path) -> PathBuf {
-    let root = fs::canonicalize(dir).unwrap().join("ws");
+    let root = rsvelte_language_server::uri::canonicalize(dir)
+        .unwrap()
+        .join("ws");
     for project in ["a", "b", "c", "tests"] {
         fs::create_dir_all(root.join(project)).unwrap();
         fs::write(root.join(project).join("tsconfig.json"), "{}").unwrap();
@@ -2570,7 +2588,9 @@ fn keystroke_states_that_panicked_the_projection_keep_the_server_answering() {
     let dir = TestDir::new("keystroke-panics");
     let helper = traffic_recorder(&dir.0);
     let log = dir.0.join("tsgo.log");
-    let root = fs::canonicalize(&dir.0).unwrap().join("ws");
+    let root = rsvelte_language_server::uri::canonicalize(&dir.0)
+        .unwrap()
+        .join("ws");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("package.json"), "{}").unwrap();
     fs::write(root.join("tsconfig.json"), "{}").unwrap();

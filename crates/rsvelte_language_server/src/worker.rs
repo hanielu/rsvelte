@@ -727,7 +727,7 @@ fn collect_source_directory(directory: &Path, sources: &mut HashMap<PathBuf, Fil
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
-        let canonical = fs::canonicalize(&path).unwrap_or(path);
+        let canonical = crate::uri::canonicalize(&path).unwrap_or(path);
         let Some(uri) = path_to_uri(&canonical) else {
             continue;
         };

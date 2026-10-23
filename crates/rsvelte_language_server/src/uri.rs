@@ -29,10 +29,43 @@ pub fn uri_to_path(uri: &str) -> PathBuf {
     PathBuf::from(decoded)
 }
 
+/// [`std::fs::canonicalize`] without Windows' verbatim prefix. On Windows it
+/// answers `\\?\C:\dir`, which an editor and a TypeScript server never send
+/// and so never compare equal to, and which [`path_to_uri`] could only have
+/// written as `file:////%3F/C:/dir`; elsewhere this is `fs::canonicalize`.
+pub fn canonicalize(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(path).map(strip_verbatim)
+}
+
+/// `\\?\C:\dir` → `C:\dir` and `\\?\UNC\server\share\dir` →
+/// `\\server\share\dir`, as long as the plain form is not longer than
+/// Windows' path limit (which only the verbatim form lifts); any other path
+/// unchanged.
+#[must_use]
+pub fn strip_verbatim(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(plain_form) {
+        Some(plain) if plain.len() < 260 => PathBuf::from(plain),
+        _ => path,
+    }
+}
+
+/// The plain form of a verbatim drive or UNC path.
+fn plain_form(text: &str) -> Option<String> {
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return Some(format!(r"\\{rest}"));
+    }
+    let rest = text.strip_prefix(r"\\?\")?;
+    has_drive_letter(&format!("/{rest}")).then(|| rest.to_string())
+}
+
 /// Return a percent-encoded file URI for a filesystem path.
 #[must_use]
 pub fn path_to_uri(path: &Path) -> Option<Uri> {
-    let path = path.to_string_lossy().replace('\\', "/");
+    // A URI has no verbatim form; a long path keeps its prefix on disk only.
+    let path = path.to_string_lossy();
+    let path = plain_form(&path)
+        .unwrap_or_else(|| path.into_owned())
+        .replace('\\', "/");
     let mut encoded = String::with_capacity(path.len() + 8);
     for byte in path.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
@@ -89,6 +122,57 @@ const fn hex(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows' `fs::canonicalize` answers verbatim paths; the plain form is
+    /// what editors and TypeScript send. Pure string handling, so it runs on
+    /// every platform.
+    #[test]
+    fn a_verbatim_path_loses_its_prefix() {
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\?\C:\proj\App.svelte")),
+            PathBuf::from(r"C:\proj\App.svelte")
+        );
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\?\UNC\server\share\App.svelte")),
+            PathBuf::from(r"\\server\share\App.svelte")
+        );
+        // Only a drive or UNC path has a plain form.
+        for kept in [
+            r"\\?\Volume{0}\App.svelte",
+            r"C:\proj",
+            "/home/u/App.svelte",
+        ] {
+            assert_eq!(strip_verbatim(PathBuf::from(kept)), PathBuf::from(kept));
+        }
+        // Past Windows' path limit only the verbatim form reaches the file.
+        let long = format!(r"\\?\C:\{}", "a".repeat(300));
+        assert_eq!(strip_verbatim(PathBuf::from(&long)), PathBuf::from(&long));
+    }
+
+    #[test]
+    fn a_verbatim_path_is_a_plain_file_uri() {
+        assert_eq!(
+            path_to_uri(Path::new(r"\\?\C:\proj\my app\App.svelte"))
+                .unwrap()
+                .as_str(),
+            "file:///C:/proj/my%20app/App.svelte"
+        );
+        assert_eq!(
+            path_to_uri(Path::new(r"C:\proj\App.svelte"))
+                .unwrap()
+                .as_str(),
+            "file:///C:/proj/App.svelte"
+        );
+    }
+
+    #[test]
+    fn canonicalize_resolves_like_the_standard_library() {
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(
+            canonicalize(&here).unwrap(),
+            std::fs::canonicalize(&here).unwrap()
+        );
+    }
 
     #[test]
     fn plain_file_uri() {

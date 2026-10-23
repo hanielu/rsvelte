@@ -98,7 +98,7 @@ pub struct DocumentStore {
 /// The document's path with every symlink resolved, when it is a file that
 /// exists. `canonicalize` needs the file, so an unsaved buffer has none.
 fn resolved_path(uri: &Uri) -> Option<PathBuf> {
-    std::fs::canonicalize(uri_to_path(uri.as_str())).ok()
+    crate::uri::canonicalize(uri_to_path(uri.as_str())).ok()
 }
 
 impl DocumentStore {
@@ -202,7 +202,7 @@ mod tests {
         // The client opens through the symlink; the server derives the resolved
         // path from the overlay and asks for that.
         let opened = path_to_uri(&link.join("App.svelte")).unwrap();
-        let resolved = path_to_uri(&std::fs::canonicalize(&file).unwrap()).unwrap();
+        let resolved = path_to_uri(&crate::uri::canonicalize(&file).unwrap()).unwrap();
         assert_ne!(
             opened.as_str(),
             resolved.as_str(),

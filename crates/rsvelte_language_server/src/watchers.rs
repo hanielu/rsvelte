@@ -17,7 +17,6 @@
 //! which tsgo takes for the link's too, and scans each directory once.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -207,7 +206,7 @@ fn through_mirror_link(watcher: &Value) -> Option<Value> {
     if !is_cache_path(directory) {
         return None;
     }
-    let target = fs::canonicalize(directory).ok()?;
+    let target = crate::uri::canonicalize(directory).ok()?;
     if is_cache_path(&target) {
         return None;
     }
@@ -295,6 +294,10 @@ fn enters_an_ignored_directory(relative: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // Only the link tests, which need Unix symlinks, touch the disk.
+    #[cfg(unix)]
+    use std::fs;
+
     use super::*;
 
     fn watch(id: &str, globs: &[&str]) -> Value {
@@ -430,7 +433,7 @@ mod tests {
         ));
         let root = {
             fs::create_dir_all(root.join("app/node_modules")).unwrap();
-            fs::canonicalize(&root).unwrap()
+            crate::uri::canonicalize(&root).unwrap()
         };
         let links = [
             root.join(".svelte-language-server-rs/projects/app/node_modules"),

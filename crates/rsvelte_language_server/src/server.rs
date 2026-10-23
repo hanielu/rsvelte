@@ -1060,7 +1060,7 @@ impl TsgoRuntime {
     /// for the ones it opens. Loading writes the project's bodies before any
     /// of its documents reaches tsgo.
     fn ensure_project_for(&mut self, source: &Path) -> (Option<usize>, bool) {
-        let source = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+        let source = crate::uri::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
         let Some(dir) = source.parent() else {
             return (None, false);
         };
@@ -1130,7 +1130,7 @@ impl TsgoRuntime {
     }
 
     fn overlay_index_for_source(&self, source: &Path) -> Option<usize> {
-        let source = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+        let source = crate::uri::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
         serving_index(&self.overlays, &source)
     }
 
@@ -1267,7 +1267,7 @@ impl TsgoRuntime {
     /// The project that owns `source`, as a [`ProjectSpec`], whether or not
     /// it exists yet.
     fn project_spec_for(&self, source: &Path) -> Option<ProjectSpec> {
-        let source = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+        let source = crate::uri::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
         match locate_project(&self.overlays, &source)? {
             ProjectLocation::Existing(index) => {
                 let overlay = &self.overlays[index];
@@ -1742,7 +1742,7 @@ impl Server {
             return;
         };
         let path = uri_to_path(uri.as_str());
-        let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let canonical = crate::uri::canonicalize(&path).unwrap_or_else(|_| path.clone());
         let processed = self
             .preprocess_documents
             .get(&canonical)
@@ -1917,7 +1917,7 @@ impl Server {
         let runtime = self.tsgo.as_ref()?;
         let source_path = uri_to_path(params.text_document.uri.as_str());
         let canonical_source =
-            fs::canonicalize(&source_path).unwrap_or_else(|_| source_path.clone());
+            crate::uri::canonicalize(&source_path).unwrap_or_else(|_| source_path.clone());
         let source = self.documents.get(&params.text_document.uri)?.text();
         let overlay = runtime
             .overlays
@@ -2019,7 +2019,7 @@ impl Server {
             .map(|document| {
                 let path = uri_to_path(document.uri.as_str());
                 FileReferenceSource {
-                    path: fs::canonicalize(&path).unwrap_or(path),
+                    path: crate::uri::canonicalize(&path).unwrap_or(path),
                     uri: document.uri.clone(),
                     text: document.text().to_string(),
                 }
@@ -2659,7 +2659,7 @@ impl Server {
     fn is_editor_document(&self, path: &Path) -> bool {
         self.documents.iter().any(|document| {
             let open = uri_to_path(document.uri.as_str());
-            fs::canonicalize(&open).unwrap_or(open) == path
+            crate::uri::canonicalize(&open).unwrap_or(open) == path
         })
     }
 
@@ -2749,7 +2749,7 @@ impl Server {
                             changes.iter().any(|change| is_project_config(&change.uri));
                         let dependency_changed = changes.iter().any(|change| {
                             let path = uri_to_path(change.uri.as_str());
-                            let path = fs::canonicalize(&path).unwrap_or(path);
+                            let path = crate::uri::canonicalize(&path).unwrap_or(path);
                             self.preprocess_dependencies
                                 .values()
                                 .any(|dependencies| dependencies.contains(&path))
@@ -3315,7 +3315,7 @@ impl Server {
         let version = document.version;
         let text = document.text().to_string();
         let path = uri_to_path(uri.as_str());
-        let path = fs::canonicalize(&path).unwrap_or(path);
+        let path = crate::uri::canonicalize(&path).unwrap_or(path);
         let svelte = is_svelte_document(&language_id, &path);
         let script = !svelte && is_typescript_or_javascript(&language_id, &path);
         if !svelte && !script {
@@ -3431,7 +3431,7 @@ impl Server {
             .iter()
             .map(|document| {
                 let path = uri_to_path(document.uri.as_str());
-                fs::canonicalize(&path).unwrap_or(path)
+                crate::uri::canonicalize(&path).unwrap_or(path)
             })
             .collect::<Vec<_>>();
         let activated = self
@@ -4069,7 +4069,7 @@ impl Server {
         };
         for document in self.documents.iter() {
             let path = uri_to_path(document.uri.as_str());
-            let path = fs::canonicalize(&path).unwrap_or(path);
+            let path = crate::uri::canonicalize(&path).unwrap_or(path);
             let overlay = &mut runtime.overlays[index];
             if !is_svelte_document(&document.language_id, &path)
                 || overlay.shadow_for_source(&path).is_none()
@@ -4124,7 +4124,7 @@ impl Server {
         };
         let language_id = document.language_id.clone();
         let path = uri_to_path(uri.as_str());
-        let path = fs::canonicalize(&path).unwrap_or(path);
+        let path = crate::uri::canonicalize(&path).unwrap_or(path);
         if let Some(runtime) = &mut self.tsgo {
             runtime.document_imports.remove(&path);
         }
@@ -4383,7 +4383,7 @@ impl Server {
         };
         for folder in removed {
             let path = uri_to_path(folder.uri.as_str());
-            let path = fs::canonicalize(&path).unwrap_or(path);
+            let path = crate::uri::canonicalize(&path).unwrap_or(path);
             // The folder's own project and every project nested in it.
             let (gone, kept) = std::mem::take(&mut runtime.overlays)
                 .into_iter()
@@ -4412,7 +4412,7 @@ impl Server {
         }
         for folder in added {
             let path = uri_to_path(folder.uri.as_str());
-            let path = fs::canonicalize(&path).unwrap_or(path);
+            let path = crate::uri::canonicalize(&path).unwrap_or(path);
             if runtime
                 .overlays
                 .iter()
@@ -4572,7 +4572,7 @@ impl Server {
             return false;
         };
         let filename = uri_to_path(document.uri.as_str());
-        let filename = fs::canonicalize(&filename).unwrap_or(filename);
+        let filename = crate::uri::canonicalize(&filename).unwrap_or(filename);
         self.preprocess_failures.remove(&filename);
         self.preprocess_documents.remove(&filename);
         self.queue_preprocess_path(filename, document.version, document.text().to_string())
@@ -4648,7 +4648,7 @@ impl Server {
                 } else {
                     base.join(dependency)
                 };
-                fs::canonicalize(&dependency).unwrap_or(dependency)
+                crate::uri::canonicalize(&dependency).unwrap_or(dependency)
             })
             .collect::<HashSet<_>>();
         self.preprocess_dependencies
@@ -4731,13 +4731,14 @@ impl Server {
                 {
                     return;
                 }
-                let filename = fs::canonicalize(&output.filename).unwrap_or(output.filename);
+                let filename =
+                    crate::uri::canonicalize(&output.filename).unwrap_or(output.filename);
                 let original = self
                     .documents
                     .iter()
                     .find(|document| {
                         let path = uri_to_path(document.uri.as_str());
-                        fs::canonicalize(&path).unwrap_or(path) == filename
+                        crate::uri::canonicalize(&path).unwrap_or(path) == filename
                     })
                     .filter(|document| document.version == output.version)
                     .map(|document| document.text().to_string())
@@ -4809,7 +4810,7 @@ impl Server {
                     .iter()
                     .find(|document| {
                         let path = uri_to_path(document.uri.as_str());
-                        fs::canonicalize(&path).unwrap_or(path) == filename
+                        crate::uri::canonicalize(&path).unwrap_or(path) == filename
                             && document.version == output.version
                     })
                     .map(|document| document.uri.as_str().to_string());
@@ -4844,7 +4845,7 @@ impl Server {
                 }
                 log::warn(format_args!("preprocessing failed: {message}"));
                 if let (Some(filename), Some(version)) = (filename, version) {
-                    let filename = fs::canonicalize(&filename).unwrap_or(filename);
+                    let filename = crate::uri::canonicalize(&filename).unwrap_or(filename);
                     self.preprocess_failures
                         .insert(filename.clone(), (version, message));
                     self.preprocess_documents.remove(&filename);
@@ -4857,7 +4858,7 @@ impl Server {
                             .iter()
                             .find(|document| {
                                 let path = uri_to_path(document.uri.as_str());
-                                fs::canonicalize(&path).unwrap_or(path) == filename
+                                crate::uri::canonicalize(&path).unwrap_or(path) == filename
                                     && document.version == version
                             })
                             .map(|document| document.text().to_string())
@@ -4888,7 +4889,7 @@ impl Server {
                         .iter()
                         .find(|document| {
                             let path = uri_to_path(document.uri.as_str());
-                            fs::canonicalize(&path).unwrap_or(path) == filename
+                            crate::uri::canonicalize(&path).unwrap_or(path) == filename
                                 && document.version == version
                         })
                         .map(|document| document.uri.as_str().to_string());
@@ -4933,7 +4934,7 @@ impl Server {
                         .iter()
                         .find(|document| {
                             let path = uri_to_path(document.uri.as_str());
-                            fs::canonicalize(&path).unwrap_or(path) == input.filename
+                            crate::uri::canonicalize(&path).unwrap_or(path) == input.filename
                                 && document.version == input.version
                         })
                         .map(|document| document.uri.as_str().to_string());
@@ -6606,7 +6607,7 @@ impl Server {
                     return;
                 }
                 if let Some((_, message)) = {
-                    let path = fs::canonicalize(&path).unwrap_or(path);
+                    let path = crate::uri::canonicalize(&path).unwrap_or(path);
                     self.preprocess_failures.get(&path)
                 } {
                     diagnostics.push(crate::diagnostics::preprocess_failure(message));
@@ -6630,7 +6631,7 @@ impl Server {
                 if self.documents.get_by_key(&key).is_some() {
                     if let Some((failed_version, message)) = {
                         let path = uri_to_path(uri.as_str());
-                        let path = fs::canonicalize(&path).unwrap_or(path);
+                        let path = crate::uri::canonicalize(&path).unwrap_or(path);
                         self.preprocess_failures.get(&path)
                     } && *failed_version == version
                     {
@@ -6804,7 +6805,7 @@ impl Server {
     }
 
     fn preprocessed_analysis(&self, path: &Path, version: i32) -> Option<PreprocessedAnalysis> {
-        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let path = crate::uri::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let state = self.preprocess_documents.get(&path)?;
         if state.version != version {
             return None;
@@ -7065,7 +7066,7 @@ fn editor_buffers(documents: &DocumentStore) -> EditorBuffers {
     for document in documents.iter() {
         let path = uri_to_path(document.uri.as_str());
         buffers.insert(
-            fs::canonicalize(&path).unwrap_or(path),
+            crate::uri::canonicalize(&path).unwrap_or(path),
             document.shared_text(),
             document.version,
         );
@@ -8297,7 +8298,7 @@ mod nested_project_tests {
         let dir = std::env::temp_dir().join(format!("rsvelte-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        fs::canonicalize(&dir).unwrap()
+        crate::uri::canonicalize(&dir).unwrap()
     }
 
     #[test]
