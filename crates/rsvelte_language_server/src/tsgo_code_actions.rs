@@ -6,7 +6,7 @@ use lsp_types::{Position, Range, Uri};
 use rsvelte_core::{Allocator, ParseOptions, parse};
 use serde_json::{Map, Value, json};
 
-use crate::context::script_bodies;
+use crate::context::{EmbeddedRegions, possibly_component, script_bodies};
 use crate::tsgo_completion::{ImportPlacement, is_new_import_edit, place_new_import_edit};
 use crate::tsgo_overlay::TsgoOverlay;
 
@@ -896,6 +896,154 @@ pub fn restore_new_imports(value: &mut Value, source_uri: &str, mut held: Vec<Ve
     }
 }
 
+/// `Cannot find name` and its "did you mean" variant.
+const CANNOT_FIND_NAME: [u64; 2] = [2304, 2552];
+/// The svelte2tsx helper a component's tag name is the argument of.
+const ENSURE_COMPONENT: &str = "__sveltets_2_ensureComponent(";
+
+/// A `Cannot find name` diagnostic on a component's tag name in the markup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComponentImportSite {
+    /// The tag name, as written.
+    pub name: String,
+    /// The end of the tag name in the shadow (tsgo's encoding), where its
+    /// completions are asked for.
+    pub position: Position,
+}
+
+/// The component tags a code-action request's `Cannot find name` diagnostics
+/// are on (`CodeActionsProvider.getComponentImportQuickFix`, `:1016-1061`).
+///
+/// TypeScript's import fix needs the missing name to be the export's own, and
+/// a component's default export carries svelte2tsx's suffix
+/// (`Widget__SvelteComponent_`), so upstream asks for auto-import completions
+/// at the tag name instead. Like upstream, a diagnostic in a script, or on a
+/// name that cannot be a component, is skipped, and one whose identifier is
+/// not a tag name (not `__sveltets_2_ensureComponent`'s argument) means no
+/// site at all, so TypeScript's own fixes answer.
+#[must_use]
+pub fn component_import_sites(
+    params: &Value,
+    source: &str,
+    overlay: &TsgoOverlay,
+    source_path: &Path,
+    shadow_path: &Path,
+) -> Vec<ComponentImportSite> {
+    let Some(diagnostics) = params
+        .pointer("/context/diagnostics")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let (Some(shadow), index) = (overlay.shadow_text(shadow_path), LineIndex::new(source)) else {
+        return Vec::new();
+    };
+    let regions = EmbeddedRegions::new(source);
+    let mut sites: Vec<ComponentImportSite> = Vec::new();
+    for diagnostic in diagnostics {
+        let cannot_find = diagnostic
+            .get("code")
+            .and_then(Value::as_u64)
+            .is_some_and(|code| CANNOT_FIND_NAME.contains(&code));
+        let Some(range) = diagnostic.get("range").and_then(parse_range) else {
+            continue;
+        };
+        if !cannot_find {
+            continue;
+        }
+        let start = index.offset(source, range.start);
+        let end = index.offset(source, range.end);
+        let Some(name) = source.get(start..end) else {
+            continue;
+        };
+        if regions.in_script(start)
+            || !possibly_component(name)
+            || sites.iter().any(|site| site.name == name)
+        {
+            continue;
+        }
+        let tag_name = overlay
+            .map_source_range(source_path, range)
+            .and_then(|shadow_range| {
+                let start = overlay.shadow_offset(shadow_path, shadow_range.start)?;
+                let end = overlay.shadow_offset(shadow_path, shadow_range.end)?;
+                (shadow.get(start..end) == Some(name)
+                    && shadow.get(..start)?.ends_with(ENSURE_COMPONENT))
+                .then_some(shadow_range.end)
+            });
+        let Some(position) = tag_name else {
+            return Vec::new();
+        };
+        sites.push(ComponentImportSite {
+            name: name.to_string(),
+            position,
+        });
+    }
+    sites
+}
+
+/// The completion items that import the component `name`: tsgo labels a
+/// component's default export with svelte2tsx's suffix.
+#[must_use]
+pub fn component_import_candidates(completion: &Value, name: &str) -> Vec<Value> {
+    let items = match completion {
+        Value::Array(items) => items,
+        other => match other.get("items").and_then(Value::as_array) {
+            Some(items) => items,
+            None => return Vec::new(),
+        },
+    };
+    let suffixed = format!("{name}{COMPONENT_SUFFIX}");
+    items
+        .iter()
+        .filter(|item| {
+            item.get("label")
+                .and_then(Value::as_str)
+                .is_some_and(|label| label == name || label == suffixed)
+        })
+        .cloned()
+        .collect()
+}
+
+/// The quick fix a resolved component completion makes: its import edits in
+/// the shadow, titled like TypeScript's `Add import from "…"`.
+#[must_use]
+pub fn component_import_action(resolved: &Value, shadow_uri: &str) -> Option<Value> {
+    let edits = resolved.get("additionalTextEdits")?.as_array()?;
+    let import = edits
+        .iter()
+        .filter_map(|edit| edit.get("newText")?.as_str())
+        .find(|text| text.contains("import "))?;
+    let title = resolved
+        .get("detail")
+        .and_then(Value::as_str)
+        .filter(|detail| detail.starts_with("Add import from"))
+        .map(str::to_string)
+        .or_else(|| {
+            let from = import.find(" from ")? + " from ".len();
+            let quoted = import[from..].trim_start();
+            let quote = quoted.chars().next()?;
+            let module = quoted.get(1..)?.split(quote).next()?;
+            Some(format!("Add import from \"{module}\""))
+        })?;
+    Some(json!({
+        "title": title,
+        "kind": QUICK_FIX_KIND,
+        "edit": { "changes": { shadow_uri: edits } },
+    }))
+}
+
+/// Upstream sorts a name's import fixes by how many directories their module
+/// path crosses, nearest first (`CodeActionsProvider.ts:1092-1101`).
+pub fn sort_component_import_actions(actions: &mut [Value]) {
+    actions.sort_by_key(|action| {
+        action
+            .get("title")
+            .and_then(Value::as_str)
+            .map_or(usize::MAX, |title| title.matches('/').count())
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -934,6 +1082,113 @@ mod tests {
                 .as_str(),
         );
         (path, shadow, overlay)
+    }
+
+    fn cannot_find(source: &str, name: &str, nth: usize) -> Value {
+        let at = source.match_indices(name).nth(nth).unwrap().0;
+        let index = LineIndex::new(source);
+        json!({
+            "range": {
+                "start": index.position(source, at),
+                "end": index.position(source, at + name.len()),
+            },
+            "code": 2304,
+            "message": format!("Cannot find name '{name}'."),
+        })
+    }
+
+    fn sites(source: &str, diagnostics: Vec<Value>) -> Vec<ComponentImportSite> {
+        let (path, shadow, overlay) = projected(source);
+        let params = json!({ "context": { "diagnostics": diagnostics } });
+        let sites = component_import_sites(&params, source, &overlay, &path, &shadow);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        sites
+    }
+
+    /// A component tag's `Cannot find name` is asked about at the end of the
+    /// tag name in the shadow, the argument of `__sveltets_2_ensureComponent`.
+    #[test]
+    fn a_component_tags_missing_name_is_an_import_site() {
+        let source = "<script lang=\"ts\">\n\tlet on = true;\n</script>\n\n<Widget />\n";
+        let (path, shadow, overlay) = projected(source);
+        let params = json!({ "context": { "diagnostics": [cannot_find(source, "Widget", 0)] } });
+        let sites = component_import_sites(&params, source, &overlay, &path, &shadow);
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        assert_eq!(sites[0].name, "Widget");
+        let text = overlay.shadow_text(&shadow).unwrap();
+        let end = overlay.shadow_offset(&shadow, sites[0].position).unwrap();
+        assert!(
+            text[..end].ends_with("__sveltets_2_ensureComponent(Widget"),
+            "{}",
+            &text[..end]
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Upstream skips a name in a script and one that cannot be a component,
+    /// and gives up on component imports altogether (TypeScript's own fixes
+    /// answer) when a candidate is not a tag name.
+    #[test]
+    fn only_tag_names_are_import_sites() {
+        let script = "<script lang=\"ts\">\n\tconst w = Widget;\n</script>\n";
+        assert_eq!(
+            sites(script, vec![cannot_find(script, "Widget", 0)]),
+            vec![]
+        );
+        let lower = "<p>{widget}</p>\n";
+        assert_eq!(sites(lower, vec![cannot_find(lower, "widget", 0)]), vec![]);
+        let expression = "<p>{Widget}</p>\n<Widget />\n";
+        assert_eq!(
+            sites(
+                expression,
+                vec![
+                    cannot_find(expression, "Widget", 0),
+                    cannot_find(expression, "Widget", 1)
+                ]
+            ),
+            vec![]
+        );
+    }
+
+    /// The completion items that import a component are the ones labelled
+    /// with its name, bare or with svelte2tsx's suffix; a resolved one makes a
+    /// quick fix titled like TypeScript's, nearest module first.
+    #[test]
+    fn a_resolved_component_completion_makes_an_import_fix() {
+        let completion = json!({ "items": [
+            { "label": "Widget__SvelteComponent_" },
+            { "label": "Widgets" },
+            { "label": "Widget" },
+        ]});
+        let labels = component_import_candidates(&completion, "Widget")
+            .iter()
+            .map(|item| item["label"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![json!("Widget__SvelteComponent_"), json!("Widget")]
+        );
+
+        let edit = json!({
+            "range": { "start": { "line": 3, "character": 0 }, "end": { "line": 3, "character": 0 } },
+            "newText": "import Widget from './lib/Widget.svelte';\n",
+        });
+        let resolved = json!({ "label": "Widget", "additionalTextEdits": [edit] });
+        let action = component_import_action(&resolved, "file:///App.svelte.tsx").unwrap();
+        assert_eq!(action["title"], "Add import from \"./lib/Widget.svelte\"");
+        assert_eq!(action["kind"], "quickfix");
+        assert_eq!(
+            action["edit"]["changes"]["file:///App.svelte.tsx"],
+            json!([edit])
+        );
+        assert!(component_import_action(&json!({ "label": "Widget" }), "file:///a").is_none());
+
+        let mut actions = vec![
+            json!({ "title": "Add import from \"../../Widget.svelte\"" }),
+            json!({ "title": "Add import from \"./Widget.svelte\"" }),
+        ];
+        sort_component_import_actions(&mut actions);
+        assert_eq!(actions[0]["title"], "Add import from \"./Widget.svelte\"");
     }
 
     /// A code action's new import goes where a completion's does, and tsgo's

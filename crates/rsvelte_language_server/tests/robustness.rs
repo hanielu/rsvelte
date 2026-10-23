@@ -843,6 +843,85 @@ fn hover(server: &mut Server, uri: &str) -> Value {
     server.response(id, Duration::from_secs(5))
 }
 
+/// A `Cannot find name` on a component's tag in the markup gets the
+/// component's import as a quick fix. TypeScript's own fix cannot find a
+/// component, whose default export carries svelte2tsx's suffix, so, as
+/// upstream does, the fix is made from the auto-import completion at the tag,
+/// resolved for its edits; the import lands on the line after the script's
+/// last import, not in the `<script` tag.
+#[cfg(unix)]
+#[test]
+fn a_component_tag_without_an_import_is_offered_one() {
+    let dir = TestDir::new("component-import-fix");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = fs::canonicalize(&dir.0).unwrap().join("ws");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    fs::write(root.join("tsconfig.json"), "{}").unwrap();
+    fs::write(root.join("MyComponent.svelte"), "<p>x</p>\n").unwrap();
+    fs::write(root.join("OtherWidget.svelte"), "<p>y</p>\n").unwrap();
+    let page = "<script lang=\"ts\">\n\timport MyComponent from './MyComponent.svelte';\n</script>\n\n<MyComponent />\n<OtherWidget />\n";
+    fs::write(root.join("Page.svelte"), page).unwrap();
+    let mut server = Server::start(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            ("RSVELTE_TEST_COMPONENT_IMPORT", Path::new("OtherWidget")),
+        ],
+    );
+    let uri = file_uri(&root.join("Page.svelte"));
+    server.open(&uri, page);
+    hover(&mut server, &uri);
+    let diagnostic = json!({
+        "range": { "start": { "line": 5, "character": 1 }, "end": { "line": 5, "character": 12 } },
+        "severity": 1,
+        "code": 2304,
+        "source": "ts",
+        "message": "Cannot find name 'OtherWidget'.",
+    });
+    let id = server.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": diagnostic["range"],
+            "context": { "diagnostics": [diagnostic], "only": ["quickfix"] },
+        }),
+    );
+    let response = server.response(id, Duration::from_secs(10));
+    let actions = response["result"].as_array().expect("code actions");
+    assert_eq!(actions.len(), 1, "{response}");
+    assert_eq!(
+        actions[0]["title"],
+        "Add import from \"./OtherWidget.svelte\""
+    );
+    assert_eq!(
+        actions[0]["edit"]["changes"][uri.as_str()],
+        json!([{
+            "range": { "start": { "line": 2, "character": 0 }, "end": { "line": 2, "character": 0 } },
+            "newText": "import OtherWidget from \"./OtherWidget.svelte\";\n",
+        }]),
+        "{response}"
+    );
+    let traffic = traffic(&log);
+    for method in [
+        "textDocument/codeAction",
+        "textDocument/completion",
+        "completionItem/resolve",
+    ] {
+        assert_eq!(
+            traffic
+                .iter()
+                .filter(|line| line.starts_with(&format!("{method} ")))
+                .count(),
+            1,
+            "{method}: {traffic:?}"
+        );
+    }
+    server.shutdown();
+}
+
 /// A project that loads after an editor buffer changed holds a copy of that
 /// component: the copy must carry the buffer, not the file (review s1).
 #[cfg(unix)]
@@ -2558,6 +2637,11 @@ fn main() {
     // more: tsrs with every worker looping.
     let wedge = std::env::var("RSVELTE_TEST_TSGO_WEDGE").ok();
     let mut wedged = false;
+    // `RSVELTE_TEST_COMPONENT_IMPORT` names a component completions offer as
+    // an auto-import (labelled with svelte2tsx's suffix, as tsgo does), and
+    // whose resolve imports it on the line after the document's last import.
+    let component_import = std::env::var("RSVELTE_TEST_COMPONENT_IMPORT").ok();
+    let mut import_line = 0;
     let mut texts = std::collections::HashMap::new();
     let stdin = io::stdin();
     let mut input = stdin.lock();
@@ -2619,6 +2703,26 @@ fn main() {
                 delay("RSVELTE_TEST_SLOW_MS").unwrap(),
                 format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{result}}}"#),
             );
+        } else if method == "textDocument/completion" && component_import.is_some() {
+            let id = json_id(&message);
+            let name = component_import.as_deref().unwrap();
+            import_line = texts
+                .get(&uri)
+                .and_then(|text: &String| {
+                    text.lines().enumerate().filter(|(_, line)| line.starts_with("import ")).last()
+                })
+                .map(|(line, _)| line)
+                .map_or(0, |line| line + 1);
+            answer(format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"isIncomplete":false,"items":[{{"label":"{name}__SvelteComponent_","kind":6,"data":{{"name":"{name}"}}}},{{"label":"Unrelated","kind":6}}]}}}}"#
+            ));
+        } else if method == "completionItem/resolve" && component_import.is_some() {
+            let id = json_id(&message);
+            let name = component_import.as_deref().unwrap();
+            let line = import_line;
+            answer(format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"label":"{name}__SvelteComponent_","kind":6,"detail":"Add import from \"./{name}.svelte\"","additionalTextEdits":[{{"range":{{"start":{{"line":{line},"character":0}},"end":{{"line":{line},"character":0}}}},"newText":"import {name} from \"./{name}.svelte\";\n"}}]}}}}"#
+            ));
         } else if method == "textDocument/completion" {
             if let Some(delay) = delay("RSVELTE_TEST_SLOW_COMPLETION_MS") {
                 std::thread::sleep(delay);

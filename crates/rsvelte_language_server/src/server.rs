@@ -51,8 +51,10 @@ use crate::settings::Settings;
 use crate::text::LineIndex;
 use crate::tsgo_client::{OpenBuffer, TsgoClient, TsgoClientClosed, TsgoConfig, TsgoEvent};
 use crate::tsgo_code_actions::{
-    TsgoCodeActionContext, document_has_parser_error, restore_new_imports,
-    rewrite_code_action_response, take_new_imports,
+    ComponentImportSite, TsgoCodeActionContext, component_import_action,
+    component_import_candidates, component_import_sites, document_has_parser_error,
+    restore_new_imports, rewrite_code_action_response, sort_component_import_actions,
+    take_new_imports,
 };
 use crate::tsgo_completion::{
     CompletionAction, CompletionRewriteContext, CompletionSite, ImportPlacement,
@@ -387,6 +389,9 @@ struct PendingTsgoRequest {
     /// For the editor's references request: its `includeDeclaration`, which
     /// the store follow-ups ask with ([`Server::continue_store_references`]).
     include_declaration: Option<bool>,
+    /// For the editor's code-action request: the component tags its
+    /// `Cannot find name` diagnostics are on ([`Server::continue_component_imports`]).
+    component_imports: Vec<ComponentImportSite>,
 }
 
 /// The references of a store and of its `$store` value, asked together
@@ -412,6 +417,38 @@ struct StoreReferencesGathering {
     covered: HashSet<(String, u32, u32)>,
     /// Follow-ups not answered yet.
     remaining: usize,
+}
+
+/// The "Add import" quick fixes of component tags, asked as auto-import
+/// completions ([`Server::continue_component_imports`]).
+#[derive(Default)]
+struct ComponentImports {
+    /// By the editor's code-action request: what has been gathered so far.
+    gathering: HashMap<RequestId, ComponentImportsGathering>,
+    /// Each follow-up request: the editor's request and the site it asks about.
+    followups: HashMap<RequestId, (RequestId, ComponentImportFollowup)>,
+    /// The editor's requests whose gathered answer is being mapped.
+    gathered: HashSet<RequestId>,
+}
+
+struct ComponentImportsGathering {
+    /// The editor's request, held until every follow-up is answered.
+    pending: PendingTsgoRequest,
+    /// tsgo's own answer to it, in shadow coordinates.
+    actions: Vec<serde_json::Value>,
+    /// The quick fixes made from resolved completions, in shadow coordinates.
+    fixes: Vec<serde_json::Value>,
+    shadow_uri: Uri,
+    /// Follow-ups not answered yet.
+    remaining: usize,
+}
+
+#[derive(Clone)]
+enum ComponentImportFollowup {
+    /// The completions at the tag of the component `name`.
+    Completion { name: String },
+    /// One of them, resolved for its import edits.
+    Resolve,
 }
 
 /// How long a document change waits for the native half of the requests
@@ -1394,6 +1431,7 @@ struct Server {
     completion_order: Vec<String>,
     rename_aggregates: HashMap<RequestId, RenameAggregate>,
     store_references: StoreReferences,
+    component_imports: ComponentImports,
     component_queries: HashMap<RequestId, PendingComponentQuery>,
     component_query_requests: HashMap<RequestId, (RequestId, ComponentInfoRequestId)>,
     /// What waits for a probe in a shadow's buffer to end (see
@@ -1473,6 +1511,7 @@ impl Server {
             completion_order: Vec::new(),
             rename_aggregates: HashMap::new(),
             store_references: StoreReferences::default(),
+            component_imports: ComponentImports::default(),
             component_queries: HashMap::new(),
             component_query_requests: HashMap::new(),
             deferred: Vec::new(),
@@ -1944,6 +1983,7 @@ impl Server {
             code_lens_resolve: None,
             completion_site_data: None,
             include_declaration: None,
+            component_imports: Vec::new(),
         };
         let child = Request::new(id.clone(), method.to_string(), params);
         if let Err(error) = runtime.forward(child.into()) {
@@ -2052,6 +2092,7 @@ impl Server {
             code_lens_resolve: None,
             completion_site_data: None,
             include_declaration: None,
+            component_imports: Vec::new(),
         };
         if runtime.forward(child.into()).is_ok() {
             self.pending_tsgo.insert(request.id, pending);
@@ -2148,6 +2189,7 @@ impl Server {
             code_lens_resolve: None,
             completion_site_data: None,
             include_declaration: None,
+            component_imports: Vec::new(),
         };
         if runtime.forward(child.into()).is_ok() {
             self.pending_tsgo.insert(request.id, pending);
@@ -2443,6 +2485,7 @@ impl Server {
             }),
             completion_site_data: None,
             include_declaration: None,
+            component_imports: Vec::new(),
         };
         if runtime.forward(child.into()).is_ok() {
             self.pending_tsgo.insert(id, pending);
@@ -2974,6 +3017,21 @@ impl Server {
             &runtime.overlays,
             document.clone(),
         );
+        let component_imports = if request.method == "textDocument/codeAction"
+            && let Some(document) = &document
+            && let Some((overlay, shadow_path)) = shadow_overlay(&runtime.overlays, document)
+            && let Some(source) = self.documents.get(document.source_uri())
+        {
+            component_import_sites(
+                &request.params,
+                source.text(),
+                overlay,
+                &uri_to_path(document.source_uri().as_str()),
+                &shadow_path,
+            )
+        } else {
+            Vec::new()
+        };
         if !mapper.map_request(&request.method, &mut request.params) {
             self.respond(Response::new_ok(
                 request.id,
@@ -3001,6 +3059,7 @@ impl Server {
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(true)
             }),
+            component_imports,
         };
         let id = request.id.clone();
         // tsrs never answers a request it loops on, and each one holds one of
@@ -3085,6 +3144,7 @@ impl Server {
             code_lens_resolve: None,
             completion_site_data: None,
             include_declaration: None,
+            component_imports: Vec::new(),
         };
         if runtime.forward(request.into()).is_ok() {
             self.pending_tsgo.insert(id, pending);
@@ -3666,7 +3726,8 @@ impl Server {
             let waited_on = warm_up
                 || self.pending_tsgo.contains_key(&id)
                 || self.component_query_requests.contains_key(&id)
-                || self.store_references.followups.contains_key(&id);
+                || self.store_references.followups.contains_key(&id)
+                || self.component_imports.followups.contains_key(&id);
             if waited_on {
                 let response = if self.component_query_requests.contains_key(&id) {
                     Response::new_err(
@@ -5071,6 +5132,14 @@ impl Server {
                 message.to_string(),
             ));
         }
+        let component_imports = std::mem::take(&mut self.component_imports);
+        for (id, _) in component_imports.gathering {
+            self.respond(Response::new_err(
+                id,
+                ErrorCode::InternalError as i32,
+                message.to_string(),
+            ));
+        }
         self.component_query_requests.clear();
         for (id, pending) in std::mem::take(&mut self.component_queries) {
             self.run_component_action(pending.query.restore());
@@ -5104,6 +5173,16 @@ impl Server {
                         _ => Vec::new(),
                     };
                     self.continue_store_references(&editor_id, locations, true);
+                    return;
+                }
+                if let Some((editor_id, followup)) =
+                    self.component_imports.followups.remove(&response.id)
+                {
+                    self.continue_component_imports(
+                        &editor_id,
+                        followup,
+                        response.response_result.ok(),
+                    );
                     return;
                 }
                 let Some(pending) = self.pending_tsgo.remove(&response.id) else {
@@ -5143,6 +5222,17 @@ impl Server {
                     }
                     _ => pending,
                 };
+                let pending = match &response.response_result {
+                    Ok(result)
+                        if !pending.component_imports.is_empty()
+                            && !self.component_imports.gathered.remove(&response.id) =>
+                    {
+                        let result = result.clone();
+                        self.start_component_imports(response.id.clone(), pending, result);
+                        return;
+                    }
+                    _ => pending,
+                };
                 let PendingTsgoRequest {
                     method,
                     document,
@@ -5157,6 +5247,7 @@ impl Server {
                     code_lens_resolve,
                     completion_site_data,
                     include_declaration: _,
+                    component_imports: _,
                 } = pending;
                 let source_path = document
                     .as_ref()
@@ -6076,6 +6167,7 @@ impl Server {
                         code_lens_resolve: None,
                         completion_site_data: None,
                         include_declaration: None,
+                        component_imports: Vec::new(),
                     };
                     requests.push((child_id, request, child_pending));
                 }
@@ -6224,6 +6316,154 @@ impl Server {
         self.on_tsgo_message(Message::Response(Response::new_ok(
             editor_id.clone(),
             serde_json::Value::Array(locations),
+        )));
+    }
+
+    /// Hold tsgo's answer to a code-action request whose `Cannot find name`
+    /// diagnostics are on component tags, and ask for each tag's completions
+    /// (`CodeActionsProvider.getComponentImportQuickFix`, `:1016-1112`):
+    /// TypeScript's own import fix cannot find a component, whose default
+    /// export carries svelte2tsx's suffix, so the fix is made from the
+    /// auto-import completion that imports it.
+    fn start_component_imports(
+        &mut self,
+        editor_id: RequestId,
+        pending: PendingTsgoRequest,
+        result: serde_json::Value,
+    ) {
+        let Some(shadow_uri) = pending
+            .document
+            .as_ref()
+            .map(|document| document.shadow_uri().clone())
+        else {
+            return;
+        };
+        let sites = pending.component_imports.clone();
+        let actions = match result {
+            serde_json::Value::Array(actions) => actions,
+            _ => Vec::new(),
+        };
+        self.component_imports.gathering.insert(
+            editor_id.clone(),
+            ComponentImportsGathering {
+                pending,
+                actions,
+                fixes: Vec::new(),
+                shadow_uri: shadow_uri.clone(),
+                remaining: 0,
+            },
+        );
+        for site in sites {
+            self.send_component_import_followup(
+                &editor_id,
+                "textDocument/completion",
+                serde_json::json!({
+                    "textDocument": { "uri": shadow_uri.as_str() },
+                    "position": site.position,
+                    "context": { "triggerKind": 1 },
+                }),
+                ComponentImportFollowup::Completion { name: site.name },
+            );
+        }
+        self.finish_component_imports(&editor_id);
+    }
+
+    fn send_component_import_followup(
+        &mut self,
+        editor_id: &RequestId,
+        method: &str,
+        params: serde_json::Value,
+        followup: ComponentImportFollowup,
+    ) {
+        self.next_request_id += 1;
+        let child_id = RequestId::from(format!(
+            "rsvelte-tsgo-component-import-{}",
+            self.next_request_id
+        ));
+        let request = Request::new(child_id.clone(), method.to_string(), params);
+        if self
+            .tsgo
+            .as_ref()
+            .is_some_and(|runtime| runtime.forward(request.into()).is_ok())
+        {
+            self.component_imports
+                .followups
+                .insert(child_id, (editor_id.clone(), followup));
+            if let Some(gathering) = self.component_imports.gathering.get_mut(editor_id) {
+                gathering.remaining += 1;
+            }
+        }
+    }
+
+    /// A follow-up's answer: resolve the completions that import the
+    /// component, or keep the quick fix a resolved one makes.
+    fn continue_component_imports(
+        &mut self,
+        editor_id: &RequestId,
+        followup: ComponentImportFollowup,
+        result: Option<serde_json::Value>,
+    ) {
+        let Some(gathering) = self.component_imports.gathering.get_mut(editor_id) else {
+            return;
+        };
+        gathering.remaining = gathering.remaining.saturating_sub(1);
+        match followup {
+            ComponentImportFollowup::Completion { name } => {
+                let candidates = result.as_ref().map_or_else(Vec::new, |result| {
+                    component_import_candidates(result, &name)
+                });
+                for item in candidates {
+                    self.send_component_import_followup(
+                        editor_id,
+                        "completionItem/resolve",
+                        item,
+                        ComponentImportFollowup::Resolve,
+                    );
+                }
+            }
+            ComponentImportFollowup::Resolve => {
+                if let Some(action) = result.as_ref().and_then(|resolved| {
+                    component_import_action(resolved, gathering.shadow_uri.as_str())
+                }) {
+                    gathering.fixes.push(action);
+                }
+            }
+        }
+        self.finish_component_imports(editor_id);
+    }
+
+    /// Once every follow-up is answered, answer the editor's request with the
+    /// component imports, mapped as tsgo's answer to it. Upstream offers them
+    /// instead of TypeScript's own quick fixes, and both for a "did you mean"
+    /// diagnostic (`CodeActionsProvider.ts:676-710`); other kinds stay.
+    fn finish_component_imports(&mut self, editor_id: &RequestId) {
+        if self
+            .component_imports
+            .gathering
+            .get(editor_id)
+            .is_none_or(|gathering| gathering.remaining > 0)
+        {
+            return;
+        }
+        let Some(gathering) = self.component_imports.gathering.remove(editor_id) else {
+            return;
+        };
+        let did_you_mean = gathering
+            .pending
+            .code_action_diagnostic_codes
+            .contains(&2552);
+        let mut actions = gathering.fixes;
+        sort_component_import_actions(&mut actions);
+        actions.extend(gathering.actions.into_iter().filter(|action| {
+            did_you_mean
+                || action.get("kind").and_then(serde_json::Value::as_str) != Some("quickfix")
+        }));
+        self.pending_tsgo
+            .insert(editor_id.clone(), gathering.pending);
+        self.component_imports.gathered.insert(editor_id.clone());
+        self.on_tsgo_message(Message::Response(Response::new_ok(
+            editor_id.clone(),
+            serde_json::Value::Array(actions),
         )));
     }
 
