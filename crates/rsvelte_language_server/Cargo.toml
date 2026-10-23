@@ -34,6 +34,11 @@ oxc_ast_visit = "0.149"
 oxc_parser = "0.149"
 oxc_span = "0.149"
 
+[target.'cfg(windows)'.dependencies]
+# A directory junction links a `node_modules` into the cache without the
+# privilege a Windows symlink needs (Developer Mode or an administrator).
+junction = "1"
+
 [dev-dependencies]
 # Rust's `regex` rejects JS-style escapes inside a character class, which the
 # official server's word pattern uses; only the test needs to evaluate it.

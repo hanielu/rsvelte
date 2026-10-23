@@ -461,9 +461,8 @@ impl TsgoOverlay {
         let mut packages = Vec::new();
         let mut seen = BTreeSet::new();
         let redundant = self.shadow_dir.join("node_modules");
-        if fs::symlink_metadata(&redundant).is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            let _ = fs::remove_file(&redundant);
+        if is_link(&redundant) {
+            let _ = remove_link(&redundant);
         }
         // A dependency's file is shadowed outside the shadow tree, and lies
         // inside a `node_modules` that is linked, not mirrored.
@@ -520,6 +519,7 @@ impl TsgoOverlay {
                     reject_symlink_components(parent, &self.cache_dir).is_ok()
                 })
                 && fs::symlink_metadata(&link).is_ok_and(|metadata| metadata.is_dir())
+                && !is_link(&link)
                 && let Err(error) = fs::remove_dir_all(&link)
             {
                 crate::log::warn(format_args!(
@@ -3974,14 +3974,17 @@ fn write_body(
     }))
 }
 
-/// Make `link` a symlink to `target`, unless something real is already there.
+/// Make `link` a link to the directory `target`, unless something real is
+/// already there: a symlink, or on Windows a directory junction, which needs
+/// none of the privilege a Windows symlink does (Developer Mode or an
+/// administrator) and points at a local directory just as well.
 fn place_symlink(link: &Path, target: &Path, cache_root: &Path) -> io::Result<()> {
     match fs::symlink_metadata(link) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            if fs::read_link(link).is_ok_and(|existing| existing == target) {
+        Ok(_) if is_link(link) => {
+            if link_target(link).is_some_and(|existing| existing == target) {
                 return Ok(());
             }
-            fs::remove_file(link)?;
+            remove_link(link)?;
         }
         Ok(_) => return Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -3995,7 +3998,38 @@ fn place_symlink(link: &Path, target: &Path, cache_root: &Path) -> io::Result<()
     #[cfg(unix)]
     return std::os::unix::fs::symlink(target, link);
     #[cfg(windows)]
-    return std::os::windows::fs::symlink_dir(target, link);
+    return junction::create(target, link);
+}
+
+/// Whether `path` is a link [`place_symlink`] could have made: a symlink, or
+/// on Windows a directory junction.
+fn is_link(path: &Path) -> bool {
+    #[cfg(windows)]
+    if junction::exists(path).unwrap_or(false) {
+        return true;
+    }
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+/// Where a link [`place_symlink`] made points, without Windows' verbatim
+/// prefix, which a junction's target carries.
+fn link_target(link: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Ok(target) = junction::get_target(link) {
+        return Some(crate::uri::strip_verbatim(target));
+    }
+    fs::read_link(link).ok().map(crate::uri::strip_verbatim)
+}
+
+/// Remove a link [`place_symlink`] made, never what it points at. Windows
+/// removes a junction or a symlink to a directory as a directory, and
+/// `remove_file` refuses one there.
+fn remove_link(link: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    if fs::remove_dir(link).is_ok() {
+        return Ok(());
+    }
+    fs::remove_file(link)
 }
 
 /// Whether a path relative to a mirror root is a dependency's file: one under
@@ -4159,6 +4193,52 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// A `node_modules` link is placed once, replaced when its target moves
+    /// and removed without touching what it pointed at; a real directory
+    /// where a link belongs is left alone. A symlink here, a directory junction
+    /// on Windows, which needs no privilege and which `remove_file` refuses.
+    #[test]
+    fn a_node_modules_link_is_placed_replaced_and_removed() {
+        let workspace = TestWorkspace::new("links");
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
+        let cache_root = root.join(CACHE_DIRECTORY);
+        let (first, second) = (root.join("a/node_modules"), root.join("b/node_modules"));
+        for target in [&first, &second] {
+            fs::create_dir_all(target).unwrap();
+            fs::write(target.join("pkg.d.ts"), "export {};").unwrap();
+        }
+        let link = cache_root.join("projects/app/node_modules");
+
+        place_symlink(&link, &first, &cache_root).unwrap();
+        assert!(is_link(&link));
+        assert_eq!(link_target(&link), Some(first.clone()));
+        assert!(
+            link.join("pkg.d.ts").is_file(),
+            "the link reaches its target"
+        );
+        place_symlink(&link, &first, &cache_root).unwrap();
+        assert_eq!(link_target(&link), Some(first.clone()));
+
+        place_symlink(&link, &second, &cache_root).unwrap();
+        assert_eq!(link_target(&link), Some(second.clone()));
+        assert!(
+            first.join("pkg.d.ts").is_file(),
+            "the old target is untouched"
+        );
+
+        remove_link(&link).unwrap();
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert!(
+            second.join("pkg.d.ts").is_file(),
+            "removing a link keeps its target"
+        );
+
+        let real = cache_root.join("projects/real/node_modules");
+        fs::create_dir_all(&real).unwrap();
+        place_symlink(&real, &first, &cache_root).unwrap();
+        assert!(!is_link(&real), "a real directory is left in place");
     }
 
     fn write(path: &Path, text: &str) {
