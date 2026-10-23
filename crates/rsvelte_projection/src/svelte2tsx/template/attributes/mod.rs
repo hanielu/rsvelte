@@ -21,12 +21,14 @@ use crate::svelte2tsx::template::segs::{
     Seg, segs_push_fmt, segs_push_lit, segs_push_lit_open, segs_push_src,
 };
 use crate::svelte2tsx::template::utils::expr::{
-    extend_expr_end_with_ts_postfix, get_expression_range, get_expression_text,
-    get_set_binding_ranges,
+    get_expression_range, get_expression_text, get_set_binding_ranges,
 };
 
 use attribute::{AttrHost, append_attribute_node_segments, trailing_attr_comment_segs};
-use binding::{bind_is_filtered_from_props, format_bind_directive_segments};
+use binding::{
+    bind_is_filtered_from_props, format_bind_directive_segments,
+    format_component_bind_directive_segments,
+};
 use event_handler::format_on_directive_segments;
 use spread::format_spread_attribute_segments;
 
@@ -278,52 +280,11 @@ pub(super) fn build_component_props_segments(
                 extend_segs(&mut inner, format_spread_attribute_segments(spread, source));
             }
             Attribute::BindDirective(bind) => {
-                if bind.name == "this" {
-                    continue;
+                // Shorthand `bind:value` → `value,`, `bind:foo={expr}` →
+                // `foo:expr,`, `bind:this` is not a prop.
+                if let Some(segs) = format_component_bind_directive_segments(bind, source) {
+                    extend_segs(&mut inner, segs);
                 }
-                // Mirror official Binding.ts: a *shorthand* component binding
-                // (`bind:value`, no `={…}`) becomes a shorthand object property
-                // — just the bound expression (`value`), not `value:value`. The
-                // shorthand test is whether the expression starts immediately
-                // after `bind:`. Explicit `bind:foo={expr}` stays `foo:expr,`.
-                let expr_range = get_expression_range(&bind.expression);
-                let is_shorthand = get_set_binding_ranges(&bind.expression, source).is_none()
-                    && expr_range.is_some_and(|(s, _)| {
-                        s == bind.start
-                            + u32::try_from("bind:".len()).expect("literal length fits in u32")
-                    });
-                if is_shorthand {
-                    let (s, e) = expr_range.unwrap();
-                    segs_push_src(&mut inner, s, e);
-                    segs_push_lit(&mut inner, ",");
-                    continue;
-                }
-                // Component-side bind:foo={expr} → foo:expr, (no quotes,
-                // no `bind:` prefix). Mirrors the JS reference.
-                segs_push_fmt(&mut inner, format_args!("{}:", bind.name));
-                if let Some(((gs, ge), (ss, se))) = get_set_binding_ranges(&bind.expression, source)
-                {
-                    // Svelte 5 function binding `bind:foo={getFn, setFn}` →
-                    // `foo:__sveltets_2_get_set_binding(getFn, setFn),` so both
-                    // callables are type-checked against the bindable prop type
-                    // (mirrors `handleBinding`'s `isGetSetBinding` branch in
-                    // `htmlxtojsx_v2/nodes/Binding.ts`). Splicing the raw
-                    // `getFn, setFn` tuple into the props literal would produce
-                    // invalid TSX (issue #726).
-                    segs_push_lit(&mut inner, "__sveltets_2_get_set_binding(");
-                    segs_push_src(&mut inner, gs, ge);
-                    segs_push_lit(&mut inner, ",");
-                    segs_push_src(&mut inner, ss, se);
-                    segs_push_lit(&mut inner, ")");
-                } else if let Some((s, e)) = get_expression_range(&bind.expression) {
-                    // Preserve a trailing TS postfix (`bind:value={value as string}`)
-                    // the parser narrowed out of the expression span.
-                    let extended = extend_expr_end_with_ts_postfix(source, e, bind.end);
-                    segs_push_src(&mut inner, s, extended);
-                } else {
-                    segs_push_lit(&mut inner, get_expression_text(&bind.expression, source));
-                }
-                segs_push_lit(&mut inner, ",");
             }
             Attribute::OnDirective(_)
             | Attribute::ClassDirective(_)

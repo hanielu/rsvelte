@@ -2,7 +2,9 @@
 
 use crate::ast::template::{Attribute, BindDirective};
 use crate::svelte2tsx::svelte2tsx::slice_src;
-use crate::svelte2tsx::template::segs::{Seg, segs_push_fmt, segs_push_lit, segs_push_src};
+use crate::svelte2tsx::template::segs::{
+    Seg, segs_push_fmt, segs_push_lit, segs_push_lit_open, segs_push_src,
+};
 use crate::svelte2tsx::template::utils::expr::{
     extend_expr_end_with_ts_postfix, get_binding_lhs_range, get_binding_lhs_text,
     get_expression_end_stripping_ts, get_expression_range, get_expression_text,
@@ -21,13 +23,12 @@ pub fn format_bind_directive_segments(
     preserve_bind: bool,
 ) -> Vec<Seg> {
     let mut out = Vec::new();
+    let expr_range = get_expression_range(&bind.expression);
+    let is_shorthand = get_set_binding_ranges(&bind.expression, source).is_none()
+        && expr_range.is_some_and(|(s, _)| {
+            s == bind.start + u32::try_from("bind:".len()).expect("literal length fits in u32")
+        });
     if !preserve_bind {
-        let expr_range = get_expression_range(&bind.expression);
-        let get_set = get_set_binding_ranges(&bind.expression, source);
-        let is_shorthand = get_set.is_none()
-            && expr_range.is_some_and(|(s, _)| {
-                s == bind.start + u32::try_from("bind:".len()).expect("literal length fits in u32")
-            });
         if let Some((s, e)) = expr_range
             && is_shorthand
         {
@@ -35,9 +36,13 @@ pub fn format_bind_directive_segments(
             segs_push_lit(&mut out, ",");
             return out;
         }
-        segs_push_fmt(&mut out, format_args!("{}:", bind.name));
-    } else {
+        push_bind_name(&mut out, bind, source, false);
+    } else if is_shorthand {
+        // The name is the expression's own text, which keeps the mapping:
+        // upstream writes this key as a literal (`"${attr.start..attr.end}"`).
         segs_push_fmt(&mut out, format_args!("\"bind:{}\":", bind.name));
+    } else {
+        push_bind_name(&mut out, bind, source, true);
     }
     if let Some(((gs, ge), (ss, se))) = get_set_binding_ranges(&bind.expression, source) {
         // Svelte 5 function binding on an element: `bind:value={getFn, setFn}`
@@ -58,6 +63,32 @@ pub fn format_bind_directive_segments(
     }
     segs_push_lit(&mut out, ",");
     out
+}
+
+/// Emit a binding's property key (`"bind:value":` with the `svelteHTML`
+/// typings, `value:` otherwise) keeping the name as an unedited source chunk.
+/// Upstream `Binding.ts` pushes `[attr.start, …]` (or `[attr.start +
+/// 'bind:'.length, …]`) as a range, so hover and diagnostics on the directive
+/// name reach the property it becomes; a name the source does not spell out
+/// that way stays a literal.
+fn push_bind_name(out: &mut Vec<Seg>, bind: &BindDirective, source: &str, keep_prefix: bool) {
+    let name_start = bind.start + u32::try_from("bind:".len()).expect("literal length fits in u32");
+    let name_end = name_start + u32::try_from(bind.name.len()).unwrap_or(0);
+    let spelled = source.get(bind.start as usize..name_start as usize) == Some("bind:")
+        && source.get(name_start as usize..name_end as usize) == Some(bind.name.as_str());
+    match (spelled, keep_prefix) {
+        (true, true) => {
+            segs_push_lit_open(out, "\"");
+            segs_push_src(out, bind.start, name_end);
+            segs_push_lit(out, "\":");
+        }
+        (true, false) => {
+            segs_push_src(out, name_start, name_end);
+            segs_push_lit(out, ":");
+        }
+        (false, true) => segs_push_fmt(out, format_args!("\"bind:{}\":", bind.name)),
+        (false, false) => segs_push_fmt(out, format_args!("{}:", bind.name)),
+    }
 }
 
 /// A component's `bind:` directive as segments: an expression that reaches
@@ -84,7 +115,7 @@ pub fn format_component_bind_directive_segments(
         segs_push_lit(&mut out, ",");
         return Some(out);
     }
-    segs_push_fmt(&mut out, format_args!("{}:", bind.name));
+    push_bind_name(&mut out, bind, source, false);
     if let Some(((gs, ge), (ss, se))) = get_set {
         segs_push_lit(&mut out, "__sveltets_2_get_set_binding(");
         segs_push_src(&mut out, gs, ge);
