@@ -388,7 +388,7 @@ mod tests {
             ("a package elsewhere", "/ws/lib/node_modules/dep/*.json"),
             (
                 "mirror link",
-                "/ws/.svelte-rs/projects/admin/node_modules/**/*",
+                "/ws/.svelte-language-server-rs/projects/admin/node_modules/**/*",
             ),
             ("dot directory", "/ws/.config/**/*"),
         ] {
@@ -433,8 +433,8 @@ mod tests {
             fs::canonicalize(&root).unwrap()
         };
         let links = [
-            root.join(".svelte-rs/projects/app/node_modules"),
-            root.join(".svelte-rs/projects/app/tsgo/svelte/app/node_modules"),
+            root.join(".svelte-language-server-rs/projects/app/node_modules"),
+            root.join(".svelte-language-server-rs/projects/app/tsgo/svelte/app/node_modules"),
         ];
         for link in &links {
             fs::create_dir_all(link.parent().unwrap()).unwrap();
@@ -462,7 +462,7 @@ mod tests {
             "the other project's link is the same directory"
         );
         // A cache directory that is not a link stays as it is.
-        let cache = root.join(".svelte-rs/tsgo");
+        let cache = root.join(".svelte-language-server-rs/tsgo");
         fs::create_dir_all(&cache).unwrap();
         let kept = watchers
             .register(&watch("cache", &[&glob(&cache)]))

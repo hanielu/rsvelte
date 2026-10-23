@@ -677,7 +677,7 @@ fn a_document_loads_only_its_own_project_and_the_rest_is_read_from_disk() {
             .collect::<Vec<_>>()
     };
     let shadow = |project: &str, file: &str| {
-        root.join(".svelte-rs/projects")
+        root.join(".svelte-language-server-rs/projects")
             .join(project)
             .join("tsgo/svelte")
             .join(project)
@@ -956,7 +956,9 @@ fn a_project_loaded_later_gets_the_unsaved_buffers_it_copies() {
     server.open(&child_uri, &child("number"));
     server.change(&child_uri, 2, &child("UnsavedMarker"));
     hover(&mut server, &child_uri);
-    let copy = file_uri(&root.join(".svelte-rs/projects/a/tsgo/svelte/b/Child.svelte.tsx"));
+    let copy = file_uri(
+        &root.join(".svelte-language-server-rs/projects/a/tsgo/svelte/b/Child.svelte.tsx"),
+    );
     assert!(
         !traffic(&log).iter().any(|line| line.contains(&copy)),
         "project a is not loaded yet"
@@ -1035,7 +1037,7 @@ fn component_attribute_completion_asks_the_owning_project() {
     assert!(
         completions
             .iter()
-            .all(|line| line.contains("/.svelte-rs/projects/b/")),
+            .all(|line| line.contains("/.svelte-language-server-rs/projects/b/")),
         "{completions:?}"
     );
     server.shutdown();
@@ -1079,7 +1081,7 @@ fn component_attribute_completion_probes_in_the_shadow_and_holds_other_requests(
     let parent_uri = file_uri(&root.join("Parent.svelte"));
     server.open(&parent_uri, parent);
     hover(&mut server, &parent_uri);
-    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/Parent.svelte.tsx"));
+    let shadow = file_uri(&root.join(".svelte-language-server-rs/tsgo/svelte/Parent.svelte.tsx"));
     let completion = server.request(
         "textDocument/completion",
         json!({
@@ -1189,7 +1191,7 @@ fn an_edit_during_a_probe_answers_the_held_requests_against_the_text_before_it()
         "the document needs formatting: {expected}"
     );
 
-    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/Parent.svelte.tsx"));
+    let shadow = file_uri(&root.join(".svelte-language-server-rs/tsgo/svelte/Parent.svelte.tsx"));
     let completion = server.request(
         "textDocument/completion",
         json!({
@@ -1313,7 +1315,7 @@ fn a_request_sent_before_an_edit_reaches_tsgo_before_it() {
     let uri = file_uri(&root.join("P.svelte"));
     server.open(&uri, &text);
     hover(&mut server, &uri);
-    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/P.svelte.tsx"));
+    let shadow = file_uri(&root.join(".svelte-language-server-rs/tsgo/svelte/P.svelte.tsx"));
     let hover_line = format!("textDocument/hover {shadow}");
     let change_line = format!("textDocument/didChange {shadow}");
     for round in 0..5_usize {
@@ -1403,7 +1405,7 @@ fn an_edit_after_a_diagnostic_pull_waits_for_neither_of_its_halves() {
     let uri = file_uri(&root.join("P.svelte"));
     server.open(&uri, &text);
     hover(&mut server, &uri);
-    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/P.svelte.tsx"));
+    let shadow = file_uri(&root.join(".svelte-language-server-rs/tsgo/svelte/P.svelte.tsx"));
 
     let pull = server.request(
         "textDocument/diagnostic",
@@ -1499,7 +1501,7 @@ fn a_request_tsgo_never_answers_is_answered_without_it_and_holds_nothing_back() 
     let kept = |project: &str, file: &str| {
         file_uri(
             &root
-                .join(".svelte-rs/projects")
+                .join(".svelte-language-server-rs/projects")
                 .join(project)
                 .join("tsgo/svelte")
                 .join(project)
@@ -1583,7 +1585,7 @@ fn a_slow_diagnostic_pull_waits_for_tsgo_and_does_not_restart_it() {
         }),
     );
     let x = file_uri(&root.join("X.svelte"));
-    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    let shadow = file_uri(&root.join(".svelte-language-server-rs/tsgo/svelte/X.svelte.tsx"));
     server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
     hover(&mut server, &x);
     for round in 0..2 {
@@ -1655,7 +1657,7 @@ fn a_slow_signature_help_or_definition_does_not_restart_tsgo() {
         &json!({ "textDocument": { "diagnostic": {} } }),
     );
     let x = file_uri(&root.join("X.svelte"));
-    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    let shadow = file_uri(&root.join(".svelte-language-server-rs/tsgo/svelte/X.svelte.tsx"));
     server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
     hover(&mut server, &x);
     let sent = Instant::now();
@@ -1736,7 +1738,7 @@ fn a_looping_request_restarts_tsgo_only_after_a_pull_of_its_document() {
         &json!({ "textDocument": { "diagnostic": {} } }),
     );
     let x = file_uri(&root.join("X.svelte"));
-    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    let shadow = file_uri(&root.join(".svelte-language-server-rs/tsgo/svelte/X.svelte.tsx"));
     server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
     hover(&mut server, &x);
     let (lost_path, lost_text, at) = looping_buffer(&root);
@@ -1816,7 +1818,7 @@ fn a_second_request_tsgo_would_loop_on_is_answered_without_it() {
         json!({ "backgroundProjects": { "enable": false } }),
     );
     let x = file_uri(&root.join("X.svelte"));
-    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    let shadow = file_uri(&root.join(".svelte-language-server-rs/tsgo/svelte/X.svelte.tsx"));
     server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
     hover(&mut server, &x);
     let (lost_path, lost_text, at) = looping_buffer(&root);
@@ -1961,7 +1963,7 @@ fn a_tsgo_that_answers_nothing_is_restarted_whatever_the_model_says() {
         json!({ "backgroundProjects": { "enable": false } }),
     );
     let x = file_uri(&root.join("X.svelte"));
-    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    let shadow = file_uri(&root.join(".svelte-language-server-rs/tsgo/svelte/X.svelte.tsx"));
     server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
     assert!(hover(&mut server, &x).to_string().contains("recorded"));
     let sent = Instant::now();
@@ -2010,7 +2012,7 @@ fn a_completion_tsgo_never_answers_restarts_it_after_four_timeouts() {
         json!({ "backgroundProjects": { "enable": false } }),
     );
     let x = file_uri(&root.join("X.svelte"));
-    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    let shadow = file_uri(&root.join(".svelte-language-server-rs/tsgo/svelte/X.svelte.tsx"));
     server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
     assert!(hover(&mut server, &x).to_string().contains("recorded"));
     let sent_to_tsgo = |log: &Path| {
@@ -2074,7 +2076,7 @@ fn as_many_overdue_requests_as_tsrs_runs_restart_tsgo() {
         json!({ "backgroundProjects": { "enable": false } }),
     );
     let x = file_uri(&root.join("X.svelte"));
-    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    let shadow = file_uri(&root.join(".svelte-language-server-rs/tsgo/svelte/X.svelte.tsx"));
     server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
     assert!(hover(&mut server, &x).to_string().contains("recorded"));
     let sent = Instant::now();
@@ -2129,7 +2131,7 @@ fn requests_a_check_holds_back_do_not_restart_tsgo() {
         &json!({ "textDocument": { "diagnostic": {} } }),
     );
     let x = file_uri(&root.join("X.svelte"));
-    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    let shadow = file_uri(&root.join(".svelte-language-server-rs/tsgo/svelte/X.svelte.tsx"));
     server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
     assert!(hover(&mut server, &x).to_string().contains("recorded"));
     let pull = server.request(
@@ -2261,7 +2263,7 @@ fn a_restarted_tsgo_has_the_editor_pull_its_diagnostics_again() {
         }),
     );
     let x = file_uri(&root.join("X.svelte"));
-    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    let shadow = file_uri(&root.join(".svelte-language-server-rs/tsgo/svelte/X.svelte.tsx"));
     server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
     hover(&mut server, &x);
     let (lost_path, lost_text, at) = looping_buffer(&root);
@@ -2331,7 +2333,7 @@ fn answers_tsgo_sent_while_the_server_was_busy_are_not_counted_as_lost() {
         &json!({ "textDocument": { "diagnostic": {} } }),
     );
     let x = file_uri(&root.join("X.svelte"));
-    let shadow = file_uri(&root.join(".svelte-rs/tsgo/svelte/X.svelte.tsx"));
+    let shadow = file_uri(&root.join(".svelte-language-server-rs/tsgo/svelte/X.svelte.tsx"));
     server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
     hover(&mut server, &x);
     // A component large enough that projecting it when it opens keeps the
@@ -2421,7 +2423,7 @@ fn the_other_projects_load_in_the_background_once_the_editor_is_quiet() {
     let kept = |project: &str, file: &str| {
         file_uri(
             &root
-                .join(".svelte-rs/projects")
+                .join(".svelte-language-server-rs/projects")
                 .join(project)
                 .join("tsgo/svelte")
                 .join(project)
@@ -2445,7 +2447,9 @@ fn the_other_projects_load_in_the_background_once_the_editor_is_quiet() {
         thread::sleep(Duration::from_millis(200));
     }
     assert!(
-        !root.join(".svelte-rs/projects/tests").exists(),
+        !root
+            .join(".svelte-language-server-rs/projects/tests")
+            .exists(),
         "a project that owns no component waits for a document of its own"
     );
     // The editor's own document still answers, and nothing else is open.
@@ -2481,7 +2485,7 @@ fn the_editors_answers_do_not_hold_the_background_back() {
     let kept = |project: &str, file: &str| {
         file_uri(
             &root
-                .join(".svelte-rs/projects")
+                .join(".svelte-language-server-rs/projects")
                 .join(project)
                 .join("tsgo/svelte")
                 .join(project)
@@ -2541,7 +2545,7 @@ fn a_workspace_wide_request_loads_every_project_first() {
     for (project, file) in [("b", "Y"), ("c", "Z")] {
         let kept = file_uri(
             &root
-                .join(".svelte-rs/projects")
+                .join(".svelte-language-server-rs/projects")
                 .join(project)
                 .join("tsgo/svelte")
                 .join(project)

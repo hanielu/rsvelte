@@ -2,7 +2,7 @@
 //!
 //! tsrs 0.18.0 (and typescript-go 7.1.0-dev.20260930.4) loops for good on
 //! some completion and signature help requests, one core busy and a
-//! cancellation ignored (`docs/upstream/tsrs-lost-request` in svelte-rs). The
+//! cancellation ignored (`docs/upstream/tsrs-lost-request` in svelte-language-server-rs). The
 //! server restarts tsgo for an overdue request only when this module says
 //! tsrs loops on it: a request that is merely slow (its document's check
 //! takes longer than the timeout) must not cost a restart, which rebuilds
@@ -590,7 +590,7 @@ mod tests {
     /// Each request tsrs 0.18.0 was sent in a one-file project, and whether it
     /// answered within 2.5 s (`loops`: it never did, and kept a core busy).
     /// Collected with `docs/upstream/tsrs-lost-request/loopprobe.mjs` in
-    /// svelte-rs; the two long texts are the lost requests `lsfuzz.mjs` seeds
+    /// svelte-language-server-rs; the two long texts are the lost requests `lsfuzz.mjs` seeds
     /// 22 and 38 found, as tsgo had them.
     const MEASURED: &str = include_str!("../tests/data/tsrs-lost-requests.json");
 

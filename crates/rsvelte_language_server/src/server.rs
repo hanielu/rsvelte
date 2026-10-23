@@ -542,7 +542,7 @@ impl SentRequest {
 }
 
 /// Whether tsrs can loop for good on a request of `method`
-/// (`docs/upstream/tsrs-lost-request` in svelte-rs).
+/// (`docs/upstream/tsrs-lost-request` in svelte-language-server-rs).
 fn may_loop(method: &str) -> bool {
     matches!(
         method,

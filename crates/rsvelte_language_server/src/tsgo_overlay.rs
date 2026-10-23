@@ -39,7 +39,7 @@ use crate::text::LineIndex;
 
 /// Distinct from upstream rsvelte's diskless `.rsvelte-language-server`, which
 /// refuses to run over a shadow body that exists on disk.
-pub(crate) const CACHE_DIRECTORY: &str = ".svelte-rs";
+pub(crate) const CACHE_DIRECTORY: &str = ".svelte-language-server-rs";
 const NESTED_PROJECTS_DIRECTORY: &str = "projects";
 const TSGO_DIRECTORY: &str = "tsgo";
 const SHADOW_DIRECTORY: &str = "svelte";
@@ -4552,10 +4552,12 @@ mod tests {
     #[test]
     fn only_paths_inside_an_overlay_cache_are_cache_paths() {
         assert!(is_cache_path(Path::new(
-            "/w/.svelte-rs/projects/a/tsgo/tsconfig.json"
+            "/w/.svelte-language-server-rs/projects/a/tsgo/tsconfig.json"
         )));
         assert!(!is_cache_path(Path::new("/w/src/tsconfig.json")));
-        assert!(!is_cache_path(Path::new("/w/src/.svelte-rs-notes/a.ts")));
+        assert!(!is_cache_path(Path::new(
+            "/w/src/.svelte-language-server-rs-notes/a.ts"
+        )));
     }
 
     #[test]
@@ -4845,7 +4847,7 @@ mod tests {
 
     /// Text that makes the projection panic in tests, standing in for the
     /// keystroke states that used to (`{#each items as }`, `{:then }`).
-    const PROJECTION_PANIC: &str = "<!-- svelte-rs test: panic in svelte2tsx -->";
+    const PROJECTION_PANIC: &str = "<!-- svelte-language-server-rs test: panic in svelte2tsx -->";
 
     pub(super) fn panic_on_marker(text: &str) {
         assert!(
