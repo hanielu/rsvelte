@@ -4179,18 +4179,30 @@ fn external_imports_options(
     }
 }
 
-/// A path as TypeScript spells it: `/`-separated, and never in Windows'
-/// verbatim form (`\\?\C:\…`), which tsgo cannot open. Go reaches a long path
-/// without the prefix, so it goes at any length.
-fn path_for_tsconfig(path: &Path) -> String {
+/// A path `/`-separated, and never in Windows' verbatim form (`\\?\C:\…`),
+/// which tsgo cannot open. Go reaches a long path without the prefix, so it
+/// goes at any length.
+fn slash_path(path: &Path) -> String {
     let path = path.to_string_lossy();
     crate::uri::plain_form(&path)
         .unwrap_or_else(|| path.into_owned())
         .replace('\\', "/")
 }
 
+/// A path as tsgo spells a file it is handed by URI: [`slash_path`] with a
+/// lowercase drive letter (`tspath.SplitVolumePath`). `rootDirs` match by
+/// plain prefix, so a `C:` root never contained a `c:` shadow, and a shadow's
+/// relative imports found nothing beside its source.
+fn path_for_tsconfig(path: &Path) -> String {
+    let mut path = slash_path(path);
+    if path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic() {
+        path[..1].make_ascii_lowercase();
+    }
+    path
+}
+
 fn path_to_uri(path: &Path) -> Result<Uri, TsgoOverlayError> {
-    let path = path_for_tsconfig(path);
+    let path = slash_path(path);
     let mut encoded = String::with_capacity(path.len() + 8);
     for byte in path.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
@@ -5614,7 +5626,7 @@ mod tests {
     fn a_verbatim_path_is_written_plain_into_the_tsconfig() {
         assert_eq!(
             path_for_tsconfig(Path::new(r"\\?\C:\w\node_modules\svelte\svelte-html.d.ts")),
-            "C:/w/node_modules/svelte/svelte-html.d.ts"
+            "c:/w/node_modules/svelte/svelte-html.d.ts"
         );
         assert_eq!(
             path_for_tsconfig(Path::new(r"\\?\UNC\server\share\w\App.svelte")),
@@ -5623,12 +5635,28 @@ mod tests {
         let long = "a".repeat(300);
         assert_eq!(
             path_for_tsconfig(Path::new(&format!(r"\\?\C:\{long}\App.svelte"))),
-            format!("C:/{long}/App.svelte")
+            format!("c:/{long}/App.svelte")
         );
         assert_eq!(
             path_for_tsconfig(Path::new("/home/u/App.svelte")),
             "/home/u/App.svelte"
         );
+    }
+
+    /// tsgo spells every file it is handed by URI with a lowercase drive
+    /// (`c:/…`, `tspath.SplitVolumePath`) and matches `rootDirs` by plain
+    /// prefix, so roots written `C:/…` never contained an open shadow: its
+    /// relative imports (`./defaults.js` beside the source) went unresolved in
+    /// the editor, while `tsgo -p` run from a `C:` directory resolved them.
+    /// Plain strings: this runs on every platform.
+    #[test]
+    fn a_tsconfig_path_has_the_lowercase_drive_tsgo_gives_open_files() {
+        assert_eq!(
+            path_for_tsconfig(Path::new(r"C:\w\packages\core")),
+            "c:/w/packages/core"
+        );
+        assert_eq!(path_for_tsconfig(Path::new("D:/w")), "d:/w");
+        assert_eq!(path_for_tsconfig(Path::new("/home/u/w")), "/home/u/w");
     }
 
     /// svelte2tsx's rewrite of imports that leave the workspace walks
