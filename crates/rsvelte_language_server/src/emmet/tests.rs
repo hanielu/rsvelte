@@ -1,6 +1,8 @@
 //! The port against emmet-helper itself: `tests/data/emmet-oracle.json` is
-//! `doComplete(document, position, 'html', {})` on a corpus of lines.
-//! Regenerate it with `node scripts/dev/generate-emmet-data.mjs`.
+//! `doComplete(document, position, 'html', {})` on a corpus of lines, and the
+//! `lines` of `tests/data/emmet-stylesheet-oracle.json` the same for `css`,
+//! `scss`, `less` and `sass`. Regenerate them with
+//! `node scripts/dev/generate-emmet-data.mjs`.
 
 use serde::Deserialize;
 
@@ -118,4 +120,88 @@ fn an_abbreviation_longer_than_the_limit_is_not_offered() {
     assert_eq!(suggestions(&short, short.len())[0].label, short);
     let line = format!("{} p", "x".repeat(5000));
     assert_eq!(suggestions(&line, line.len())[0].label, "p");
+}
+
+const STYLESHEET_ORACLE: &str = include_str!("../../tests/data/emmet-stylesheet-oracle.json");
+
+#[derive(Deserialize)]
+struct StylesheetOracle {
+    lines: Vec<StylesheetLine>,
+}
+
+#[derive(Deserialize)]
+struct StylesheetLine {
+    syntax: String,
+    line: String,
+    cursor: usize,
+    items: Option<Vec<StylesheetItem>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StylesheetItem {
+    label: String,
+    new_text: String,
+    documentation: String,
+    filter_text: Option<String>,
+    range: lsp_types::Range,
+}
+
+fn syntax(name: &str) -> Stylesheet {
+    match name {
+        "css" => Stylesheet::Css,
+        "scss" => Stylesheet::Scss,
+        "less" => Stylesheet::Less,
+        "sass" => Stylesheet::Sass,
+        _ => panic!("no stylesheet syntax {name}"),
+    }
+}
+
+#[test]
+fn every_stylesheet_line_completes_as_emmet_helper_does() {
+    let oracle: StylesheetOracle =
+        serde_json::from_str(STYLESHEET_ORACLE).expect("parse the stylesheet oracle");
+    let mut failures = Vec::new();
+    for case in &oracle.lines {
+        let got = stylesheet_suggestions(&case.line, case.cursor, syntax(&case.syntax));
+        let same = match (&got, &case.items) {
+            (None, None) => true,
+            (Some(got), Some(want)) => {
+                got.len() == want.len()
+                    && got.iter().zip(want).all(|(got, want)| {
+                        got.label == want.label
+                            && got.new_text == want.new_text
+                            && got.documentation == want.documentation
+                            && got.filter_text == want.filter_text
+                            && want.range.start.line == 0
+                            && got.start == want.range.start.character as usize
+                            && got.end == want.range.end.character as usize
+                    })
+            }
+            _ => false,
+        };
+        if !same {
+            failures.push(format!(
+                "{} {:?} at {}:\n  want {:?}\n  got  {:?}",
+                case.syntax,
+                case.line,
+                case.cursor,
+                case.items.as_ref().map(|items| items
+                    .iter()
+                    .map(|item| (&item.label, item.range.start.character, &item.new_text))
+                    .collect::<Vec<_>>()),
+                got.as_ref().map(|items| items
+                    .iter()
+                    .map(|item| (&item.label, item.start, &item.new_text))
+                    .collect::<Vec<_>>()),
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} lines differ:\n{}",
+        failures.len(),
+        oracle.lines.len(),
+        failures.join("\n")
+    );
 }

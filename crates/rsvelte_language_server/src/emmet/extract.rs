@@ -1,7 +1,9 @@
 //! Finding the abbreviation before the cursor: `extractAbbreviation` in
-//! emmet 2.4.11 (`@emmetio/extract-abbreviation`), for markup, looking past
-//! the brackets and quote an editor closes automatically. Works on UTF-16
-//! code units, as JavaScript's strings do.
+//! emmet 2.4.11 (`@emmetio/extract-abbreviation`) with the options
+//! emmet-helper passes — for markup, looking past the brackets and quote an
+//! editor closes automatically; for a stylesheet, not looking ahead, and with
+//! only round brackets pairing. Works on UTF-16 code units, as JavaScript's
+//! strings do.
 
 const SQUARE_L: u16 = b'[' as u16;
 const SQUARE_R: u16 = b']' as u16;
@@ -28,14 +30,38 @@ pub(super) struct Extracted {
 /// would reach further back is not offered.
 const MAX_LENGTH: usize = 2000;
 
-pub(super) fn extract(line: &[u16], pos: usize) -> Option<Extracted> {
-    let mut pos = pos.min(line.len());
-    // A closing quote may only come right after the cursor; brackets follow.
-    if line.get(pos).copied().is_some_and(is_quote) {
-        pos += 1;
+/// emmet's `type` option: which brackets an abbreviation pairs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Kind {
+    Markup,
+    Stylesheet,
+}
+
+impl Kind {
+    fn is_open_brace(self, ch: u16) -> bool {
+        ch == ROUND_L || self == Self::Markup && (ch == SQUARE_L || ch == CURLY_L)
     }
-    while line.get(pos).copied().is_some_and(is_close_brace) {
-        pos += 1;
+
+    fn is_close_brace(self, ch: u16) -> bool {
+        ch == ROUND_R || self == Self::Markup && (ch == SQUARE_R || ch == CURLY_R)
+    }
+}
+
+pub(super) fn extract(line: &[u16], pos: usize, kind: Kind) -> Option<Extracted> {
+    let mut pos = pos.min(line.len());
+    // `lookAhead`, for markup only: a closing quote may only come right after
+    // the cursor; brackets follow.
+    if kind == Kind::Markup {
+        if line.get(pos).copied().is_some_and(is_quote) {
+            pos += 1;
+        }
+        while line
+            .get(pos)
+            .copied()
+            .is_some_and(|ch| kind.is_close_brace(ch))
+        {
+            pos += 1;
+        }
     }
     let start = pos.saturating_sub(MAX_LENGTH);
     let mut scanner = Backward {
@@ -57,9 +83,9 @@ pub(super) fn extract(line: &[u16], pos: usize) -> Option<Extracted> {
                 continue;
             }
         }
-        if is_close_brace(ch) {
+        if kind.is_close_brace(ch) {
             stack.push(ch);
-        } else if is_open_brace(ch) {
+        } else if kind.is_open_brace(ch) {
             if stack.pop() != Some(brace_pair(ch)) {
                 // An unexpected brace.
                 break;

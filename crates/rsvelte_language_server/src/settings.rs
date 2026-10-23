@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::completions::EmmetGates;
+
 /// What a `compilerWarnings` entry does to the warning it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WarningLevel {
@@ -126,6 +128,51 @@ impl Default for HtmlSettings {
     }
 }
 
+/// The editor's `emmet` section, as far as emmet-helper's `doComplete` reads
+/// it before expanding: `showExpandedAbbreviation` and `excludeLanguages`.
+/// Its other keys (`preferences`, `syntaxProfiles`, `variables`,
+/// `showAbbreviationSuggestions`, `showSuggestionsAsSnippets`,
+/// `extensionsPath`) are not read; Emmet behaves as with their defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EmmetSettings {
+    /// `showExpandedAbbreviation: "never"`.
+    pub never: bool,
+    /// `excludeLanguages`: the syntaxes Emmet is off in.
+    pub exclude_languages: Vec<String>,
+}
+
+impl EmmetSettings {
+    #[must_use]
+    pub fn from_json(value: &Value) -> Self {
+        Self {
+            never: value
+                .get("showExpandedAbbreviation")
+                .and_then(Value::as_str)
+                == Some("never"),
+            exclude_languages: value
+                .get("excludeLanguages")
+                .and_then(Value::as_array)
+                .map(|languages| {
+                    languages
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// `doComplete`'s own check, and `getEmmetMode`'s.
+    fn offers(&self, syntax: &str) -> bool {
+        !self.never
+            && !self
+                .exclude_languages
+                .iter()
+                .any(|language| language == syntax)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SvelteSettings {
     pub enable: bool,
@@ -181,6 +228,7 @@ pub struct Settings {
     pub css: CssSettings,
     pub html: HtmlSettings,
     pub svelte: SvelteSettings,
+    pub emmet: EmmetSettings,
 }
 
 impl Default for Settings {
@@ -206,6 +254,7 @@ impl Default for Settings {
             css,
             html,
             svelte,
+            emmet: EmmetSettings::default(),
         };
         settings.recompute();
         settings
@@ -237,10 +286,34 @@ impl Settings {
             || self.css.enable && self.css.completions
     }
 
-    /// Emmet in markup: the HTML plugin's completions, and its `emmet` switch.
+    /// The editor's `emmet` section, which official reads apart from the
+    /// `svelte` one (`initializationOptions.configuration.emmet`, the
+    /// `emmet` key of `didChangeConfiguration`'s settings).
     #[must_use]
-    pub const fn html_emmet_enabled(&self) -> bool {
-        self.html.enable && self.html.completions && self.html.emmet
+    pub fn with_emmet(mut self, emmet: &Value) -> Self {
+        self.emmet = EmmetSettings::from_json(emmet);
+        self
+    }
+
+    /// Where Emmet is offered: in markup, the HTML plugin's completions and
+    /// its `emmet` switch; in `css`, `scss` and `less`, the CSS plugin's; in
+    /// `sass`, the CSS plugin's completions alone — and emmet-helper's own
+    /// `emmet` settings in each.
+    #[must_use]
+    pub fn emmet_gates(&self) -> EmmetGates {
+        let css_completions = self.css.enable && self.css.completions;
+        let stylesheet =
+            |syntax: &str| css_completions && self.css.emmet && self.emmet.offers(syntax);
+        EmmetGates {
+            html: self.html.enable
+                && self.html.completions
+                && self.html.emmet
+                && self.emmet.offers("html"),
+            css: stylesheet("css"),
+            scss: stylesheet("scss"),
+            less: stylesheet("less"),
+            sass: css_completions && self.emmet.offers("sass"),
+        }
     }
 
     #[must_use]
@@ -555,6 +628,42 @@ mod tests {
         assert_eq!(
             settings.compiler_warnings.get("a11y_missing_attribute"),
             Some(&WarningLevel::Ignore)
+        );
+    }
+
+    #[test]
+    fn emmet_follows_each_plugin_and_the_emmet_section() {
+        assert_eq!(Settings::default().emmet_gates(), EmmetGates::all());
+        let css_off = Settings::from_sections(
+            &Value::Null,
+            &json!({ "plugin": { "css": { "completions": { "emmet": false } } } }),
+        );
+        // The CSS plugin's `emmet` switch is not consulted for `sass`.
+        assert_eq!(
+            css_off.emmet_gates(),
+            EmmetGates {
+                css: false,
+                scss: false,
+                less: false,
+                ..EmmetGates::all()
+            }
+        );
+        let no_css = Settings::from_sections(
+            &Value::Null,
+            &json!({ "plugin": { "css": { "completions": { "enable": false } } } }),
+        );
+        assert!(!no_css.emmet_gates().sass);
+        let never = Settings::default().with_emmet(&json!({ "showExpandedAbbreviation": "never" }));
+        assert_eq!(never.emmet_gates(), EmmetGates::default());
+        let excluded =
+            Settings::default().with_emmet(&json!({ "excludeLanguages": ["scss", "html"] }));
+        assert_eq!(
+            excluded.emmet_gates(),
+            EmmetGates {
+                html: false,
+                scss: false,
+                ..EmmetGates::all()
+            }
         );
     }
 

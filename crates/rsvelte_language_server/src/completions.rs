@@ -11,6 +11,7 @@ use lsp_types::{
 use crate::context::{
     EmbeddedRegions, StartTag, attribute_context, is_component_tag, start_tag_context,
 };
+use crate::emmet::Stylesheet;
 use crate::html_data::{self, provider};
 use crate::modifiers::MODIFIERS;
 use crate::tags::{SvelteTag, latest_opening_tag};
@@ -31,23 +32,76 @@ const HTML_COMMENT_START: &str = "<!--";
 /// case, and short enough that a stray `{` far away cannot open a moustache.
 const WINDOW: usize = 10;
 
+/// Where Emmet abbreviations are offered, as official's plugins and
+/// emmet-helper's own checks decide: markup by the HTML plugin's `emmet`
+/// switch, `css`, `scss` and `less` by the CSS plugin's, and `sass` by the CSS
+/// plugin's completions alone (its `emmet` switch is not consulted there);
+/// `emmet.showExpandedAbbreviation: "never"` and `emmet.excludeLanguages`
+/// turn a syntax off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmmetGates {
+    pub html: bool,
+    pub css: bool,
+    pub scss: bool,
+    pub less: bool,
+    pub sass: bool,
+}
+
+impl EmmetGates {
+    /// Emmet everywhere, as the default settings have it.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self {
+            html: true,
+            css: true,
+            scss: true,
+            less: true,
+            sass: true,
+        }
+    }
+
+    const fn stylesheet(self, syntax: Stylesheet) -> bool {
+        match syntax {
+            Stylesheet::Css => self.css,
+            Stylesheet::Scss => self.scss,
+            Stylesheet::Less => self.less,
+            Stylesheet::Sass => self.sass,
+        }
+    }
+}
+
+/// `CSSPlugin.triggerCharacters`: a completion another trigger character
+/// asks for, the CSS plugin answers with nothing.
+const CSS_TRIGGER_CHARACTERS: [&str; 4] = [".", ":", "-", "/"];
+
+/// `HTMLPlugin.htmlTriggerCharacters`.
+const HTML_TRIGGER_CHARACTERS: [&str; 6] = [".", ":", "<", "\"", "=", "/"];
+
 /// The Svelte, HTML and CSS completions at `offset`, without Emmet.
 #[must_use]
 pub fn completions(text: &str, offset: usize) -> Option<CompletionList> {
-    completions_with_strict_mode(text, offset, false, true, false)
+    completions_with_strict_mode(text, offset, false, true, EmmetGates::default(), None)
 }
 
-/// `emmet` adds Emmet abbreviations in markup content, as the official HTML
-/// plugin does unless `svelte.plugin.html.completions.emmet` is off.
+/// `emmet` adds Emmet abbreviations where official's HTML and CSS plugins
+/// offer them; `triggered_by` is the character that asked, if one did.
 #[must_use]
 pub fn completions_with_strict_mode(
     text: &str,
     offset: usize,
     strict_mode: bool,
     markdown_documentation: bool,
-    emmet: bool,
+    emmet: EmmetGates,
+    triggered_by: Option<&str>,
 ) -> Option<CompletionList> {
-    build_completions(text, offset, strict_mode, markdown_documentation, emmet)
+    build_completions(
+        text,
+        offset,
+        strict_mode,
+        markdown_documentation,
+        emmet,
+        triggered_by,
+    )
 }
 
 fn build_completions(
@@ -55,18 +109,47 @@ fn build_completions(
     offset: usize,
     strict_mode: bool,
     markdown_documentation: bool,
-    emmet: bool,
+    emmet: EmmetGates,
+    triggered_by: Option<&str>,
 ) -> Option<CompletionList> {
+    let css_triggered =
+        triggered_by.is_none_or(|character| CSS_TRIGGER_CHARACTERS.contains(&character));
     let embedded = EmbeddedRegions::new(text);
-    if let Some(style) = embedded.style_at(offset) {
-        // `shouldExcludeCompletion` (`CSSPlugin.ts:585-593`) — `sass` is not on
-        // upstream's list because it is answered by emmet, which rsvelte ports
-        // for markup only, so it stays with the CSS provider rather than going
-        // silent.
-        if matches!(style.language.as_deref(), Some("stylus" | "styl")) {
-            return None;
+    let nested;
+    let style = match embedded.style_holding(offset) {
+        Some(style) => Some(style),
+        None if !embedded.in_script(offset) => {
+            nested = crate::context::nested_style_holding(text, offset);
+            nested.as_ref()
         }
-        return crate::css::completions(text, offset, markdown_documentation);
+        None => None,
+    };
+    if let Some(style) = style {
+        // `HTMLPlugin.getCompletions`: a trigger character the HTML plugin
+        // does not declare has it offer markup Emmet in an element's content,
+        // a style's included, unless a `{` before the cursor reads as a
+        // moustache. Its items come before the CSS plugin's.
+        let markup = if emmet.html
+            && triggered_by.is_some_and(|character| !HTML_TRIGGER_CHARACTERS.contains(&character))
+            && let Some(lt) = text[..style.body.start].rfind('<')
+            && !inside_moustache(text, lt, offset)
+        {
+            markup_emmet_items(text, offset)
+        } else {
+            Vec::new()
+        };
+        let list = if css_triggered {
+            style_completions(text, offset, style, markdown_documentation, emmet)
+        } else {
+            None
+        };
+        if markup.is_empty() {
+            return list;
+        }
+        let mut list = list.unwrap_or_default();
+        list.items.splice(0..0, markup);
+        list.is_incomplete = true;
+        return Some(list);
     }
     // A script body belongs to tsgo, not to the CSS provider.
     if embedded.in_script(offset) {
@@ -160,7 +243,17 @@ fn build_completions(
             return Some(language_completions(attribute.element_tag));
         }
         if attribute.in_value && attribute.name == "style" {
-            return crate::css::completions(text, offset, markdown_documentation);
+            if !css_triggered {
+                return None;
+            }
+            let list = crate::css::completions(text, offset, markdown_documentation);
+            if !emmet.css {
+                return list;
+            }
+            let items = attribute_value(text, attribute.name_start + attribute.name.len())
+                .map(|value| crate::css_emmet::attribute_items(text, value, offset))
+                .unwrap_or_default();
+            return with_emmet(list, items);
         }
         // `CSSPlugin.ts:252` answers a `class=` / `id=` value from the
         // component's own selectors.
@@ -190,7 +283,7 @@ fn build_completions(
     if let Some(list) = component_documentation(before) {
         return Some(list);
     }
-    if !emmet {
+    if !emmet.html {
         return None;
     }
     let items = emmet_completions(text, offset);
@@ -200,6 +293,74 @@ fn build_completions(
         is_incomplete: true,
         items,
     })
+}
+
+/// The CSS plugin's answer in a `<style>` body.
+fn style_completions(
+    text: &str,
+    offset: usize,
+    style: &crate::context::StyleRegion,
+    markdown_documentation: bool,
+    emmet: EmmetGates,
+) -> Option<CompletionList> {
+    // `shouldExcludeCompletion` (`CSSPlugin.ts:585-593`).
+    if matches!(style.language.as_deref(), Some("stylus" | "styl")) {
+        return None;
+    }
+    let syntax = crate::css_emmet::syntax(style.language.as_deref());
+    if syntax == Stylesheet::Sass {
+        // `isSASS`: the CSS language service does not parse `sass`, so
+        // upstream answers with emmet-helper alone, on the component.
+        return if emmet.sass {
+            crate::css_emmet::sass_items(text, offset).map(|items| CompletionList {
+                is_incomplete: true,
+                items,
+            })
+        } else {
+            None
+        };
+    }
+    let list = crate::css::completions(text, offset, markdown_documentation);
+    if !emmet.stylesheet(syntax) {
+        return list;
+    }
+    let items = crate::css_emmet::style_items(text, style.body.clone(), offset, syntax);
+    with_emmet(list, items)
+}
+
+/// The CSS plugin's list with emmet-helper's items after its own: incomplete
+/// when it holds one, since an abbreviation changes with every keystroke.
+fn with_emmet(list: Option<CompletionList>, items: Vec<CompletionItem>) -> Option<CompletionList> {
+    if items.is_empty() {
+        return list;
+    }
+    let mut list = list.unwrap_or_default();
+    list.items.extend(items);
+    list.is_incomplete = true;
+    Some(list)
+}
+
+/// The value of the attribute whose name ends at `name_end`, inside its
+/// quotes, as the HTML scanner's `AttributeValue` token has it; an
+/// unterminated quote has none.
+fn attribute_value(text: &str, name_end: usize) -> Option<std::ops::Range<usize>> {
+    let rest = text.get(name_end..)?;
+    let after_name = rest.trim_start();
+    let after_assign = after_name.strip_prefix('=')?;
+    let value = after_assign.trim_start();
+    let start = text.len() - value.len();
+    match value.as_bytes().first() {
+        Some(&quote @ (b'"' | b'\'')) => {
+            let close = value[1..].find(char::from(quote))?;
+            Some(start + 1..start + 1 + close)
+        }
+        _ => {
+            let len = value
+                .find(|c: char| c.is_whitespace() || "\"'`=<>".contains(c))
+                .unwrap_or(value.len());
+            Some(start..start + len)
+        }
+    }
 }
 
 /// emmet-helper's suggestions where the HTML language service reaches its
@@ -215,6 +376,11 @@ fn emmet_completions(text: &str, offset: usize) -> Vec<CompletionItem> {
     if inside_moustache(text, seed, offset) {
         return Vec::new();
     }
+    markup_emmet_items(text, offset)
+}
+
+/// emmet-helper's `html` suggestions on the cursor's line.
+fn markup_emmet_items(text: &str, offset: usize) -> Vec<CompletionItem> {
     let index = LineIndex::new(text);
     let position = index.position(text, offset);
     let line = index.line_text(text, position.line as usize);
@@ -231,6 +397,7 @@ fn emmet_completions(text: &str, offset: usize) -> Vec<CompletionItem> {
                 label: suggestion.label,
                 detail: Some("Emmet Abbreviation".to_string()),
                 documentation: Some(Documentation::String(suggestion.documentation)),
+                filter_text: suggestion.filter_text,
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 text_edit: Some(lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: lsp_types::Range::new(at(suggestion.start), at(suggestion.end)),
@@ -1200,9 +1367,16 @@ mod tests {
     #[test]
     fn only_the_html_tables_follow_the_client_documentation_format() {
         let kind = |source: &str, offset: usize, label: &str, markdown: bool| {
-            let items = completions_with_strict_mode(source, offset, false, markdown, false)
-                .unwrap()
-                .items;
+            let items = completions_with_strict_mode(
+                source,
+                offset,
+                false,
+                markdown,
+                EmmetGates::default(),
+                None,
+            )
+            .unwrap()
+            .items;
             let item = items.iter().find(|i| i.label == label).unwrap();
             let Some(Documentation::MarkupContent(content)) = &item.documentation else {
                 panic!("{label} carried no markup documentation");

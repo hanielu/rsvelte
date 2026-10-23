@@ -24,6 +24,7 @@ struct Server {
     /// What `workspace/configuration` is answered with.
     settings: Value,
     official_settings: Value,
+    emmet_settings: Value,
 }
 
 impl Server {
@@ -67,6 +68,7 @@ impl Server {
                 "hover": { "enable": true },
             }),
             official_settings: Value::Null,
+            emmet_settings: Value::Null,
         }
     }
 
@@ -259,6 +261,7 @@ impl Server {
                 .map(|item| match item["section"].as_str() {
                     Some("rsvelte") => self.settings.clone(),
                     Some("svelte") => self.official_settings.clone(),
+                    Some("emmet") => self.emmet_settings.clone(),
                     _ => Value::Null,
                 })
                 .collect();
@@ -1206,6 +1209,94 @@ fn emmet_abbreviations_follow_the_html_emmet_setting() {
             assert_eq!(server.response(resolve), emmet_items[0]);
         } else {
             assert!(emmet_items.is_empty(), "{response}");
+        }
+        assert_eq!(server.shutdown(), Some(0));
+    }
+}
+
+/// Official's CSS plugin offers emmet-helper's stylesheet expansions after its
+/// CSS items, in `<style>` and a `style` attribute, unless
+/// `svelte.plugin.css.completions.emmet` is off — which `sass`, answered by
+/// emmet-helper alone, does not consult — or the editor's `emmet` section
+/// says `showExpandedAbbreviation: "never"`. The list is incomplete, so
+/// `PluginHost` keeps the items whose label holds the word at the cursor:
+/// `m10-a` → `margin: 10px auto;` stays, `m10` → `margin: 10px;` does not.
+#[test]
+fn emmet_abbreviations_in_style_follow_the_css_and_emmet_settings() {
+    let dir = temp_dir("style-emmet");
+    let css = file_uri(&dir.join("Css.svelte"));
+    let sass = file_uri(&dir.join("Sass.svelte"));
+    let item = |label: &str, filter: &str, line: u32, start: u32, end: u32| {
+        json!({
+            "label": label,
+            "detail": "Emmet Abbreviation",
+            "documentation": label,
+            "filterText": filter,
+            "insertTextFormat": 2,
+            "textEdit": {
+                "range": {
+                    "start": { "line": line, "character": start },
+                    "end": { "line": line, "character": end }
+                },
+                "newText": label
+            }
+        })
+    };
+    let off = json!({ "plugin": { "css": { "completions": { "emmet": false } } } });
+    let never = json!({ "showExpandedAbbreviation": "never" });
+    for (official, emmet, in_css, in_sass) in [
+        (Value::Null, Value::Null, true, true),
+        (off, Value::Null, false, true),
+        (Value::Null, never, false, false),
+    ] {
+        let mut server = Server::start();
+        server.official_settings = official;
+        server.emmet_settings = emmet;
+        let initialize = server.request(
+            "initialize",
+            json!({
+                "processId": Value::Null,
+                "rootUri": Value::Null,
+                "capabilities": { "workspace": { "configuration": true } }
+            }),
+        );
+        server.response(initialize);
+        server.notify("initialized", json!({}));
+        server.settle_configuration();
+        did_open(
+            &mut server,
+            &css,
+            "<div style=\"p10-20\"></div>\n<style>\n\t.a {\n\t\tm10-a\n\t\tm10\n\t}\n</style>\n",
+        );
+        did_open(
+            &mut server,
+            &sass,
+            "<style lang=\"sass\">\n.a\n\tm10-a\n</style>\n",
+        );
+        let margin = item("margin: 10px auto;", "m10-a", 3, 2, 7);
+        let padding = item("padding: 10px 20px;", "p10-20", 0, 12, 18);
+        let sass_margin = item("margin: 10px auto", "m10-a", 2, 1, 6);
+        for (uri, line, character, want) in [
+            (&css, 3, 7, in_css.then_some(margin)),
+            (&css, 0, 18, in_css.then_some(padding)),
+            (&css, 4, 5, None),
+            (&sass, 2, 6, in_sass.then_some(sass_margin)),
+        ] {
+            let response = server.completion_response(uri, line, character);
+            let emmet_items: Vec<Value> = response["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|item| item["detail"] == "Emmet Abbreviation")
+                .cloned()
+                .collect();
+            match want {
+                Some(want) => {
+                    assert_eq!(response["isIncomplete"], json!(true), "{response}");
+                    assert_eq!(emmet_items, vec![want]);
+                }
+                None => assert!(emmet_items.is_empty(), "{response}"),
+            }
         }
         assert_eq!(server.shutdown(), Some(0));
     }

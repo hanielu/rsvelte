@@ -81,7 +81,9 @@ pub enum Job {
         offset: usize,
         strict_mode: bool,
         markdown_documentation: bool,
-        emmet: bool,
+        emmet: crate::completions::EmmetGates,
+        /// The character that triggered the request, if one did.
+        trigger_character: Option<String>,
     },
     Hover {
         id: RequestId,
@@ -438,6 +440,7 @@ fn run(jobs: &Receiver<Job>, outcomes: &Sender<Outcome>, stopping: &AtomicBool) 
                 strict_mode,
                 markdown_documentation,
                 emmet,
+                trigger_character,
             } => Outcome::Completed {
                 id,
                 list: guard("completion", &path, || {
@@ -447,6 +450,7 @@ fn run(jobs: &Receiver<Job>, outcomes: &Sender<Outcome>, stopping: &AtomicBool) 
                         strict_mode,
                         markdown_documentation,
                         emmet,
+                        trigger_character.as_deref(),
                     )
                 })
                 .flatten(),
@@ -854,7 +858,8 @@ mod tests {
             offset: 0,
             strict_mode: false,
             markdown_documentation: true,
-            emmet: true,
+            emmet: crate::completions::EmmetGates::all(),
+            trigger_character: None,
         });
         assert!(
             matches!(next(&outcomes), Outcome::Completed { id, .. } if id == RequestId::from(2)),

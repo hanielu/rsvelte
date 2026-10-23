@@ -17,6 +17,7 @@ pub mod completions;
 pub mod context;
 pub mod css;
 pub mod css_data;
+pub mod css_emmet;
 pub mod css_selector;
 pub mod diagnostics;
 pub mod document;

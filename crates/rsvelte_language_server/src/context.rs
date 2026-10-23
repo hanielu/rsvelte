@@ -63,6 +63,44 @@ impl EmbeddedRegions {
             .iter()
             .find(|style| style.body.contains(&offset))
     }
+
+    /// The `<style>` whose body holds `offset`, its end included, as
+    /// upstream's `isInTag` has it: completion right before `</style>` is in
+    /// the style.
+    #[must_use]
+    pub fn style_holding(&self, offset: usize) -> Option<&StyleRegion> {
+        self.styles
+            .iter()
+            .find(|style| style.body.start <= offset && offset <= style.body.end)
+    }
+}
+
+/// A `<style>` nested in markup — in `<svelte:head>`, an element or a block —
+/// whose body holds `offset`, its end included: upstream's
+/// `extractStyleTagAtOffset`, for the styles beside the component's own.
+#[must_use]
+pub fn nested_style_holding(text: &str, offset: usize) -> Option<StyleRegion> {
+    // Right before `</style>` the element is still open.
+    let probe = if text
+        .get(offset..)
+        .is_some_and(|rest| rest.starts_with("</style"))
+    {
+        offset.checked_sub(1)?
+    } else {
+        offset
+    };
+    let (name, lt) = crate::html_tags::enclosing_open_tag(text, probe)?;
+    if name != "style" {
+        return None;
+    }
+    let open_end = lt + text[lt..].find('>')? + 1;
+    let body_end = text[open_end..]
+        .find("</style")
+        .map_or(text.len(), |index| open_end + index);
+    (open_end <= offset && offset <= body_end).then(|| StyleRegion {
+        language: style_language(&text[lt..open_end]),
+        body: open_end..body_end,
+    })
 }
 
 /// The language a `<style …>` open tag declares, as `getLangAttribute` reads it.

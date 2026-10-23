@@ -1,19 +1,24 @@
-//! Emmet abbreviations in markup: a port of the official server's
-//! `doComplete(document, position, 'html', {})` from `@vscode/emmet-helper`
-//! 2.8.4 and the markup half of `emmet` 2.4.11 it expands with.
+//! Emmet abbreviations: a port of the official server's `doComplete(document,
+//! position, syntax, {})` from `@vscode/emmet-helper` 2.8.4 and of `emmet`
+//! 2.4.11, which it expands with — for `html` in markup, and for `css`,
+//! `scss`, `less` and `sass` in a stylesheet.
 //!
 //! `data.json` holds what those packages ship as data — the `html` snippet
 //! registry, the variables, emmet-helper's commonly used tags and the lorem
-//! ipsum vocabularies — extracted from the installed versions.
+//! ipsum vocabularies; the stylesheet snippet registry, keywords and unitless
+//! properties, and emmet-helper's CSS property names — extracted from the
+//! installed versions.
 //!
 //! Both are MIT-licensed (emmet © Sergey Chikuyonok, emmet-helper ©
 //! Microsoft); their notices are in `NOTICE.md`. Regenerate `data.json` and
-//! the tests' oracle with `node scripts/dev/generate-emmet-data.mjs`.
+//! the tests' oracles with `node scripts/dev/generate-emmet-data.mjs`.
 
 mod convert;
+mod css;
 mod extract;
 mod html;
 mod parser;
+mod stylesheet;
 mod tokenizer;
 mod transform;
 
@@ -36,8 +41,162 @@ pub struct Suggestion {
     pub new_text: String,
     /// The expansion with each tab stop shown as `|`.
     pub documentation: String,
+    /// A stylesheet expansion is labelled with its text and filtered by
+    /// the abbreviation.
+    pub filter_text: Option<String>,
     pub start: usize,
     pub end: usize,
+}
+
+/// emmet-helper's stylesheet syntaxes, as the official CSS plugin names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stylesheet {
+    Css,
+    Scss,
+    Less,
+    Sass,
+}
+
+impl Stylesheet {
+    /// The name emmet-helper and `emmet.excludeLanguages` know it by.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Css => "css",
+            Self::Scss => "scss",
+            Self::Less => "less",
+            Self::Sass => "sass",
+        }
+    }
+
+    /// emmet-helper's `stylesheet.after`.
+    const fn options(self) -> css::Options {
+        css::Options {
+            after: match self {
+                Self::Sass => "",
+                Self::Css | Self::Scss | Self::Less => ";",
+            },
+        }
+    }
+}
+
+/// The stylesheet suggestions for the abbreviation ending at UTF-16 column
+/// `cursor` of `line`, the cursor's whole line: `None` where emmet-helper
+/// answers `undefined`, and an empty list where it answers one (an
+/// abbreviation longer than four characters that starts a CSS property name).
+#[must_use]
+pub fn stylesheet_suggestions(
+    line: &str,
+    cursor: usize,
+    syntax: Stylesheet,
+) -> Option<Vec<Suggestion>> {
+    let data = data();
+    let line: Vec<u16> = line.encode_utf16().collect();
+    let till_cursor = &line[..cursor.min(line.len())];
+    let (pos, filter) = filters(till_cursor, cursor);
+    let filter_len = filter.as_ref().map_or(0, |filter| filter.len() + 1);
+    let extracted = extract::extract(&line, pos, extract::Kind::Stylesheet)?;
+    let abbreviation = String::from_utf16_lossy(&extracted.abbreviation);
+    let start = extracted.location;
+    let end = start + extracted.abbreviation.len() + filter_len;
+    let options = syntax.options();
+
+    let mut expanded = None;
+    if is_stylesheet_abbreviation_valid(&abbreviation, data) {
+        let mut text = css::expand(&abbreviation, options, data).unwrap_or_default();
+        // microsoft/vscode#120245.
+        if "!important".starts_with(&abbreviation) {
+            text = "!important".to_string();
+        }
+        if !text.is_empty() && !is_stylesheet_noise(&abbreviation, &text, options) {
+            expanded = Some(text);
+        }
+    }
+    // An abbreviation longer than emmet's own that starts a property name
+    // is that property being typed.
+    if abbreviation.encode_utf16().count() > 4
+        && data
+            .stylesheet
+            .properties
+            .iter()
+            .any(|property| property.starts_with(&abbreviation))
+    {
+        return Some(Vec::new());
+    }
+    let expanded = expanded?;
+    let label = remove_tab_stops(&expanded);
+    // `width` → `widows` or `font-family` → `font: family` would be noise
+    // (microsoft/vscode#28933): without a digit, the label must hold the
+    // abbreviation's characters in order.
+    if !abbreviation.chars().any(|c| c.is_ascii_digit()) && !holds_in_order(&abbreviation, &label)?
+    {
+        return None;
+    }
+    Some(vec![Suggestion {
+        label,
+        new_text: escape_non_tab_stop_dollar(&add_final_tab_stop(&expanded)),
+        documentation: replace_tab_stops_with_cursors(&expanded),
+        filter_text: Some(abbreviation),
+        start,
+        end,
+    }])
+}
+
+/// `isAbbreviationValid` for a stylesheet: a hex colour, or a start that can
+/// begin a property, a keyword or an at-rule — and no tag before a `#`.
+fn is_stylesheet_abbreviation_valid(abbreviation: &str, data: &Data) -> bool {
+    if let Some(hash) = abbreviation.find('#') {
+        if let Some(hex) = abbreviation.strip_prefix('#') {
+            return (1..=6).contains(&hex.len())
+                && hex.chars().all(|c| c.is_ascii_hexdigit() || c == ',');
+        }
+        if data.tags.iter().any(|tag| *tag == abbreviation[..hash]) {
+            return false;
+        }
+    }
+    let rest = abbreviation.strip_prefix('-').unwrap_or(abbreviation);
+    rest.starts_with(|c: char| c.is_ascii_alphabetic() || ",!@#".contains(c))
+}
+
+/// `isExpandedTextNoise` for a stylesheet: an unknown name expands to an
+/// empty property (`abc` → `abc: ;`, `abc:d` → `abc: d;`).
+fn is_stylesheet_noise(abbreviation: &str, expanded: &str, options: css::Options) -> bool {
+    let after = options.after;
+    // The abbreviation without a `:` it ends with.
+    let units: Vec<u16> = abbreviation.encode_utf16().collect();
+    let from = units.len().saturating_sub(css::BETWEEN.len());
+    let end = units[from..]
+        .iter()
+        .position(|&unit| unit == u16::from(b':'))
+        .map_or(units.len(), |index| from + index);
+    let name = String::from_utf16_lossy(&units[..end]);
+    let unspaced = |text: &str| {
+        text.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    expanded == format!("{name}{}${{0}}{after}", css::BETWEEN)
+        || unspaced(expanded) == unspaced(abbreviation) + after
+}
+
+/// emmet-helper's `abbrRegex`: `.*` between the abbreviation's characters,
+/// case-insensitive, with `$` and `+` escaped — the other characters keep
+/// their regular expression meaning, so `.` is any character but a line
+/// break and parentheses group. `None` where JavaScript's `RegExp` would
+/// throw.
+fn holds_in_order(abbreviation: &str, label: &str) -> Option<bool> {
+    const ANY: &str = r"[^\n\r\u{2028}\u{2029}]";
+    let pattern: Vec<String> = abbreviation
+        .chars()
+        .map(|c| match c {
+            '.' => ANY.to_string(),
+            '(' | ')' | '^' => c.to_string(),
+            _ => regex::escape(&c.to_string()),
+        })
+        .collect();
+    let any = format!("{ANY}*");
+    let pattern = format!("(?i){any}{}{any}", pattern.join(&any));
+    Some(regex::Regex::new(&pattern).ok()?.is_match(label))
 }
 
 /// The suggestions for the abbreviation ending at UTF-16 column `cursor` of
@@ -49,7 +208,7 @@ pub fn suggestions(line: &str, cursor: usize) -> Vec<Suggestion> {
     let till_cursor = &line[..cursor.min(line.len())];
     let (pos, filter) = filters(till_cursor, cursor);
     let filter_len = filter.as_ref().map_or(0, |filter| filter.len() + 1);
-    let Some(extracted) = extract::extract(&line, pos) else {
+    let Some(extracted) = extract::extract(&line, pos, extract::Kind::Markup) else {
         return Vec::new();
     };
     let abbreviation = String::from_utf16_lossy(&extracted.abbreviation);
@@ -74,6 +233,7 @@ pub fn suggestions(line: &str, cursor: usize) -> Vec<Suggestion> {
         label,
         new_text: escape_non_tab_stop_dollar(&add_final_tab_stop(expanded)),
         documentation: replace_tab_stops_with_cursors(expanded),
+        filter_text: None,
         start,
         end,
     };
@@ -340,6 +500,15 @@ fn escape_non_tab_stop_dollar(text: &str) -> String {
 /// `replaceTabStopsWithCursors`: `${1}` → `|` (after any character but a
 /// backslash), then `${1:text}` → `text`.
 fn replace_tab_stops_with_cursors(text: &str) -> String {
+    rewrite_tab_stops(text, "|")
+}
+
+/// `removeTabStops`: as `replaceTabStopsWithCursors`, with nothing for `${1}`.
+fn remove_tab_stops(text: &str) -> String {
+    rewrite_tab_stops(text, "")
+}
+
+fn rewrite_tab_stops(text: &str, cursor: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut cursors = String::with_capacity(text.len());
     let mut i = 0;
@@ -348,7 +517,7 @@ fn replace_tab_stops_with_cursors(text: &str) -> String {
             && let Some(end) = tab_stop_end(&chars, i + 1)
         {
             cursors.push(chars[i]);
-            cursors.push('|');
+            cursors.push_str(cursor);
             i = end;
             continue;
         }
@@ -409,6 +578,18 @@ pub(crate) struct Data {
     /// emmet-helper's commonly used tags: the HTML tags, then `lorem`.
     tags: Vec<String>,
     lorem: HashMap<String, Vocabulary>,
+    stylesheet: StylesheetData,
+}
+
+pub(crate) struct StylesheetData {
+    /// The stylesheet snippet registry, parsed and sorted by name.
+    snippets: Vec<css::Snippet>,
+    /// emmet's `stylesheet.keywords`.
+    keywords: Vec<String>,
+    /// emmet's `stylesheet.unitless`: properties a bare number keeps no unit in.
+    unitless: Vec<String>,
+    /// emmet-helper's CSS property names.
+    properties: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -423,6 +604,15 @@ struct RawData {
     variables: Vec<(String, String)>,
     tags: Vec<String>,
     lorem: HashMap<String, Vocabulary>,
+    stylesheet: RawStylesheet,
+}
+
+#[derive(Deserialize)]
+struct RawStylesheet {
+    snippets: Vec<(String, String)>,
+    keywords: Vec<String>,
+    unitless: Vec<String>,
+    properties: Vec<String>,
 }
 
 /// emmet's default `inlineElements`.
@@ -478,6 +668,12 @@ fn data() -> &'static Data {
             variables: raw.variables.into_iter().collect(),
             tags: raw.tags,
             lorem: raw.lorem,
+            stylesheet: StylesheetData {
+                snippets: css::snippets(&raw.stylesheet.snippets),
+                keywords: raw.stylesheet.keywords,
+                unitless: raw.stylesheet.unitless,
+                properties: raw.stylesheet.properties,
+            },
         }
     })
 }

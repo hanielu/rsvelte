@@ -16,15 +16,15 @@ use lsp_types::{
     CallHierarchyServerCapability, CancelParams, CodeActionKind, CodeActionOptions,
     CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, CodeLens, CodeLensOptions,
     CodeLensParams, ColorPresentationParams, ColorProviderCapability, CompletionOptions,
-    CompletionOptionsCompletionItem, CompletionParams, ConfigurationItem, ConfigurationParams,
-    DiagnosticOptions, DiagnosticServerCapabilities, DidChangeTextDocumentParams,
-    DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentColorParams,
-    DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentFormattingParams,
-    DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse, ExecuteCommandOptions,
-    ExecuteCommandParams, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
-    FullDocumentDiagnosticReport, HoverParams, HoverProviderCapability,
-    ImplementationProviderCapability, LinkedEditingRangeParams,
+    CompletionOptionsCompletionItem, CompletionParams, CompletionTriggerKind, ConfigurationItem,
+    ConfigurationParams, DiagnosticOptions, DiagnosticServerCapabilities,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentColorParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
+    DocumentFormattingParams, DocumentHighlightParams, DocumentSymbolParams,
+    DocumentSymbolResponse, ExecuteCommandOptions, ExecuteCommandParams, FoldingRange,
+    FoldingRangeParams, FoldingRangeProviderCapability, FullDocumentDiagnosticReport, HoverParams,
+    HoverProviderCapability, ImplementationProviderCapability, LinkedEditingRangeParams,
     LinkedEditingRangeServerCapabilities, NumberOrString, OneOf, Position, PositionEncodingKind,
     PublishDiagnosticsParams, RelatedFullDocumentDiagnosticReport, RenameOptions, RenameParams,
     SaveOptions, SelectionRangeParams, SelectionRangeProviderCapability, SemanticTokenModifier,
@@ -101,6 +101,7 @@ const JS_TS_CONFIG_SECTION: &str = "js/ts";
 const TYPESCRIPT_CONFIG_SECTION: &str = "typescript";
 const JAVASCRIPT_CONFIG_SECTION: &str = "javascript";
 const EDITOR_CONFIG_SECTION: &str = "editor";
+const EMMET_CONFIG_SECTION: &str = "emmet";
 
 const TSGO_SEMANTIC_TOKEN_TYPES: &[&str] = &[
     "namespace",
@@ -316,8 +317,15 @@ fn capabilities(client: &ClientState) -> ServerCapabilities {
 /// produce one.
 enum Pending {
     Formatting,
-    Completion { tsgo_fallback: Request },
-    Hover { tsgo_fallback: Request },
+    /// `filter`, the word an incomplete answer is narrowed to
+    /// (`PluginHost.ts:285-296`), when the client has the server filter.
+    Completion {
+        tsgo_fallback: Request,
+        filter: Option<String>,
+    },
+    Hover {
+        tsgo_fallback: Request,
+    },
     ExtractComponent,
     CompiledCode,
     SelectionRange,
@@ -1485,6 +1493,12 @@ impl Server {
                     .pointer("/initializationOptions/configuration/svelte")
                     .unwrap_or(&serde_json::Value::Null),
             )
+            .with_emmet(
+                initialize_params
+                    .pointer("/initializationOptions/configuration/emmet")
+                    .or_else(|| initialize_params.pointer("/initializationOptions/emmetConfig"))
+                    .unwrap_or(&serde_json::Value::Null),
+            )
         };
         Self {
             sender,
@@ -1806,14 +1820,23 @@ impl Server {
     fn on_completion(&mut self, request: Request) {
         let tsgo_fallback = request.clone();
         let id = request.id;
-        let params = match serde_json::from_value::<CompletionParams>(request.params) {
-            Ok(params) => params.text_document_position,
-            Err(err) => {
-                log::warn(format_args!("textDocument/completion: {err}"));
-                self.respond(Response::new_ok(id, empty_completion_list()));
-                return;
-            }
-        };
+        let (params, trigger_character) =
+            match serde_json::from_value::<CompletionParams>(request.params) {
+                Ok(params) => (
+                    params.text_document_position,
+                    params
+                        .context
+                        .filter(|context| {
+                            context.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER
+                        })
+                        .and_then(|context| context.trigger_character),
+                ),
+                Err(err) => {
+                    log::warn(format_args!("textDocument/completion: {err}"));
+                    self.respond(Response::new_ok(id, empty_completion_list()));
+                    return;
+                }
+            };
         // `rsvelte.completion.enable` has no upstream counterpart, so
         // `PluginHost.ts:298` — which is about every plugin declining — does not
         // govern a server the user configured not to answer at all.
@@ -1827,8 +1850,17 @@ impl Server {
         }
         match self.locate(&params) {
             Some((path, text, offset)) => {
-                self.pending
-                    .insert(id.clone(), Pending::Completion { tsgo_fallback });
+                let filter = self
+                    .client
+                    .filter_incomplete_completions
+                    .then(|| incomplete_completion_filter_at(&text, offset));
+                self.pending.insert(
+                    id.clone(),
+                    Pending::Completion {
+                        tsgo_fallback,
+                        filter,
+                    },
+                );
                 self.worker.submit(Job::Complete {
                     id,
                     path,
@@ -1836,7 +1868,8 @@ impl Server {
                     offset,
                     strict_mode: self.settings.format_config.strict_mode.unwrap_or(false),
                     markdown_documentation: self.client.markdown_documentation,
-                    emmet: self.settings.html_emmet_enabled(),
+                    emmet: self.settings.emmet_gates(),
+                    trigger_character,
                 });
             }
             None => self.forward_tsgo_request(tsgo_fallback),
@@ -2872,6 +2905,11 @@ impl Server {
                             .unwrap_or(&serde_json::Value::Null),
                         settings
                             .and_then(|settings| settings.get("svelte"))
+                            .unwrap_or(&serde_json::Value::Null),
+                    )
+                    .with_emmet(
+                        settings
+                            .and_then(|settings| settings.get("emmet"))
                             .unwrap_or(&serde_json::Value::Null),
                     );
                     if preprocessing_was_enabled && !self.settings.preprocess_enable {
@@ -4914,6 +4952,11 @@ impl Server {
                                 .and_then(|items| items.get(1))
                                 .unwrap_or(&serde_json::Value::Null),
                         )
+                        .with_emmet(
+                            items
+                                .and_then(|items| items.get(6))
+                                .unwrap_or(&serde_json::Value::Null),
+                        )
                     }
                     Err(err) => {
                         log::warn(format_args!(
@@ -6475,8 +6518,20 @@ impl Server {
                 }
             }
             Outcome::Completed { id, list } => {
-                if let Some(Pending::Completion { tsgo_fallback }) = self.pending.remove(&id) {
-                    let fallback = list.and_then(|list| serde_json::to_value(list).ok());
+                if let Some(Pending::Completion {
+                    tsgo_fallback,
+                    filter,
+                }) = self.pending.remove(&id)
+                {
+                    let mut fallback = list.and_then(|list| serde_json::to_value(list).ok());
+                    // `PluginHost.ts:285-296`: an incomplete list — Emmet's —
+                    // keeps only the items whose label holds the word at the
+                    // cursor, since not every editor filters client-side.
+                    if let Some(result) = fallback.as_mut()
+                        && result["isIncomplete"] == true
+                    {
+                        mark_completion_list_incomplete(result, filter.as_deref());
+                    }
                     self.forward_tsgo_request_with_fallback(tsgo_fallback, fallback);
                 }
             }
@@ -6591,6 +6646,7 @@ impl Server {
                     TYPESCRIPT_CONFIG_SECTION,
                     JAVASCRIPT_CONFIG_SECTION,
                     EDITOR_CONFIG_SECTION,
+                    EMMET_CONFIG_SECTION,
                 ]
                 .into_iter()
                 .map(|section| ConfigurationItem {
@@ -7294,7 +7350,11 @@ fn incomplete_completion_filter(text: &str, position: &serde_json::Value) -> Str
     let Ok(position) = serde_json::from_value::<Position>(position.clone()) else {
         return String::new();
     };
-    let offset = LineIndex::new(text).offset(text, position);
+    incomplete_completion_filter_at(text, LineIndex::new(text).offset(text, position))
+}
+
+/// [`incomplete_completion_filter`] at a byte offset.
+fn incomplete_completion_filter_at(text: &str, offset: usize) -> String {
     let before = text.get(..offset).unwrap_or(text);
     let units = before.encode_utf16().collect::<Vec<_>>();
     let window = String::from_utf16_lossy(&units[units.len().saturating_sub(20)..]);
