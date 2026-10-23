@@ -536,9 +536,7 @@ impl TsgoOverlay {
             }
         }
         for (link, target) in packages {
-            if fs::symlink_metadata(&link).is_err()
-                && let Err(error) = place_symlink(&link, &target, &cache_root)
-            {
+            if let Err(error) = place_file_mirror(&link, &target, &cache_root) {
                 crate::log::warn(format_args!(
                     "could not mirror {} for tsgo: {error}",
                     target.display()
@@ -4001,6 +3999,36 @@ fn place_symlink(link: &Path, target: &Path, cache_root: &Path) -> io::Result<()
     return junction::create(target, link);
 }
 
+/// Mirror the file `target` at `link`, as tsgo must read a package scope's
+/// `package.json` beside the shadows. A symlink, placed once; on Windows a
+/// copy, rewritten whenever the file's text changes: a junction reaches only
+/// a directory, and a file symlink needs Developer Mode or an administrator.
+/// A junction an earlier server left there gives way.
+fn place_file_mirror(link: &Path, target: &Path, cache_root: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    if fs::symlink_metadata(link).is_ok() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    return place_symlink(link, target, cache_root);
+    #[cfg(windows)]
+    {
+        if is_link(link) {
+            remove_link(link)?;
+        }
+        let text = fs::read(target)?;
+        if fs::read(link).is_ok_and(|existing| existing == text) {
+            return Ok(());
+        }
+        let Some(parent) = link.parent() else {
+            return Ok(());
+        };
+        fs::create_dir_all(parent)?;
+        reject_symlink_components(parent, cache_root)?;
+        fs::write(link, text)
+    }
+}
+
 /// Whether `path` is a link [`place_symlink`] could have made: a symlink, or
 /// on Windows a directory junction.
 fn is_link(path: &Path) -> bool {
@@ -6467,6 +6495,68 @@ mod tests {
         assert!(
             fs::symlink_metadata(overlay.shadow_dir.join("package.json")).is_err(),
             "the mirror root's own is found through the cache's ancestry"
+        );
+    }
+
+    fn build_package_scope(root: &Path, manifest: &str) -> TsgoOverlay {
+        write(&root.join("package.json"), r#"{ "name": "root" }"#);
+        write(&root.join("ui/package.json"), manifest);
+        write(&root.join("ui/tsconfig.json"), "{}");
+        write(&root.join("ui/src/App.svelte"), "<p />");
+        TsgoOverlay::build_nested(&root.join("ui"), &root.join("ui/tsconfig.json"), root).unwrap()
+    }
+
+    /// tsgo reads a package scope's `type` (a shadow's module format) and
+    /// `imports` from the `package.json` mirrored into the shadow tree. A
+    /// junction, the only link Windows makes without privilege, reaches a
+    /// directory but not a file: tsgo found no `package.json` there, took the
+    /// workspace root's instead and checked every component of a
+    /// `"type": "module"` package as CommonJS (TS1295). The mirror must read
+    /// as the package's own text, and follow an edit.
+    #[test]
+    fn a_mirrored_package_json_reads_as_the_package_and_follows_its_edits() {
+        let workspace = TestWorkspace::new("package-scope");
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
+        let overlay = build_package_scope(&root, r#"{ "type": "module" }"#);
+        let mirror = overlay.shadow_dir.join("ui/package.json");
+        assert_eq!(
+            fs::read_to_string(&mirror).ok().as_deref(),
+            Some(r#"{ "type": "module" }"#)
+        );
+
+        write(&root.join("ui/package.json"), r#"{ "type": "commonjs" }"#);
+        overlay.link_node_modules();
+        assert_eq!(
+            fs::read_to_string(&mirror).ok().as_deref(),
+            Some(r#"{ "type": "commonjs" }"#)
+        );
+    }
+
+    /// What earlier Windows builds left at a package scope: a junction to the
+    /// file. It gives way to a mirror tsgo can read, and the package's own
+    /// `package.json` is left alone.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_an_earlier_server_left_for_a_package_json_is_replaced() {
+        let workspace = TestWorkspace::new("package-scope-junction");
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
+        let manifest = r#"{ "type": "module" }"#;
+        let overlay = build_package_scope(&root, manifest);
+        let mirror = overlay.shadow_dir.join("ui/package.json");
+        if is_link(&mirror) {
+            remove_link(&mirror).unwrap();
+        } else {
+            fs::remove_file(&mirror).unwrap();
+        }
+        junction::create(root.join("ui/package.json"), &mirror).unwrap();
+
+        overlay.link_node_modules();
+        assert_eq!(fs::read_to_string(&mirror).ok().as_deref(), Some(manifest));
+        assert_eq!(
+            fs::read_to_string(root.join("ui/package.json"))
+                .ok()
+                .as_deref(),
+            Some(manifest)
         );
     }
 
