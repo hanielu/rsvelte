@@ -307,27 +307,37 @@ fn close_tag_completions(
     };
     let mut items = Vec::new();
     if let Some((tag, tag_bracket)) = enclosing {
-        let mut filter_text = format!("/{tag}");
-        let mut range = replace(after_open_bracket, name_end);
-        let mut new_text = format!("/{tag}{close}");
-        if let (Some(start_indent), Some(end_indent)) = (
+        // A close tag on a line of its own takes its ancestor's indent, as
+        // `collectCloseTagSuggestions` does, but in an edit of the indent
+        // alone: upstream's item replaces the indent and `<` too, filtered by
+        // `{indent}</{tag}`, and Zed filters an item by the text from its
+        // edit's start to the cursor (`\t<`) against its label (`/div`), so it
+        // never showed. The edit itself starts after `<`, as on one line.
+        let reindent = match (
             line_indent(text, tag_bracket),
             line_indent(text, after_open_bracket - 1),
-        ) && start_indent != end_indent
-        {
-            filter_text = format!("{end_indent}</{tag}");
-            range = replace(after_open_bracket - 1 - end_indent.len(), offset);
-            new_text = format!("{start_indent}</{tag}{close}");
-        }
+        ) {
+            (Some(start_indent), Some(end_indent)) if start_indent != end_indent => {
+                Some(vec![TextEdit {
+                    range: replace(
+                        after_open_bracket - 1 - end_indent.len(),
+                        after_open_bracket - 1,
+                    ),
+                    new_text: start_indent.to_string(),
+                }])
+            }
+            _ => None,
+        };
         items.push(CompletionItem {
             label: format!("/{tag}"),
             kind: Some(CompletionItemKind::PROPERTY),
-            filter_text: Some(filter_text),
+            filter_text: Some(format!("/{tag}")),
             insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
             text_edit: Some(lsp_types::CompletionTextEdit::Edit(TextEdit {
-                range,
-                new_text,
+                range: replace(after_open_bracket, name_end),
+                new_text: format!("/{tag}{close}"),
             })),
+            additional_text_edits: reindent,
             ..CompletionItem::default()
         });
     } else if !in_open_tag {
@@ -1399,6 +1409,28 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// The edits a close tag's item makes beside its own: the indent it fixes.
+    fn reindent(text: &str, offset: usize) -> Vec<(String, String)> {
+        completions(text, offset)
+            .into_iter()
+            .flat_map(|list| list.items)
+            .filter(|item| item.label.starts_with('/'))
+            .flat_map(|item| item.additional_text_edits.unwrap_or_default())
+            .map(|edit| {
+                (
+                    format!(
+                        "{}:{}-{}:{}",
+                        edit.range.start.line,
+                        edit.range.start.character,
+                        edit.range.end.line,
+                        edit.range.end.character
+                    ),
+                    edit.new_text,
+                )
+            })
+            .collect()
+    }
+
     fn after_slash(text: &str) -> usize {
         text.find("</").expect("an end tag") + 2
     }
@@ -1435,17 +1467,25 @@ mod tests {
         );
     }
 
+    /// A close tag on a line of its own takes its ancestor's indent, in an
+    /// edit of the indent alone. Upstream's item replaces the indent and `</`
+    /// too, filtered by `  </div`: Zed filters an item by the text from its
+    /// edit's start against its label, so that item was never shown.
     #[test]
-    fn a_differing_indent_replaces_the_whole_line_prefix() {
+    fn a_differing_indent_is_fixed_in_its_own_edit() {
         let text = "<div>\n  </\n</div>\n";
         assert_eq!(
             close_tags(text, after_slash(text)),
             [(
                 "/div".to_string(),
-                "  </div".to_string(),
-                "</div>".to_string(),
-                "1:0-1:4".to_string()
+                "/div".to_string(),
+                "/div>".to_string(),
+                "1:3-1:4".to_string()
             )]
+        );
+        assert_eq!(
+            reindent(text, after_slash(text)),
+            [("1:0-1:2".to_string(), String::new())]
         );
     }
 
@@ -1458,10 +1498,14 @@ mod tests {
             close_tags(text, after_slash(text)),
             [(
                 "/span".to_string(),
-                "    </span".to_string(),
-                "  </span>".to_string(),
-                "2:0-2:6".to_string()
+                "/span".to_string(),
+                "/span>".to_string(),
+                "2:5-2:6".to_string()
             )]
+        );
+        assert_eq!(
+            reindent(text, after_slash(text)),
+            [("2:0-2:4".to_string(), "  ".to_string())]
         );
     }
 
@@ -1476,14 +1520,14 @@ mod tests {
             let offered = close_tags(text, after_slash(text));
             assert_eq!(offered.len(), 1, "{text:?}");
             assert_eq!(offered[0].0, format!("/{tag}"), "{text:?}");
-            assert_eq!(offered[0].2, format!("</{tag}>"), "{text:?}");
+            assert_eq!(offered[0].2, format!("/{tag}>"), "{text:?}");
         }
     }
 
     #[test]
     fn a_following_bracket_drops_the_one_the_edit_would_add() {
         let text = "<div>\n  </>\n";
-        assert_eq!(close_tags(text, after_slash(text))[0].2, "</div");
+        assert_eq!(close_tags(text, after_slash(text))[0].2, "/div");
     }
 
     /// A void element, a self-closing element and an already-closed sibling
@@ -1525,7 +1569,8 @@ mod tests {
         let offered = close_tags(text, 9);
         assert_eq!(offered.len(), 1);
         assert_eq!(offered[0].0, "/div");
-        assert_eq!(offered[0].3, "1:0-1:3");
+        assert_eq!(offered[0].3, "1:3-1:3");
+        assert_eq!(reindent(text, 9), [("1:0-1:2".to_string(), String::new())]);
         assert!(close_tags("<\n", 1).is_empty());
         // A partly typed name is an open tag alone.
         assert!(close_tags("<div>\n  <sp\n</div>\n", 11).is_empty());
