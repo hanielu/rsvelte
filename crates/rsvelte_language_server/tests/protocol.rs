@@ -340,8 +340,10 @@ fn opt_into_lint(dir: &Path) {
     std::fs::write(dir.join("rsvelte-lint.json"), "{}").unwrap();
 }
 
-fn temp_component() -> PathBuf {
-    temp_dir("format").join("App.svelte")
+/// A component in a directory of its own: tests run in parallel, and each
+/// clears its directory first.
+fn temp_component(case: &str) -> PathBuf {
+    temp_dir(case).join("App.svelte")
 }
 
 fn file_uri(path: &Path) -> String {
@@ -489,7 +491,7 @@ fn did_open(server: &mut Server, uri: &str, text: &str) {
 
 #[test]
 fn serves_diagnostics_and_formatting() {
-    let path = temp_component();
+    let path = temp_component("format");
     let uri = file_uri(&path);
     // Lint rules run only for a project that opts in; this one does.
     opt_into_lint(path.parent().unwrap());
@@ -654,7 +656,7 @@ fn serves_diagnostics_and_formatting() {
 
 #[test]
 fn serves_pull_diagnostics_without_push_notifications() {
-    let path = temp_component();
+    let path = temp_component("pull-diagnostics");
     let uri = file_uri(&path);
     let mut server = Server::start();
     let id = server.request(
