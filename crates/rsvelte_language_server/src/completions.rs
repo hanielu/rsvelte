@@ -483,31 +483,88 @@ fn inside_moustache(text: &str, from: usize, offset: usize) -> bool {
 }
 
 /// `scanMatchingBraces`: the offset past the `}` that closes `start`, or
-/// nothing when the expression is still open at the end of the document.
+/// nothing when the expression is still open at the end of the document. It
+/// reads JavaScript enough to walk a script: a quoted string ends at its line,
+/// comments are skipped (as upstream, with the character after `*/`), and a
+/// template literal's `${}` nests. A regular expression is read as code, as
+/// upstream reads it.
 fn moustache_end(text: &str, start: usize) -> Option<usize> {
     let bytes = text.as_bytes();
-    let mut depth = 0u32;
+    if bytes.get(start) != Some(&b'{') {
+        return Some(start);
+    }
+    let mut depth = 0usize;
+    let mut templates = Vec::new();
     let mut i = start;
     while i < bytes.len() {
         match bytes[i] {
             b'{' => depth += 1,
             b'}' => {
                 depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(i + 1);
+                if depth == 0
+                    && let Some(outer) = templates.pop()
+                {
+                    depth = outer;
+                    i = template_stop(bytes, i, &mut depth, &mut templates);
                 }
             }
-            quote @ (b'"' | b'\'' | b'`') => {
+            quote @ (b'"' | b'\'') => {
                 i += 1;
-                while i < bytes.len() && bytes[i] != quote {
+                while i < bytes.len() && bytes[i] != quote && bytes[i] != b'\n' {
                     i += if bytes[i] == b'\\' { 2 } else { 1 };
                 }
             }
+            b'`' => i = template_stop(bytes, i + 1, &mut depth, &mut templates),
+            b'/' => match bytes.get(i + 1) {
+                Some(b'/') => {
+                    while i < bytes.len() && !matches!(bytes[i], b'\r' | b'\n') {
+                        i += 1;
+                    }
+                }
+                Some(b'*') => {
+                    i += 2;
+                    while i < bytes.len() {
+                        if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        i += 1;
+        if depth == 0 && templates.is_empty() {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// `scanTemplateString`: from `i`, the index of the template literal's closing
+/// backtick, or of the `$` of a `${`, which saves the depth it interrupts.
+fn template_stop(
+    bytes: &[u8],
+    mut i: usize,
+    depth: &mut usize,
+    templates: &mut Vec<usize>,
+) -> usize {
+    while i < bytes.len() {
+        match bytes[i] {
+            b'`' => return i,
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                templates.push(*depth);
+                *depth = 0;
+                return i;
+            }
+            b'\\' => i += 1,
             _ => {}
         }
         i += 1;
     }
-    None
+    i
 }
 
 /// `collectCloseTagSuggestions` (`htmlCompletion.js:96-141`). The ancestor's
@@ -1856,5 +1913,47 @@ mod tests {
         assert!(close_tags("<script>\n  const a = 1; //</\n</script>\n", 27).is_empty());
         assert!(close_tags("<style>\n  a { /* </ */ }\n</style>\n", 19).is_empty());
         assert!(close_tags("<div>{ </ }</div>\n", 9).is_empty());
+    }
+
+    /// `scanMatchingBraces` (`lib/documents/utils.ts`) reads what it walks
+    /// through as JavaScript enough to stay balanced: comments are skipped, a
+    /// quoted string ends at its line, a template literal's `${}` nests, and
+    /// (upstream's own quirk) the character after `*/` is skipped too. Each
+    /// end is what upstream's function answers for the same text.
+    #[test]
+    fn a_moustache_ends_where_scan_matching_braces_ends_it() {
+        for (text, end) in [
+            ("{ x }", Some(5)),
+            ("{ a // }\n}", Some(10)),
+            ("{ // It's\n}", Some(11)),
+            ("{ /* } */ }", Some(11)),
+            ("{ /* c */}", None),
+            ("{ \"a\n}", Some(6)),
+            ("{ \"a\\\"}\" }", Some(10)),
+            ("{ `a ${ \"}\" } b` }", Some(18)),
+            ("{ `${ `${ {} }` }` }", Some(20)),
+            ("{ a\n", None),
+        ] {
+            assert_eq!(moustache_end(text, 0), end, "{text:?}");
+        }
+    }
+
+    /// Markup after a script is checked for a moustache from the document's
+    /// start, through the script. Quotes alone took the apostrophe in a
+    /// `// It's …` comment for a string running past every later brace, so
+    /// the markup read as inside a moustache and got no Emmet.
+    #[test]
+    fn markup_after_a_script_with_an_apostrophe_in_a_comment_gets_emmet() {
+        let text = "<script lang=\"ts\">\n\tconst a = {\n\t\t// It's the first\n\t\tb: 1,\n\t};\n</script>\n\ndiv";
+        let list =
+            completions_with_strict_mode(text, text.len(), false, true, EmmetGates::all(), None);
+        let emmet = list
+            .map(|list| list.items)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|item| item.detail.as_deref() == Some("Emmet Abbreviation"))
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        assert_eq!(emmet, ["div"]);
     }
 }
