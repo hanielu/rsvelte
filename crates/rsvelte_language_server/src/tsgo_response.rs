@@ -2019,12 +2019,16 @@ mod tests {
 
     impl Workspace {
         fn new() -> Self {
+            // The clock alone can repeat across parallel tests (macOS counts
+            // microseconds), and one test's drop then removes another's files.
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
+            let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let root = std::env::temp_dir().join(format!(
-                "rsvelte-tsgo-response-{}-{nonce}",
+                "rsvelte-tsgo-response-{}-{nonce}-{next}",
                 std::process::id()
             ));
             fs::create_dir_all(&root).unwrap();
