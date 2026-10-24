@@ -80,9 +80,9 @@ use crate::tsgo_rename::{
 };
 use crate::tsgo_response::{
     RequestDocumentContext, TsgoResponseMapper, empty_completion_list,
-    filter_generated_inlay_hints, filter_source_inlay_hints, normalize_definition_result,
-    normalize_hover_result, rewrite_document_symbols, tsgo_unmapped_result,
-    widen_hover_range_over_string_quotes,
+    filter_generated_inlay_hints, filter_source_inlay_hints, normalize_completion_documentation,
+    normalize_definition_result, normalize_hover_result, rewrite_document_symbols,
+    tsgo_unmapped_result, widen_hover_range_over_string_quotes,
 };
 use crate::uri::{path_to_uri, uri_to_path};
 use crate::watchers::TsgoWatchers;
@@ -5448,6 +5448,7 @@ impl Server {
                             if let Some((uri, position)) = &completion_site_data {
                                 adopt_upstream_item_data(result, uri, position);
                             }
+                            normalize_completion_documentation(result);
                         }
                         "textDocument/codeAction" => {
                             if let Some(uri) = source_uri.as_ref()

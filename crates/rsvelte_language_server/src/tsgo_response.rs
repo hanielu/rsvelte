@@ -1249,6 +1249,23 @@ pub fn normalize_hover_result(result: &mut Value) {
     object.insert("contents".to_string(), Value::String(text));
 }
 
+/// A resolved completion item's Markdown documentation, which upstream's
+/// completion provider builds with the same `getMarkdownDocumentation` as a
+/// hover's (see [`upstream_documentation`]).
+pub fn normalize_completion_documentation(item: &mut Value) {
+    let Some(documentation) = item.get_mut("documentation") else {
+        return;
+    };
+    if documentation.get("kind").and_then(Value::as_str) != Some("markdown") {
+        return;
+    }
+    if let Some(value) = documentation.get_mut("value")
+        && let Some(text) = value.as_str()
+    {
+        *value = Value::String(upstream_documentation(text.trim_end_matches('\n')));
+    }
+}
+
 fn upstream_hover_text(value: &str) -> String {
     const FENCE: &str = "```typescript\n";
     let Some(rest) = value.strip_prefix(FENCE) else {
@@ -1258,11 +1275,241 @@ fn upstream_hover_text(value: &str) -> String {
         return value.trim_end_matches('\n').to_string();
     };
     let declaration = &rest[..end];
-    let documentation = rest[end + "\n```".len()..].trim_start_matches('\n');
+    let documentation =
+        upstream_documentation(rest[end + "\n```".len()..].trim_start_matches('\n'));
     if documentation.trim().is_empty() {
         format!("{FENCE}{declaration}\n```")
     } else {
         format!("{FENCE}{declaration}\n```\n---\n{documentation}")
+    }
+}
+
+/// tsgo's rendering of a quick info's JSDoc tags, rewritten as upstream's
+/// `getMarkdownDocumentation` (`plugins/typescript/previewer.ts`) renders
+/// them. tsgo fences every `@example` as `tsx`, around one that brings its
+/// own fence too, and puts a caption, a `@default` and a multi-line body on
+/// the tag's line; upstream keeps an example's own fence, fences the rest
+/// without a language and moves a multi-line body below the tag. The
+/// description, and tsgo's `{@link}` targets, are kept.
+fn upstream_documentation(documentation: &str) -> String {
+    let Some(first) = next_tag_start(documentation, 0) else {
+        return documentation.to_string();
+    };
+    let description = documentation[..first].trim_end_matches('\n');
+    let mut parts: Vec<String> = Vec::new();
+    if !description.is_empty() {
+        parts.push(description.to_string());
+    }
+    let mut at = first;
+    while at < documentation.len() {
+        let (tag, end) = parse_tsgo_tag(documentation, at);
+        parts.extend(tag.and_then(|tag| tag.upstream()));
+        at = next_tag_start(documentation, end).unwrap_or(documentation.len());
+    }
+    parts.join("\n\n")
+}
+
+/// One JSDoc tag as tsgo's hover writes it: `*@name*`, a backticked name for
+/// a parameter-like tag, then the comment; an example's caption and code.
+struct TsgoTag<'a> {
+    name: &'a str,
+    parameter: Option<&'a str>,
+    comment: String,
+    caption: Option<&'a str>,
+}
+
+/// The offset of the next `*@name*` at `from` or after a blank line.
+fn next_tag_start(text: &str, from: usize) -> Option<usize> {
+    let starts_tag = |at: usize| {
+        text[at..]
+            .strip_prefix("*@")
+            .and_then(|rest| rest.find('*').map(|end| &rest[..end]))
+            .is_some_and(|name| {
+                name.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+            })
+    };
+    if text.get(from..)?.is_empty() {
+        return None;
+    }
+    if (from == 0 || text[..from].ends_with("\n\n")) && starts_tag(from) {
+        return Some(from);
+    }
+    let mut search = from;
+    while let Some(relative) = text[search..].find("\n\n*@") {
+        let at = search + relative + 2;
+        if starts_tag(at) {
+            return Some(at);
+        }
+        search = at;
+    }
+    None
+}
+
+/// The tag at `at`, and the offset its text ends at.
+fn parse_tsgo_tag(text: &str, at: usize) -> (Option<TsgoTag<'_>>, usize) {
+    let header = &text[at + 2..];
+    let Some(name_end) = header.find('*') else {
+        return (None, text.len());
+    };
+    let name = &header[..name_end];
+    let body_start = at + 2 + name_end + 1;
+    if name == "example" {
+        return parse_tsgo_example(text, body_start);
+    }
+    let end = next_tag_start(text, body_start).unwrap_or(text.len());
+    let body = text[body_start..end].trim_end_matches('\n');
+    let (parameter, rest) = match body
+        .strip_prefix(" `")
+        .and_then(|rest| rest.split_once('`'))
+    {
+        Some((parameter, rest)) => (Some(parameter), rest),
+        None => (None, body),
+    };
+    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+    // tsgo puts `— ` before a comment that does not start with `- `.
+    let comment = rest.strip_prefix("— ").unwrap_or(rest);
+    let tag = TsgoTag {
+        name,
+        parameter,
+        comment: comment.to_string(),
+        caption: None,
+    };
+    (Some(tag), end)
+}
+
+/// tsgo's `*@example*[ — caption]\n` and the code in a fence of at least
+/// three backticks, longer than any run in the code.
+fn parse_tsgo_example(text: &str, body_start: usize) -> (Option<TsgoTag<'_>>, usize) {
+    let line_end = text[body_start..]
+        .find('\n')
+        .map_or(text.len(), |end| body_start + end);
+    let caption = text[body_start..line_end].strip_prefix(" — ");
+    let fence_start = (line_end + 1).min(text.len());
+    let ticks = text[fence_start..]
+        .bytes()
+        .take_while(|byte| *byte == b'`')
+        .count();
+    let mut code = String::new();
+    let mut end = line_end;
+    if ticks >= 3
+        && let Some(open_end) = text[fence_start..].find('\n')
+    {
+        let code_start = fence_start + open_end + 1;
+        let close = format!("\n{}", "`".repeat(ticks));
+        let code_end = text[code_start - 1..]
+            .match_indices(&close)
+            .map(|(index, _)| code_start - 1 + index)
+            .find(|&index| {
+                let after = index + close.len();
+                text[after..].is_empty() || text[after..].starts_with('\n')
+            })
+            .unwrap_or(text.len());
+        code = text[code_start..code_end.max(code_start)].to_string();
+        end = (code_end + close.len()).min(text.len());
+    }
+    let tag = TsgoTag {
+        name: "example",
+        parameter: None,
+        comment: code,
+        caption,
+    };
+    (Some(tag), end)
+}
+
+impl TsgoTag<'_> {
+    /// `getTagDocumentation`.
+    fn upstream(&self) -> Option<String> {
+        if matches!(self.name, "augments" | "extends" | "param" | "template") {
+            // `getWithType`: the tag's text split into its first word and the
+            // rest, less a `-` between them.
+            let text = match self.parameter {
+                Some(parameter) if self.comment.is_empty() => parameter.to_string(),
+                Some(parameter) => format!("{parameter} {}", self.comment),
+                None => self.comment.clone(),
+            };
+            let text = text.trim_start_matches(char::is_whitespace);
+            if text.is_empty() {
+                return None;
+            }
+            let (parameter, doc) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+            let doc = doc.trim_start();
+            let doc = doc.strip_prefix('-').unwrap_or(doc).trim_start();
+            let label = format!("*@{}* `{parameter}`", self.name);
+            return Some(with_body(label, doc));
+        }
+        let label = format!("*@{}*", self.name);
+        // Upstream's text for any other named tag (`@property x`) starts with
+        // the name.
+        let comment = match self.parameter {
+            Some(parameter) if self.comment.is_empty() => parameter.to_string(),
+            Some(parameter) => format!("{parameter} {}", self.comment),
+            None => self.comment.clone(),
+        };
+        let body = match self.name {
+            "example" if self.comment.is_empty() => String::new(),
+            "example" => match self.caption {
+                Some(caption) => format!("{caption}\n\n{}", code_block(&self.comment)),
+                None => code_block(&self.comment),
+            },
+            "author" => without_email_brackets(&comment),
+            "default" if !comment.is_empty() => code_block(&comment),
+            _ => comment,
+        };
+        Some(with_body(label, &body))
+    }
+}
+
+/// A tag's label and body: a one-line body after ` — `, a longer one below.
+fn with_body(label: String, body: &str) -> String {
+    if body.is_empty() {
+        label
+    } else if body.contains('\n') {
+        format!("{label}  \n{body}")
+    } else {
+        format!("{label} — {body}")
+    }
+}
+
+/// `makeCodeblock`: text already starting with a fence stays as it is.
+fn code_block(text: &str) -> String {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        text.to_string()
+    } else {
+        format!("```\n{text}\n```")
+    }
+}
+
+/// `makeEmailTag`: `Jane <jane@example.com>` → `Jane jane@example.com`, which
+/// a Markdown renderer would otherwise drop as an HTML tag.
+fn without_email_brackets(text: &str) -> String {
+    let is_email = |candidate: &str| {
+        candidate.split_once('@').is_some_and(|(user, host)| {
+            let part = |s: &str| {
+                !s.is_empty()
+                    && s.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            };
+            part(user) && part(host)
+        })
+    };
+    if text.contains('\n') {
+        return text.to_string();
+    }
+    let Some(open) = text.rfind('<') else {
+        return text.to_string();
+    };
+    let Some(close) = text[open..].find('>').map(|end| open + end) else {
+        return text.to_string();
+    };
+    let before = &text[..open];
+    let email = &text[open + 1..close];
+    match before.strip_suffix(char::is_whitespace) {
+        Some(name) if !name.is_empty() && is_email(email) => format!("{name} {email}"),
+        _ => text.to_string(),
     }
 }
 
@@ -2559,6 +2806,74 @@ mod tests {
             documented["contents"],
             json!("```typescript\nfunction $props(): any\n```\n---\nDeclares the props.")
         );
+    }
+
+    /// What tsgo's hover writes for each JSDoc tag, and what upstream's
+    /// `getMarkdownDocumentation` writes for the same comment (both recorded
+    /// over the LSP from one fixture; tsgo's `{@link}` targets are kept).
+    #[test]
+    fn jsdoc_tags_are_rendered_as_upstream_renders_them() {
+        let cases = [
+            (
+                "Fenced example.\n\n*@example*\n````tsx\n```svelte\n<Control>\n  {#snippet children({ props })}\n    <input {...props} />\n  {/snippet}\n</Control>\n```\n\n### Snippet Props\n- `props` - spreadable.\n````\n",
+                "Fenced example.\n\n*@example*  \n```svelte\n<Control>\n  {#snippet children({ props })}\n    <input {...props} />\n  {/snippet}\n</Control>\n```\n\n### Snippet Props\n- `props` - spreadable.",
+            ),
+            (
+                "Plain example.\n\n*@example*\n```tsx\nconst x = plain(1);\nconsole.log(x);\n```\n",
+                "Plain example.\n\n*@example*  \n```\nconst x = plain(1);\nconsole.log(x);\n```",
+            ),
+            (
+                "Captioned.\n\n*@example* — Adding\n```tsx\nadd(1, 2);\n```\n",
+                "Captioned.\n\n*@example*  \nAdding\n\n```\nadd(1, 2);\n```",
+            ),
+            (
+                "One line example.\n\n*@example*\n```tsx\ninline(1)\n```\n",
+                "One line example.\n\n*@example*  \n```\ninline(1)\n```",
+            ),
+            (
+                "Params and more.\n\n*@param* `a` - the first\n\n*@param* `b` — the second\n\n*@param* `c` — multi line\ndescription\n\n*@returns* — the sum\n\n*@throws* — {Error} when bad\n\n*@deprecated* — use [add](file:///w/docs.ts#31,17-31,20) instead\n\n*@see* — https://example.com\n\n*@see* — [Svelte docs](https://svelte.dev)\n\n*@author* — Jane Doe <jane@example.com>\n\n*@default* — 42\n\n*@since* — 1.0\n\n*@template* `T` — the type",
+                "Params and more.\n\n*@param* `a` — the first\n\n*@param* `b` — the second\n\n*@param* `c`  \nmulti line\ndescription\n\n*@returns* — the sum\n\n*@throws* — {Error} when bad\n\n*@deprecated* — use [add](file:///w/docs.ts#31,17-31,20) instead\n\n*@see* — https://example.com\n\n*@see* — [Svelte docs](https://svelte.dev)\n\n*@author* — Jane Doe jane@example.com\n\n*@default*  \n```\n42\n```\n\n*@since* — 1.0\n\n*@template* `T` — the type",
+            ),
+            (
+                "*@example*\n```tsx\nfirst()\n```\n\n\n*@returns* — next",
+                "*@example*  \n```\nfirst()\n```\n\n*@returns* — next",
+            ),
+            (
+                "No tags, and `code` and **bold**.\n\nSecond paragraph.",
+                "No tags, and `code` and **bold**.\n\nSecond paragraph.",
+            ),
+        ];
+        for (tsgo, upstream) in cases {
+            let mut result = json!({ "contents": { "kind": "markdown", "value": format!("```typescript\nconst x: 1\n```\n{tsgo}") } });
+            normalize_hover_result(&mut result);
+            assert_eq!(
+                result["contents"],
+                json!(format!("```typescript\nconst x: 1\n```\n---\n{upstream}")),
+                "{tsgo}"
+            );
+        }
+    }
+
+    /// A resolved completion item's Markdown documentation is the same
+    /// `getMarkdownDocumentation` upstream; a plain-text one is left alone.
+    #[test]
+    fn completion_documentation_renders_jsdoc_tags_as_upstream() {
+        let mut markdown = json!({
+            "label": "inline",
+            "documentation": { "kind": "markdown", "value": "One line example.\n\n*@example*\n```tsx\ninline(1)\n```\n" }
+        });
+        normalize_completion_documentation(&mut markdown);
+        assert_eq!(
+            markdown["documentation"]["value"],
+            json!("One line example.\n\n*@example*  \n```\ninline(1)\n```")
+        );
+        let plain_text = json!({
+            "label": "inline",
+            "documentation": { "kind": "plaintext", "value": "One line example.\n\n@example\n```tsx\ninline(1)\n```\n" }
+        });
+        let mut unchanged = plain_text.clone();
+        normalize_completion_documentation(&mut unchanged);
+        assert_eq!(unchanged, plain_text);
     }
 
     #[test]
