@@ -1969,21 +1969,33 @@ impl TsgoOverlay {
         if let Some(mapped) = self.map_generated_range(shadow_path, range) {
             return Some(mapped);
         }
-        if !self.is_projected_shadow(shadow_path)
-            || self
-                .map_generated_position(shadow_path, range.start)
-                .is_some()
-        {
+        if !self.is_projected_shadow(shadow_path) {
             return None;
         }
         let text = self.shadow_text(shadow_path)?;
         let start = utf8_offset(text, range.start);
         let end = utf8_offset(text, range.end).max(start);
-        if is_in_generated_code(text, start, end) {
+        let file_start = Range::new(Position::new(0, 1), Position::new(0, 1));
+        // The module itself: tsrs answers a component imported through a
+        // `paths` alias with its whole shadow (from the first token after the
+        // `///<reference>` to the end), where TypeScript answers the empty
+        // range at the top; neither maps, so both land at the file's start.
+        if end >= text.trim_end().len()
+            && text[..start].lines().all(|line| {
+                let line = line.trim();
+                line.is_empty() || line.starts_with("//")
+            })
+        {
+            return Some(file_start);
+        }
+        if self
+            .map_generated_position(shadow_path, range.start)
+            .is_some()
+            || is_in_generated_code(text, start, end)
+        {
             return None;
         }
-        let start = Position::new(0, 1);
-        Some(Range::new(start, start))
+        Some(file_start)
     }
 
     /// Whether a tsgo position falls inside an `Ωignore` generated-code region.

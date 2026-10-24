@@ -2310,6 +2310,48 @@ mod tests {
         assert_eq!(references, json!([]));
     }
 
+    /// tsrs answers a module specifier that a `paths` alias resolves to a
+    /// component (`"$lib/x.svelte"`) with the whole shadow — the first token
+    /// after `///<reference>` to the end — where a relative one gets the
+    /// empty range at the top. Both are the module itself.
+    #[test]
+    fn a_definition_spanning_the_whole_shadow_lands_at_the_start_of_its_file() {
+        let source = "<script lang=\"ts\">\n\tlet { label }: { label: string } = $props();\n</script>\n<p>{label}</p>\n";
+        let (_workspace, path, overlay) = overlay(source);
+        let shadow = overlay.shadow_for_source(&path).unwrap();
+        let shadow_path = uri_to_path(shadow.shadow_uri.as_str());
+        assert!(shadow.text.starts_with("///<reference"), "{}", shadow.text);
+        // tsgo's shadow positions count UTF-8 bytes, and the shadow's last
+        // line holds `Ω`s.
+        let utf8_position = |offset: usize| {
+            let before = &shadow.text[..offset];
+            let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+            Position::new(
+                u32::try_from(before.matches('\n').count()).unwrap(),
+                u32::try_from(offset - line_start).unwrap(),
+            )
+        };
+        let first_token = shadow.text.find('\n').unwrap() + 1;
+        let whole = Range::new(utf8_position(first_token), utf8_position(shadow.text.len()));
+        assert_eq!(overlay.map_generated_range(&shadow_path, whole), None);
+        let mut result = json!([{
+            "targetUri": shadow.shadow_uri.as_str(),
+            "targetRange": json_range(whole),
+            "targetSelectionRange": json_range(whole),
+        }]);
+        let mapper = TsgoResponseMapper::new(&overlay);
+        assert!(mapper.map_response("textDocument/definition", &mut result));
+        let start = Range::new(Position::new(0, 1), Position::new(0, 1));
+        assert_eq!(
+            result,
+            json!([{
+                "targetUri": shadow.source_uri.as_str(),
+                "targetRange": json_range(start),
+                "targetSelectionRange": json_range(start),
+            }])
+        );
+    }
+
     #[test]
     fn generated_array_elements_are_dropped() {
         let source = "<script>let value;</script><p>{value}</p>";
