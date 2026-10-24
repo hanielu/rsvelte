@@ -7,7 +7,7 @@ use regex::{Captures, Regex};
 use serde_json::{Value, json};
 
 use crate::text::LineIndex;
-use crate::uri::uri_to_path;
+use crate::uri::{path_to_uri, uri_to_path};
 
 pub const COMMAND: &str = "extract_to_svelte_component";
 
@@ -65,7 +65,9 @@ pub fn component(
         .ok_or_else(|| "Invalid selection range".to_string())?;
     let old_path = uri_to_path(uri);
     let new_path = old_path.parent().unwrap_or(Path::new(".")).join(&file_path);
-    let new_uri = file_uri(&new_path);
+    let new_uri = path_to_uri(&new_path)
+        .ok_or_else(|| "Invalid selection range".to_string())?
+        .to_string();
 
     let mut new_source = format!("{}\n\n", &source[start..end]);
     let mut tags: Vec<(usize, usize)> = [
@@ -204,10 +206,6 @@ fn boundary(source: &str, offset: usize, start: bool) -> bool {
     adjacent.is_none_or(|c| c.is_whitespace() || !c.is_alphanumeric() && c != '_')
 }
 
-fn file_uri(path: &Path) -> String {
-    format!("file://{}", path.to_string_lossy().replace(' ', "%20"))
-}
-
 fn zero() -> Value {
     json!({ "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } })
 }
@@ -243,6 +241,29 @@ mod tests {
         assert_eq!(
             edit["documentChanges"][2]["edits"][0]["newText"],
             "<p>extract me</p>\n\n<script>\nlet x = 1;\n</script>\n\n<style>p { color: blue; }</style>\n\n"
+        );
+    }
+
+    /// What a Windows editor sends: a drive path, which the joined path
+    /// carries on with a `\`.
+    #[cfg(windows)]
+    #[test]
+    fn a_component_beside_a_windows_document_gets_a_file_uri() {
+        let source = "<p>extract me</p>";
+        let edit = component(
+            source,
+            "file:///C:/w/src/App.svelte",
+            Range::new(Position::new(0, 0), Position::new(0, 17)),
+            "NewComp",
+        )
+        .unwrap();
+        assert_eq!(
+            edit["documentChanges"][1]["uri"],
+            "file:///C:/w/src/./NewComp.svelte"
+        );
+        assert_eq!(
+            edit["documentChanges"][2]["textDocument"]["uri"],
+            "file:///C:/w/src/./NewComp.svelte"
         );
     }
 
