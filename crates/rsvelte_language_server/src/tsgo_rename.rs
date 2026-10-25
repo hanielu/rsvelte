@@ -7,6 +7,7 @@
 //! has no transport or server-loop state.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use lsp_types::{Position, Range, Uri};
 use rsvelte_projection::{ByteRange, ProjectionMap};
@@ -16,6 +17,7 @@ use sourcemap::SourceMap;
 use crate::context::{ScriptOpeningTags, attribute_context};
 use crate::text::LineIndex;
 use crate::tsgo_overlay::is_in_generated_code;
+use crate::uri::uri_to_path;
 
 const STORE_GET: &str = "__sveltets_2_store_get(";
 const PROPS_RETURN: &str = "\nreturn { props: {";
@@ -214,7 +216,9 @@ pub fn rewrite_prepare_response(
         (parse_range(&response)?, false)
     };
     let (uri, _, _) = plan.request()?;
-    let document = document_by_shadow(documents, uri.as_str())?;
+    let document = documents_by_shadow(documents)
+        .get(&uri_to_path(uri.as_str()))
+        .copied()?;
     let mapped = map_generated_range(document, range)?;
     if wrapped {
         let mut object = response.as_object()?.clone();
@@ -242,6 +246,7 @@ pub fn rewrite_workspace_edit(
     let mut edits = Vec::new();
     let mut followups = Vec::new();
     let mut opening_tags = BTreeMap::new();
+    let by_shadow = documents_by_shadow(documents);
     visit_workspace_edits(response, |uri, edit| {
         let Some(range) = edit.get("range").and_then(parse_range) else {
             return;
@@ -250,7 +255,7 @@ pub fn rewrite_workspace_edit(
             .get("newText")
             .and_then(Value::as_str)
             .unwrap_or(new_name);
-        let Some(document) = document_by_shadow(documents, uri) else {
+        let Some(document) = by_shadow.get(&uri_to_path(uri)).copied() else {
             edits.push(EditorEdit {
                 uri: uri.to_string(),
                 range,
@@ -835,14 +840,19 @@ const fn is_tag_name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_' | b'.')
 }
 
-fn document_by_shadow<'a>(
-    documents: &'a [RenameDocument<'a>],
-    uri: &str,
-) -> Option<RenameDocument<'a>> {
-    documents
-        .iter()
-        .find(|document| document.shadow_uri.as_str() == uri)
-        .copied()
+/// The documents by their shadow's path, which is what names one in tsgo's
+/// answer: it spells a Windows drive its own way, `file:///c%3A/…` for the
+/// `file:///C:/…` it was sent.
+fn documents_by_shadow<'a>(
+    documents: &[RenameDocument<'a>],
+) -> BTreeMap<PathBuf, RenameDocument<'a>> {
+    let mut by_shadow = BTreeMap::new();
+    for document in documents {
+        by_shadow
+            .entry(uri_to_path(document.shadow_uri.as_str()))
+            .or_insert(*document);
+    }
+    by_shadow
 }
 
 fn visit_workspace_edits(edit: &Value, mut visit: impl FnMut(&str, &Value)) {
@@ -1177,6 +1187,43 @@ mod tests {
         let rewritten = rewrite_workspace_edit(&plan, &response, &[document], "renamed", true);
         let edits = rewritten.edit["changes"][source_uri.as_str()].clone();
         assert_eq!(edits[0]["newText"], "$renamed", "{edits}");
+    }
+
+    /// tsgo answers with its own spelling of a Windows drive: `file:///c%3A/…`
+    /// for the `file:///C:/…` it was sent. The edit is still the shadow's.
+    #[cfg(windows)]
+    #[test]
+    fn an_edit_in_tsgos_spelling_of_the_drive_maps_to_the_component() {
+        let source_uri = uri("file:///C:/w/src/Input.svelte");
+        let shadow_uri = uri("file:///C:/w/.cache/src/Input.svelte.tsx");
+        let tsgo_uri = uri("file:///c%3A/w/.cache/src/Input.svelte.tsx");
+        let source = "<script>let value = 1;</script>{value}";
+        let artifact = project(source);
+        let document = view(&source_uri, &shadow_uri, source, &artifact);
+        let declaration = source.find("value").unwrap();
+        let generated = artifact
+            .exact_mappings
+            .as_ref()
+            .unwrap()
+            .source_to_generated(u32::try_from(declaration).unwrap())
+            .first()
+            .copied()
+            .unwrap() as usize;
+        let response = edit(
+            &tsgo_uri,
+            "renamed",
+            utf8_position(&artifact.code, generated),
+            utf8_position(&artifact.code, generated + "value".len()),
+        );
+        let index = LineIndex::new(source);
+        let start = index.position(source, declaration);
+        let end = index.position(source, declaration + "value".len());
+        let plan = prepare_rename_plan(document, start);
+        let rewritten = rewrite_workspace_edit(&plan, &response, &[document], "renamed", true);
+        assert_eq!(
+            rewritten.edit,
+            json!({"changes": {source_uri.as_str(): [{"range": range_value(Range::new(start, end)), "newText": "renamed"}]}})
+        );
     }
 
     #[test]

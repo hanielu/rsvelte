@@ -6,6 +6,8 @@ use std::path::{Component, Path, PathBuf};
 use lsp_types::{Location, Position, Range, Uri};
 use serde_json::{Map, Value, json};
 
+use crate::uri::uri_to_path;
+
 const COMPONENT_SUFFIX: &str = "__SvelteComponent_";
 const MODULE_EXTENSIONS: &[&str] = &[
     "ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs", "svelte",
@@ -378,25 +380,25 @@ fn rewrite_shadow_specifiers(text: &str, pairs: &[ShadowUriPair<'_>]) -> String 
     result
 }
 
-fn source_uri_for<'a>(uri: &str, pairs: &'a [ShadowUriPair<'_>]) -> Option<&'a str> {
-    pairs
-        .iter()
-        .find(|pair| pair.shadow_uri.as_str() == uri)
-        .map(|pair| pair.source_uri.as_str())
-}
-
+/// The editor's URI for a document of tsgo's answer, matched by path: tsgo
+/// spells a Windows drive its own way, `file:///c%3A/…` for `file:///C:/…`.
 fn result_uri_for<'a>(
     uri: &str,
     mappings: &'a [WillRenameMapping<'_>],
     pairs: &'a [ShadowUriPair<'_>],
 ) -> Option<&'a str> {
+    let path = uri_to_path(uri);
+    let names = |other: &Uri| uri_to_path(other.as_str()) == path;
     mappings
         .iter()
-        .find(|mapping| {
-            mapping.old.shadow_uri.as_str() == uri || mapping.old.source_uri.as_str() == uri
-        })
+        .find(|mapping| names(mapping.old.shadow_uri) || names(mapping.old.source_uri))
         .map(|mapping| mapping.new.source_uri.as_str())
-        .or_else(|| source_uri_for(uri, pairs))
+        .or_else(|| {
+            pairs
+                .iter()
+                .find(|pair| names(pair.shadow_uri))
+                .map(|pair| pair.source_uri.as_str())
+        })
 }
 
 fn edit_count(change: &Value) -> usize {
@@ -1032,6 +1034,42 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    /// tsgo keys its edits by its own spelling of a Windows drive,
+    /// `file:///c%3A/…` for the `file:///C:/…` it was sent: the renamed
+    /// component's edits still go to its new name, once.
+    #[cfg(windows)]
+    #[test]
+    fn will_rename_result_maps_tsgos_spelling_of_the_drive() {
+        let imported_source = uri("file:///C:/w/Imported.svelte");
+        let imported_shadow = uri("file:///C:/cache/Imported.svelte.tsx");
+        let renamed_source = uri("file:///C:/w/Documentation.svelte");
+        let renamed_shadow = uri("file:///C:/cache/Documentation.svelte.tsx");
+        let mapping = WillRenameMapping {
+            old: ShadowUriPair {
+                source_uri: &imported_source,
+                shadow_uri: &imported_shadow,
+            },
+            new: ShadowUriPair {
+                source_uri: &renamed_source,
+                shadow_uri: &renamed_shadow,
+            },
+        };
+        let edit = |line: u32, text: &str| json!({ "range": { "start": { "line": line, "character": 0 }, "end": { "line": line, "character": 1 } }, "newText": text });
+        let mut result = json!({
+            "changes": {
+                "file:///c%3A/cache/Imported.svelte.tsx": [edit(0, "old")],
+                "file:///c%3A/cache/Documentation.svelte.tsx": [edit(0, "new"), edit(1, "newer")],
+            }
+        });
+
+        rewrite_will_rename_result(&mut result, &[mapping], &[]);
+
+        assert_eq!(
+            result,
+            json!({ "changes": { renamed_source.as_str(): [edit(0, "new"), edit(1, "newer")] } })
         );
     }
 
