@@ -304,6 +304,9 @@ pub struct TsgoOverlay {
     engine: ProjectionEngine,
     accessors: bool,
     namespace: Svelte2TsxNamespace,
+    /// The namespace svelte2tsx types elements against
+    /// ([`typings_namespace`]).
+    typings_namespace: String,
     entries: BTreeMap<PathBuf, ShadowState>,
     by_shadow: BTreeMap<PathBuf, PathBuf>,
     /// Whether the members have been discovered and projected. A deferred
@@ -672,6 +675,7 @@ impl TsgoOverlay {
         let tsconfig_path = cache_dir.join(OVERLAY_TSCONFIG);
         let svelte_fallback = fallback_svelte_types(&workspace, svelte_fallback_root, &cache_dir);
         let compiler = rsvelte_check::config::load_compiler_options(&workspace);
+        let typings_namespace = typings_namespace(&workspace, source_tsconfig.as_deref());
         let mut overlay = Self {
             workspace,
             mirror_root,
@@ -683,6 +687,7 @@ impl TsgoOverlay {
             engine: ProjectionEngine::new(),
             accessors: compiler.projection_accessors(),
             namespace: compiler.projection_namespace(),
+            typings_namespace,
             entries: BTreeMap::new(),
             by_shadow: BTreeMap::new(),
             loaded: false,
@@ -2231,6 +2236,7 @@ impl TsgoOverlay {
             mode: Svelte2TsxMode::Ts,
             accessors: self.accessors,
             namespace: self.namespace,
+            typings_namespace: self.typings_namespace.clone(),
             version: SvelteVersion::V5,
             runes: None,
             emit_jsdoc: true,
@@ -2915,6 +2921,40 @@ fn overlay_target(tsconfig: Option<&Path>) -> Option<&'static str> {
             matches!(target.to_ascii_lowercase().as_str(), "es3" | "es5").then_some("ES2015")
         }
     }
+}
+
+/// `typingsNamespace` (`service.ts`): the namespace svelte2tsx types elements
+/// against — the project config's own `svelteOptions.namespace` (not one it
+/// extends), `svelteHTML` without one, and `svelteNative.JSX` wherever
+/// svelte-native is installed and `jsxFactory` names no Svelte factory.
+fn typings_namespace(workspace: &Path, tsconfig: Option<&Path>) -> String {
+    let svelte_factory = tsconfig
+        .and_then(|tsconfig| resolve_compiler_option(tsconfig, "jsxFactory"))
+        .is_some_and(|factory| factory.starts_with("svelte"));
+    let svelte_native = ["@nativescript-community/svelte-native", "svelte-native"]
+        .into_iter()
+        .any(|name| {
+            workspace.ancestors().any(|dir| {
+                dir.join("node_modules")
+                    .join(name)
+                    .join("package.json")
+                    .is_file()
+            })
+        });
+    if !svelte_factory && svelte_native {
+        return "svelteNative.JSX".to_string();
+    }
+    tsconfig
+        .and_then(|tsconfig| fs::read_to_string(tsconfig).ok())
+        .and_then(|raw| parse_jsonc(&raw))
+        .and_then(|config| {
+            config
+                .pointer("/svelteOptions/namespace")
+                .and_then(serde_json::Value::as_str)
+                .filter(|namespace| !namespace.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "svelteHTML".to_string())
 }
 
 fn resolve_compiler_option(tsconfig: &Path, key: &str) -> Option<String> {
@@ -6004,6 +6044,72 @@ mod tests {
         assert_eq!(
             nearest_tsconfig(&root.join("src/App.svelte"), &root),
             Some(root.join("tsconfig.json"))
+        );
+    }
+
+    /// `typingsNamespace` (`service.ts`): a project config's own
+    /// `svelteOptions.namespace` is what its elements type against, as
+    /// svelte-lynx's `svelteLynx` is; upstream reads the config's raw JSON, so
+    /// a namespace it only extends does not count.
+    #[test]
+    fn a_projects_svelte_options_namespace_types_its_elements() {
+        let workspace = TestWorkspace::new("typings-namespace");
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
+        let component = root.join("src/App.svelte");
+        write(&component, "<view ontap={() => {}}></view>\n");
+        let shadow =
+            |overlay: &TsgoOverlay| overlay.shadow_for_source(&component).unwrap().text.clone();
+
+        let overlay = TsgoOverlay::build_with(&root, None, None).unwrap();
+        assert!(shadow(&overlay).contains("svelteHTML.createElement(\"view\""));
+
+        write(
+            &root.join("tsconfig.json"),
+            r#"{ "svelteOptions": { "namespace": "svelteLynx" } }"#,
+        );
+        let overlay = TsgoOverlay::build_with(&root, None, None).unwrap();
+        let text = shadow(&overlay);
+        assert!(text.contains("svelteLynx.createElement(\"view\""), "{text}");
+        assert!(!text.contains("svelteHTML."), "{text}");
+
+        write(
+            &root.join("base.json"),
+            r#"{ "svelteOptions": { "namespace": "svelteLynx" } }"#,
+        );
+        write(
+            &root.join("tsconfig.json"),
+            r#"{ "extends": "./base.json" }"#,
+        );
+        let overlay = TsgoOverlay::build_with(&root, None, None).unwrap();
+        assert!(shadow(&overlay).contains("svelteHTML.createElement(\"view\""));
+    }
+
+    /// Upstream switches a project with svelte-native installed to
+    /// `svelteNative.JSX`, over its own namespace, unless `jsxFactory` names a
+    /// Svelte one.
+    #[test]
+    fn svelte_native_types_elements_against_its_jsx_namespace() {
+        let workspace = TestWorkspace::new("typings-namespace-native");
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
+        write(
+            &root.join("node_modules/svelte-native/package.json"),
+            r#"{ "name": "svelte-native" }"#,
+        );
+        write(
+            &root.join("tsconfig.json"),
+            r#"{ "svelteOptions": { "namespace": "svelteLynx" } }"#,
+        );
+        assert_eq!(
+            typings_namespace(&root, Some(&root.join("tsconfig.json"))),
+            "svelteNative.JSX"
+        );
+        write(
+            &root.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "jsxFactory": "svelte.h" }, "svelteOptions": { "namespace": "svelteLynx" } }"#,
+        );
+        assert_eq!(
+            typings_namespace(&root, Some(&root.join("tsconfig.json"))),
+            "svelteLynx"
         );
     }
 
