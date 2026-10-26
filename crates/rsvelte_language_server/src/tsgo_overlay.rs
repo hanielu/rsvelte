@@ -2594,6 +2594,11 @@ impl TsgoOverlay {
                 "allowImportingTsExtensions": true,
                 "jsx": "preserve",
                 "noEmit": true,
+                // Shadows import a component as `"$lib/x.svelte.tsx"`, and
+                // with this on TypeScript reports every such non-relative
+                // import as one it cannot rewrite on emit (TS2877). Nothing is
+                // emitted, and upstream's imports keep `.svelte`.
+                "rewriteRelativeImportExtensions": false,
                 "rootDirs": self.overlay_root_dirs()
             },
             "files": files,
@@ -6082,6 +6087,27 @@ mod tests {
         );
         let overlay = TsgoOverlay::build_with(&root, None, None).unwrap();
         assert!(shadow(&overlay).contains("svelteHTML.createElement(\"view\""));
+    }
+
+    /// doctors-portal's `rewriteRelativeImportExtensions: true` made every
+    /// shadow import of a component through an alias (`"#lib/x.svelte.tsx"`)
+    /// a TS2877 error; the overlay emits nothing, so it turns the option off.
+    #[test]
+    fn the_overlay_does_not_rewrite_import_extensions() {
+        let workspace = TestWorkspace::new("rewrite-import-extensions");
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
+        write(
+            &root.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "rewriteRelativeImportExtensions": true } }"#,
+        );
+        write(&root.join("src/App.svelte"), "<p />");
+        let overlay = TsgoOverlay::build_with(&root, None, None).unwrap();
+        let config = overlay_config(&overlay);
+        assert_eq!(
+            config["compilerOptions"]["rewriteRelativeImportExtensions"],
+            json!(false)
+        );
+        assert!(config["extends"].is_string());
     }
 
     /// Upstream switches a project with svelte-native installed to
