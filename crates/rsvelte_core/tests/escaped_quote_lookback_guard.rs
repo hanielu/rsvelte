@@ -35,6 +35,18 @@ const ALLOWED: &[(&str, &str)] = &[
         "crates/rsvelte_core/src/compiler/phases/1_parse/read/strict_mode.rs",
         r"if b[i] != b'\\' {",
     ),
+    // emmet-helper's `escapeNonTabStopDollar` and `replaceTabStopsWithCursors`,
+    // regexes that require one character other than a backslash before `$`
+    // (`/([^\\])\$…/`), ported as written: a match condition on the current
+    // character, not a test of whether a quote is escaped.
+    (
+        "crates/rsvelte_language_server/src/emmet/mod.rs",
+        r"if i + 2 < chars.len() && chars[i] != '\\' && chars[i + 1] == '$' && chars[i + 2] != '{' {",
+    ),
+    (
+        "crates/rsvelte_language_server/src/emmet/mod.rs",
+        r"if chars[i] != '\\'",
+    ),
 ];
 
 /// A minimum file count, so a walk that silently reaches nothing fails instead
