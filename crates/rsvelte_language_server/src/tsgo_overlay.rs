@@ -3094,7 +3094,7 @@ fn resolve_extends_target(base: &Path, specifier: &str) -> Option<PathBuf> {
     let mut cursor = Some(absolute_normalized(base));
     while let Some(directory) = cursor {
         let candidate = directory.join("node_modules").join(specifier);
-        for path in config_path_candidates(candidate) {
+        for path in package_config_candidates(candidate) {
             if path.is_file() {
                 return Some(path);
             }
@@ -3102,6 +3102,24 @@ fn resolve_extends_target(base: &Path, specifier: &str) -> Option<PathBuf> {
         cursor = directory.parent().map(Path::to_path_buf);
     }
     None
+}
+
+/// TypeScript's `nodeNextJsonConfigResolver` order for a package's config:
+/// the file first (`X.json`, or `X` when it names one), then the directory's
+/// `tsconfig.json`. SvelteKit's generated `$app/tsconfig` has both a
+/// `tsconfig.json` and a `tsconfig/` beside it, and the file is the config.
+fn package_config_candidates(path: PathBuf) -> Vec<PathBuf> {
+    let file = if path
+        .extension()
+        .is_some_and(|extension| extension == "json")
+    {
+        path.clone()
+    } else {
+        let mut json = path.clone().into_os_string();
+        json.push(".json");
+        PathBuf::from(json)
+    };
+    vec![file, path.join("tsconfig.json")]
 }
 
 fn resolve_extends_path(base: &Path, specifier: &str) -> PathBuf {
@@ -6108,6 +6126,33 @@ mod tests {
             json!(false)
         );
         assert!(config["extends"].is_string());
+    }
+
+    /// `"extends": "$app/tsconfig"` (SvelteKit's generated package) names the
+    /// file `node_modules/$app/tsconfig.json`, which sits beside a `tsconfig/`
+    /// directory holding no `tsconfig.json`: TypeScript tries the file first.
+    #[test]
+    fn a_package_extends_is_the_file_before_the_directory() {
+        let workspace = TestWorkspace::new("package-extends");
+        let root = crate::uri::canonicalize(&workspace.0).unwrap();
+        write(
+            &root.join("node_modules/$app/tsconfig.json"),
+            r#"{ "compilerOptions": { "rootDirs": ["../..", "../../.svelte-kit/types"] } }"#,
+        );
+        write(
+            &root.join("node_modules/$app/tsconfig/service-worker.json"),
+            "{}",
+        );
+        assert_eq!(
+            resolve_extends_target(&root, "$app/tsconfig"),
+            Some(root.join("node_modules/$app/tsconfig.json"))
+        );
+        // A package's own directory config still answers when there is no file.
+        write(&root.join("node_modules/base/tsconfig.json"), "{}");
+        assert_eq!(
+            resolve_extends_target(&root, "base"),
+            Some(root.join("node_modules/base/tsconfig.json"))
+        );
     }
 
     /// Upstream switches a project with svelte-native installed to
