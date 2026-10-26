@@ -1453,6 +1453,9 @@ struct Server {
     preprocess_event_sender: Sender<PreprocessEvent>,
     preprocess_failures: HashMap<PathBuf, (i32, String)>,
     preprocess_documents: HashMap<PathBuf, PreprocessDocumentState>,
+    /// The version each component was last sent to the sidecar at, until it
+    /// answers that version ([`Self::awaiting_preprocess`]).
+    preprocess_pending: HashMap<PathBuf, i32>,
     preprocess_dependencies: HashMap<PathBuf, HashSet<PathBuf>>,
     watched_preprocess_directories: HashSet<PathBuf>,
     /// Which Svelte config preprocesses each directory's documents.
@@ -1537,6 +1540,7 @@ impl Server {
             preprocess_event_sender,
             preprocess_failures: HashMap::new(),
             preprocess_documents: HashMap::new(),
+            preprocess_pending: HashMap::new(),
             preprocess_dependencies: HashMap::new(),
             watched_preprocess_directories: HashSet::new(),
             preprocess_configs: PreprocessConfigCache::default(),
@@ -1803,6 +1807,12 @@ impl Server {
         };
         if !self.settings.lint_enable || !is_lint_target(document) {
             self.forward_tsgo_request(tsgo_fallback);
+            return;
+        }
+        if self.awaiting_preprocess(&uri_to_path(uri.as_str()), document.version) {
+            // tsgo's half alone; the sidecar's answer asks the editor to pull again.
+            self.join(id.clone(), tsgo_fallback);
+            self.join_native(id, serde_json::to_value(diagnostic_report(Vec::new())).ok());
             return;
         }
         self.worker.submit(Job::PullDiagnostics {
@@ -2916,6 +2926,7 @@ impl Server {
                         self.preprocess = None;
                         self.preprocess_failures.clear();
                         self.preprocess_documents.clear();
+                        self.preprocess_pending.clear();
                         self.preprocess_dependencies.clear();
                         self.rebuild_tsgo_overlays();
                     } else {
@@ -4233,6 +4244,7 @@ impl Server {
             }
             self.preprocess_failures.remove(&path);
             self.preprocess_documents.remove(&path);
+            self.preprocess_pending.remove(&path);
             self.preprocess_dependencies.remove(&path);
             if let Some((version, text)) = closed_source {
                 let _ = self.queue_preprocess_path(path, version, text);
@@ -4507,6 +4519,7 @@ impl Server {
             self.preprocess = None;
             self.preprocess_failures.clear();
             self.preprocess_documents.clear();
+            self.preprocess_pending.clear();
             self.preprocess_dependencies.clear();
             return;
         }
@@ -4531,7 +4544,12 @@ impl Server {
             }
         };
         for input in inputs {
-            let _ = client.preprocess(input);
+            let filename = crate::uri::canonicalize(&input.filename)
+                .unwrap_or_else(|_| input.filename.clone());
+            let version = input.version;
+            if client.preprocess(input).is_ok() {
+                self.preprocess_pending.insert(filename, version);
+            }
         }
         self.preprocess = Some(PreprocessRuntime {
             client,
@@ -4632,23 +4650,40 @@ impl Server {
             .find(&filename, &workspace)
             .is_none()
         {
+            self.preprocess_pending.remove(&filename);
             if let Some(runtime) = &self.preprocess {
                 let _ = runtime.client.remove(filename);
             }
             return false;
         }
         if let Some(runtime) = &self.preprocess {
-            return runtime
+            let queued = runtime
                 .client
                 .preprocess(PreprocessInput {
                     workspace,
-                    filename,
+                    filename: filename.clone(),
                     version,
                     text,
                 })
                 .is_ok();
+            if queued {
+                self.preprocess_pending.insert(filename, version);
+            }
+            return queued;
         }
         false
+    }
+
+    /// Whether the sidecar has yet to answer this version of the document.
+    /// Upstream compiles only the preprocessed text (`SvelteDocument`), so the
+    /// compiler has nothing to report until then: the text as written would
+    /// report what the preprocessor removes, such as a script's `enum`.
+    fn awaiting_preprocess(&self, path: &Path, version: i32) -> bool {
+        if self.preprocess.is_none() {
+            return false;
+        }
+        let path = crate::uri::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.preprocess_pending.get(&path) == Some(&version)
     }
 
     fn preprocess_workspace_for_path(&self, path: &Path) -> Option<PathBuf> {
@@ -4755,6 +4790,7 @@ impl Server {
         self.preprocess_known_empty = false;
         self.preprocess_failures.clear();
         self.preprocess_documents.clear();
+        self.preprocess_pending.clear();
         self.preprocess_dependencies.clear();
         self.preprocess = None;
         self.ensure_preprocess_runtime();
@@ -4778,6 +4814,9 @@ impl Server {
                 }
                 let filename =
                     crate::uri::canonicalize(&output.filename).unwrap_or(output.filename);
+                if self.preprocess_pending.get(&filename) == Some(&output.version) {
+                    self.preprocess_pending.remove(&filename);
+                }
                 let original = self
                     .documents
                     .iter()
@@ -4851,6 +4890,9 @@ impl Server {
                 log::warn(format_args!("preprocessing failed: {message}"));
                 if let (Some(filename), Some(version)) = (filename, version) {
                     let filename = crate::uri::canonicalize(&filename).unwrap_or(filename);
+                    if self.preprocess_pending.get(&filename) == Some(&version) {
+                        self.preprocess_pending.remove(&filename);
+                    }
                     self.preprocess_failures
                         .insert(filename.clone(), (version, message));
                     self.preprocess_documents.remove(&filename);
@@ -4896,6 +4938,7 @@ impl Server {
                 log::warn(format_args!(
                     "preprocess sidecar restart circuit opened after {crashes} crashes: {error}"
                 ));
+                self.preprocess_pending.clear();
                 for input in self.preprocess_inputs() {
                     self.preprocess_documents.remove(&input.filename);
                     self.preprocess_failures
@@ -4980,6 +5023,7 @@ impl Server {
                     self.preprocess = None;
                     self.preprocess_failures.clear();
                     self.preprocess_documents.clear();
+                    self.preprocess_pending.clear();
                     self.preprocess_dependencies.clear();
                     self.rebuild_tsgo_overlays();
                 } else {
@@ -6779,6 +6823,11 @@ impl Server {
             } else {
                 self.publish(uri, version, Vec::new());
             }
+            return;
+        }
+        if self.awaiting_preprocess(&uri_to_path(key), version) {
+            // The sidecar's answer lints it again.
+            self.linted.remove(key);
             return;
         }
         self.worker.submit(Job::Lint {

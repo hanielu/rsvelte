@@ -1073,6 +1073,111 @@ export default {
     assert_eq!(server.shutdown(), Some(0));
 }
 
+/// A component whose `enum` only its (slow) preprocessor removes, as
+/// `vitePreprocess({ script: true })` does: the text as written is a
+/// `typescript_invalid_feature` parse error, the preprocessed text compiles.
+const ENUM_SOURCE: &str = "<script lang=\"ts\">\n\tenum Status { A }\n\tconst value = Status.A;\n</script>\n\n<p>{value}</p>\n";
+
+fn write_slow_enum_preprocess_fixture(root: &Path) {
+    write_preprocess_fixture(root, &root.join("config-executed"));
+    std::fs::write(
+        root.join("svelte.config.mjs"),
+        r#"
+export default {
+  preprocess: {
+    async markup({ content }) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      return { code: content.replace('enum Status { A }', 'const Status = { A: 0 };') };
+    }
+  }
+};
+"#,
+    )
+    .unwrap();
+}
+
+fn reports_the_raw_parse_error(diagnostics: &[Value]) -> bool {
+    diagnostics.iter().any(|diagnostic| {
+        diagnostic["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("typescript_invalid_feature"))
+    })
+}
+
+/// Upstream compiles only the preprocessed text, so an editor never sees what
+/// a preprocessor removes. Opened before the server's `workspace/configuration`
+/// is answered, as an editor opens a file at once, the answer's re-lint came
+/// while the sidecar was still working and published the raw text's errors.
+#[test]
+fn a_component_awaiting_preprocessing_publishes_no_raw_compiler_errors() {
+    if Command::new("node").arg("--version").output().is_err() {
+        return;
+    }
+    let root = temp_dir("preprocess-pending-push");
+    write_slow_enum_preprocess_fixture(&root);
+    let uri = file_uri(&root.join("App.svelte"));
+    let mut server = Server::start();
+    let id = server.request(
+        "initialize",
+        json!({
+            "processId": Value::Null,
+            "rootUri": file_uri(&root),
+            "initializationOptions": { "isTrusted": true },
+            "capabilities": { "workspace": { "configuration": true } },
+        }),
+    );
+    server.response(id);
+    server.notify("initialized", json!({}));
+    did_open(&mut server, &uri, ENUM_SOURCE);
+
+    let first = server.diagnostics(&uri);
+    assert!(!reports_the_raw_parse_error(&first), "{first:#?}");
+    assert_eq!(server.shutdown(), Some(0));
+}
+
+/// The same for an editor that pulls: until the sidecar answers, a pull gets
+/// no compiler diagnostics, and the answer asks the editor to pull again.
+#[test]
+fn a_pull_before_preprocessing_answers_reports_no_raw_compiler_errors() {
+    if Command::new("node").arg("--version").output().is_err() {
+        return;
+    }
+    let root = temp_dir("preprocess-pending-pull");
+    write_slow_enum_preprocess_fixture(&root);
+    let uri = file_uri(&root.join("App.svelte"));
+    let mut server = Server::start();
+    let id = server.request(
+        "initialize",
+        json!({
+            "processId": Value::Null,
+            "rootUri": file_uri(&root),
+            "initializationOptions": { "isTrusted": true },
+            "capabilities": {
+                "workspace": { "configuration": true, "diagnostics": { "refreshSupport": true } },
+                "textDocument": { "diagnostic": {} },
+            },
+        }),
+    );
+    server.response(id);
+    server.notify("initialized", json!({}));
+    did_open(&mut server, &uri, ENUM_SOURCE);
+
+    let report = server.pull_diagnostics(&uri);
+    let items = report["items"].as_array().cloned().unwrap_or_default();
+    assert!(!reports_the_raw_parse_error(&items), "{items:#?}");
+    loop {
+        let message = server.read();
+        let refresh = message["method"] == "workspace/diagnostic/refresh";
+        server.answer_server_request(&message);
+        if refresh {
+            break;
+        }
+    }
+    let report = server.pull_diagnostics(&uri);
+    assert_eq!(report["items"], json!([]));
+    assert_eq!(server.shutdown(), Some(0));
+}
+
 /// `HTMLHover.doesSupportMarkdown` (`htmlHover.js:242-251`) and
 /// `HTMLCompletion.doesSupportMarkdown` (`htmlCompletion.js:554-563`) read two
 /// different client capabilities. The LSP differential gate declares neither,
