@@ -200,12 +200,16 @@ impl ScopeRoot {
     /// `scope_idx`. Scope 0 is intentionally polluted with every child-scope
     /// declaration, so a plain `get_binding` answers with an `{#each}` item or
     /// an `{#await}` value for a reference nowhere near its block; upstream's
-    /// scope chain has no such name there at all.
+    /// scope chain has no such name there at all. A declaration tag's binding
+    /// is block-local too, whatever its kind: `{const open = $derived(…)}` in
+    /// one `{#each}` is a `Derived` binding, and was taken for a `bind:`
+    /// setter's `(open) =>` parameter elsewhere in the template.
     pub fn is_block_local_out_of_scope(&self, binding_idx: usize, scope_idx: usize) -> bool {
         let Some(binding) = self.bindings.get(binding_idx) else {
             return false;
         };
-        binding.kind.is_block_local() && !self.is_scope_ancestor_of(binding.scope_index, scope_idx)
+        (binding.kind.is_block_local() || binding.declaration_tag)
+            && !self.is_scope_ancestor_of(binding.scope_index, scope_idx)
     }
 
     /// Look up the first binding (in declaration order) with the given name
@@ -459,6 +463,9 @@ pub struct Binding {
     /// duplicate check has to be about implementations rather than about the
     /// `function` keyword.
     pub is_function_implementation: bool,
+    /// Declared by a `{let …}` / `{const …}` declaration tag: scoped to its
+    /// template block whatever its kind (`$derived` makes it `Derived`).
+    pub declaration_tag: bool,
     /// The AST node type of the initial value expression (e.g., "BinaryExpression", "Literal").
     /// Used by should_proxy() to determine if an identifier's initial value needs deep reactivity.
     pub initial_node_type: Option<String>,
@@ -570,6 +577,7 @@ impl Binding {
             initial_is_defined: false,
             initial_is_function: false,
             is_function_implementation: false,
+            declaration_tag: false,
             initial_node_type: None,
             initial_identifier_name: None,
             init_rune: None,
@@ -611,6 +619,7 @@ impl Binding {
             initial_is_defined: false,
             initial_is_function: false,
             is_function_implementation: false,
+            declaration_tag: false,
             initial_node_type: None,
             initial_identifier_name: None,
             init_rune: None,

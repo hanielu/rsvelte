@@ -4132,7 +4132,13 @@ impl<'a> ScopeBuilder<'a> {
                     }
                     self.validation_errors.push(error);
                 }
-                self.declare_binding(name.to_string(), binding_kind, decl_kind, span_of(pattern));
+                let idx = self.declare_binding(
+                    name.to_string(),
+                    binding_kind,
+                    decl_kind,
+                    span_of(pattern),
+                );
+                self.bindings[idx].declaration_tag = true;
             }
             JsNode::ObjectPattern { properties, .. }
             | JsNode::ObjectExpression { properties, .. } => {
