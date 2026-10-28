@@ -1720,6 +1720,16 @@ impl TsgoOverlay {
             .map(|entry| entry.source_text.as_str())
     }
 
+    /// [`Self::source_text`] for a component, `None` for a plain module.
+    #[must_use]
+    pub fn component_source_text(&self, source_path: &Path) -> Option<&str> {
+        let path = self.lookup_source_path(source_path);
+        self.entries
+            .get(&path)
+            .filter(|entry| entry.is_component())
+            .map(|entry| entry.source_text.as_str())
+    }
+
     /// Preprocessed Svelte text used as input to svelte2tsx.
     #[must_use]
     pub fn preprocessed_text(&self, source_path: &Path) -> Option<&str> {

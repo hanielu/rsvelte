@@ -185,6 +185,21 @@ pub fn run_stdio() -> Result<ExitCode> {
     Ok(code)
 }
 
+/// The token types of the semantic token legend: tsgo's, narrowed to the ones
+/// the editor advertised.
+fn semantic_token_types(client: &ClientState) -> Vec<&'static str> {
+    TSGO_SEMANTIC_TOKEN_TYPES
+        .iter()
+        .copied()
+        .filter(|token| {
+            client
+                .semantic_token_types
+                .iter()
+                .any(|supported| supported == token)
+        })
+        .collect()
+}
+
 fn capabilities(client: &ClientState) -> ServerCapabilities {
     let mut code_action_kinds = vec![
         CodeActionKind::QUICKFIX,
@@ -263,15 +278,9 @@ fn capabilities(client: &ClientState) -> ServerCapabilities {
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
             SemanticTokensOptions {
                 legend: SemanticTokensLegend {
-                    token_types: TSGO_SEMANTIC_TOKEN_TYPES
-                        .iter()
-                        .filter(|token| {
-                            client
-                                .semantic_token_types
-                                .iter()
-                                .any(|supported| supported == **token)
-                        })
-                        .map(|token| SemanticTokenType::new(token))
+                    token_types: semantic_token_types(client)
+                        .into_iter()
+                        .map(SemanticTokenType::new)
                         .collect(),
                     token_modifiers: TSGO_SEMANTIC_TOKEN_MODIFIERS
                         .iter()
@@ -5350,6 +5359,9 @@ impl Server {
                                 rename.new_shadow.clone(),
                                 &rename.old_source,
                             );
+                        }
+                        if method.starts_with("textDocument/semanticTokens/") {
+                            mapper.set_semantic_token_types(semantic_token_types(&self.client));
                         }
                         mapper.map_response(&method, result);
                     }

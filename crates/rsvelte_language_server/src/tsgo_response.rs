@@ -14,7 +14,7 @@ use rsvelte_core::ast::template::Root;
 use serde_json::{Map, Value};
 
 use crate::context::{EmbeddedRegions, ScriptBodies, attribute_context, script_bodies};
-use crate::nodes::{offset_is_in_attribute, parse_root};
+use crate::nodes::{offset_is_in_attribute, offset_is_on_component, parse_root};
 use crate::text::LineIndex;
 use crate::tsgo_inlay_hints::{HintKind, ShadowNodes, render_return_type_without_a_tree};
 use crate::tsgo_overlay::{TsgoOverlay, is_in_generated_code};
@@ -71,6 +71,9 @@ pub struct TsgoResponseMapper<'a> {
     /// a copy of the author's text lands at the copy's source instead of
     /// being dropped (see [`TsgoOverlay::map_diagnostic_range`]).
     diagnostic_ranges: bool,
+    /// The semantic token legend the server announced, which the token types
+    /// in tsgo's answers index ([`Self::set_semantic_token_types`]).
+    semantic_token_types: Vec<&'static str>,
     caches: MapperCaches<'a>,
 }
 
@@ -118,6 +121,7 @@ impl<'a> TsgoResponseMapper<'a> {
             clamp_request_ranges: false,
             definition_locations: false,
             diagnostic_ranges: false,
+            semantic_token_types: Vec::new(),
             caches: MapperCaches::new(),
         }
     }
@@ -132,6 +136,7 @@ impl<'a> TsgoResponseMapper<'a> {
             clamp_request_ranges: false,
             definition_locations: false,
             diagnostic_ranges: false,
+            semantic_token_types: Vec::new(),
             caches: MapperCaches::new(),
         }
     }
@@ -149,6 +154,7 @@ impl<'a> TsgoResponseMapper<'a> {
             clamp_request_ranges: false,
             definition_locations: false,
             diagnostic_ranges: false,
+            semantic_token_types: Vec::new(),
             caches: MapperCaches::new(),
         }
     }
@@ -166,6 +172,7 @@ impl<'a> TsgoResponseMapper<'a> {
             clamp_request_ranges: false,
             definition_locations: false,
             diagnostic_ranges: false,
+            semantic_token_types: Vec::new(),
             caches: MapperCaches::new(),
         }
     }
@@ -183,6 +190,7 @@ impl<'a> TsgoResponseMapper<'a> {
             clamp_request_ranges: false,
             definition_locations: false,
             diagnostic_ranges: false,
+            semantic_token_types: Vec::new(),
             caches: MapperCaches::new(),
         }
     }
@@ -199,6 +207,7 @@ impl<'a> TsgoResponseMapper<'a> {
             clamp_request_ranges: false,
             definition_locations: false,
             diagnostic_ranges: false,
+            semantic_token_types: Vec::new(),
             caches: MapperCaches::new(),
         }
     }
@@ -212,6 +221,12 @@ impl<'a> TsgoResponseMapper<'a> {
     #[must_use]
     pub fn default_document(&self) -> Option<&RequestDocumentContext> {
         self.default_document.as_ref()
+    }
+
+    /// The token types of the announced semantic token legend, in order.
+    /// Without them no token is filtered by its type.
+    pub fn set_semantic_token_types(&mut self, types: Vec<&'static str>) {
+        self.semantic_token_types = types;
     }
 
     /// Treat a prospective shadow URI as another name for an existing
@@ -269,6 +284,7 @@ impl<'a> TsgoResponseMapper<'a> {
                 clamp_request_ranges: true,
                 definition_locations: false,
                 diagnostic_ranges: false,
+                semantic_token_types: Vec::new(),
                 caches: MapperCaches::new(),
             };
             return clamping.map_transactional(method, params, Direction::SourceToShadow);
@@ -303,6 +319,7 @@ impl<'a> TsgoResponseMapper<'a> {
                 clamp_request_ranges: self.clamp_request_ranges,
                 definition_locations: true,
                 diagnostic_ranges: false,
+                semantic_token_types: Vec::new(),
                 caches: MapperCaches::new(),
             };
             return definitions.map_response(method, result);
@@ -352,6 +369,7 @@ impl<'a> TsgoResponseMapper<'a> {
             clamp_request_ranges: self.clamp_request_ranges,
             definition_locations: self.definition_locations,
             diagnostic_ranges: true,
+            semantic_token_types: Vec::new(),
             caches: MapperCaches::new(),
         })
     }
@@ -752,6 +770,30 @@ impl<'a> TsgoResponseMapper<'a> {
         }
         let input = std::mem::take(data);
 
+        // `SemanticTokensProvider.ts` `map`: "Ensure components in the template
+        // get no semantic highlighting".
+        let component_types: Vec<u32> = self
+            .semantic_token_types
+            .iter()
+            .zip(0u32..)
+            .filter(|(name, _)| {
+                matches!(
+                    **name,
+                    "class" | "type" | "parameter" | "variable" | "function"
+                )
+            })
+            .map(|(_, index)| index)
+            .collect();
+        let component_source = if component_types.is_empty() || context.plain_text.is_some() {
+            None
+        } else {
+            self.overlay_for_context(context)
+                .and_then(|overlay| overlay.component_source_text(&context.source_path))
+        };
+        let allocator = Allocator::default();
+        let mut source_index = None;
+        let mut template = None;
+
         let mut line = 0u32;
         let mut character = 0u32;
         let mut tokens = Vec::with_capacity(input.len() / 5);
@@ -799,6 +841,24 @@ impl<'a> TsgoResponseMapper<'a> {
                 || source.start.character >= source.end.character
             {
                 continue;
+            }
+            if component_types.contains(&token_type)
+                && let Some(text) = component_source
+            {
+                let index = source_index.get_or_insert_with(|| LineIndex::new(text));
+                let offset = index.offset(text, source.start);
+                if offset > 0
+                    && matches!(text.as_bytes().get(offset - 1), Some(b'<' | b'/'))
+                    && template
+                        .get_or_insert_with(|| parse_root(text, &allocator))
+                        .as_ref()
+                        .is_some_and(|root| {
+                            u32::try_from(offset)
+                                .is_ok_and(|offset| offset_is_on_component(root, offset))
+                        })
+                {
+                    continue;
+                }
             }
             tokens.push((
                 source.start.line,
@@ -2736,6 +2796,88 @@ mod tests {
         assert_eq!(encoded[6], second_source.start.character);
         assert_eq!(encoded[7], 4);
         assert_eq!(first_source.end.character - first_source.start.character, 4);
+    }
+
+    #[test]
+    fn semantic_tokens_skip_component_tag_names() {
+        let source = "<script lang=\"ts\">\nlet { as: AsComponent } = $props();\n</script>\n<AsComponent>{AsComponent}</AsComponent>\n";
+        let (_workspace, path, overlay) = overlay(source);
+        let shadow = overlay.shadow_for_source(&path).unwrap();
+        let index = crate::text::LineIndex::new(source);
+        let types = vec!["namespace", "class", "variable"];
+        let (namespace, variable) = (0, 2);
+        let mut tokens = Vec::new();
+        for (offset, _) in source.match_indices("AsComponent") {
+            let range = Range::new(
+                index.position(source, offset),
+                index.position(source, offset + "AsComponent".len()),
+            );
+            let generated = overlay.map_source_range(&path, range).unwrap();
+            tokens.push((generated, variable, range));
+        }
+        // Upstream filters a component by the token's type, not its place.
+        let opening = tokens[1];
+        tokens.push((opening.0, namespace, opening.2));
+        tokens.sort_by_key(|(range, token_type, _)| {
+            (range.start.line, range.start.character, *token_type)
+        });
+        let mut data = Vec::new();
+        let (mut line, mut character) = (0, 0);
+        for (range, token_type, _) in &tokens {
+            let delta_line = range.start.line - line;
+            let delta_start = if delta_line == 0 {
+                range.start.character - character
+            } else {
+                range.start.character
+            };
+            data.extend([
+                delta_line,
+                delta_start,
+                range.end.character - range.start.character,
+                *token_type,
+                0,
+            ]);
+            (line, character) = (range.start.line, range.start.character);
+        }
+        let mut result = json!({ "data": data });
+        let context = TsgoResponseMapper::new(&overlay)
+            .document_context(&shadow.source_uri)
+            .unwrap();
+        let mut mapper = TsgoResponseMapper::with_default_document(&overlay, Some(context));
+        mapper.set_semantic_token_types(types);
+        assert!(mapper.map_response("textDocument/semanticTokens/full", &mut result));
+
+        let encoded: Vec<u32> = result["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| u32::try_from(value.as_u64().unwrap()).unwrap())
+            .collect();
+        let (mut line, mut character) = (0, 0);
+        let mut kept = Vec::new();
+        for token in encoded.as_chunks::<5>().0 {
+            line += token[0];
+            character = if token[0] == 0 {
+                character + token[1]
+            } else {
+                token[1]
+            };
+            kept.push((
+                &source[index.offset(source, Position::new(line, character))..][..11],
+                index.position(source, index.offset(source, Position::new(line, character))),
+                token[3],
+            ));
+        }
+        let [declaration, opening_tag, expression, _closing_tag] =
+            [0, 1, 2, 3].map(|n| tokens.iter().filter(|t| t.1 == variable).nth(n).unwrap().2);
+        assert_eq!(
+            kept,
+            [
+                ("AsComponent", declaration.start, variable),
+                ("AsComponent", opening_tag.start, namespace),
+                ("AsComponent", expression.start, variable),
+            ]
+        );
     }
 
     #[test]

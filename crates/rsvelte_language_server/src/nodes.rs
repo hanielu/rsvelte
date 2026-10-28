@@ -385,6 +385,26 @@ mod tests {
     }
 
     #[test]
+    fn only_a_component_s_own_text_is_on_the_component() {
+        let text = "<A {b} c={d/e}>{f<g}<div></div><svelte:self /></A><UI.Button /><h />";
+        let (_allocator, root) = root_of(text);
+        let root = root.unwrap();
+        let on = |needle: &str, nth: usize| {
+            let offset = text.match_indices(needle).nth(nth).unwrap().0;
+            offset_is_on_component(&root, u32::try_from(offset).unwrap())
+        };
+        assert!(on("A", 0), "opening tag name");
+        assert!(on("A", 1), "closing tag name");
+        assert!(on("self", 0));
+        assert!(on("UI", 0));
+        assert!(!on("b", 0), "shorthand attribute");
+        assert!(!on("e", 0), "attribute expression");
+        assert!(!on("g", 0), "child expression");
+        assert!(!on("div", 0), "child element");
+        assert!(!on("h", 0), "element");
+    }
+
+    #[test]
     fn a_snippet_carries_its_name_span() {
         let text = "{#snippet row(item)}{item}{/snippet}";
         let (_allocator, root) = root_of(text);
@@ -394,6 +414,50 @@ mod tests {
         assert_eq!(&text[10..13], "row");
         assert_eq!(snippet.name_span, Some((10, 13)));
     }
+}
+
+/// Upstream's `svelteNodeAt(offset)?.type === 'InlineComponent'`
+/// (`SemanticTokensProvider.ts`, `map`): the deepest node at the offset is a
+/// component — `Component`, `<svelte:component>` or `<svelte:self>` here — and
+/// not one of its attributes, expressions or children. Of two siblings that
+/// both reach the offset, upstream's walk enters the later one last.
+#[must_use]
+pub fn offset_is_on_component(root: &Root<'_>, offset: u32) -> bool {
+    fn in_fragment(fragment: &Fragment<'_>, offset: u32) -> Option<bool> {
+        fragment
+            .nodes
+            .iter()
+            .rev()
+            .find_map(|node| in_node(node, offset))
+    }
+    fn in_node(node: &TemplateNode<'_>, offset: u32) -> Option<bool> {
+        let view = view(node);
+        if !view.contains(offset as usize) {
+            return None;
+        }
+        let in_part = view.attributes.iter().any(|attribute| {
+            let (start, end) = attribute.span();
+            (start..=end).contains(&offset)
+        }) || view
+            .expressions()
+            .any(|(start, end)| (start..=end).contains(&offset));
+        if in_part {
+            return Some(false);
+        }
+        let is_component = matches!(
+            node,
+            TemplateNode::Component(_)
+                | TemplateNode::SvelteComponent(_)
+                | TemplateNode::SvelteSelf(_)
+        );
+        Some(
+            view.fragments()
+                .filter_map(|fragment| in_fragment(fragment, offset))
+                .last()
+                .unwrap_or(is_component),
+        )
+    }
+    in_fragment(&root.fragment, offset).unwrap_or(false)
 }
 
 /// Upstream's `svelteNodeAt(position)` fed through
