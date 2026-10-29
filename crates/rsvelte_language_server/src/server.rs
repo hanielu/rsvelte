@@ -2796,30 +2796,46 @@ impl Server {
                         // The overlay cache holds this server's own output — the
                         // shadow bodies, the overlay configs — so an event there
                         // is an echo of a write, never a change to the project.
-                        // tsgo still hears it below.
-                        let changes = params
-                            .changes
-                            .iter()
-                            .filter(|change| {
-                                !tsgo_overlay::is_cache_path(&uri_to_path(change.uri.as_str()))
-                            })
-                            .collect::<Vec<_>>();
-                        let project_changed =
-                            changes.iter().any(|change| is_project_config(&change.uri));
-                        let dependency_changed = changes.iter().any(|change| {
-                            let path = uri_to_path(change.uri.as_str());
-                            let path = crate::uri::canonicalize(&path).unwrap_or(path);
-                            self.preprocess_dependencies
+                        // Of a `node_modules`, which an editor reports in full once
+                        // a watcher covers it, only what `is_server_change` keeps
+                        // matters. tsgo still hears every event below.
+                        let (changes, project_changed, dependency_changed, package_changed) = {
+                            let dependency_names = self
+                                .preprocess_dependencies
                                 .values()
-                                .any(|dependencies| dependencies.contains(&path))
-                        });
-                        let package_changed = changes.iter().any(|change| {
-                            let path = uri_to_path(change.uri.as_str());
-                            path.file_name().is_some_and(|name| name == "package.json")
-                                && !path
-                                    .components()
-                                    .any(|component| component.as_os_str() == "node_modules")
-                        });
+                                .flatten()
+                                .filter_map(|path| path.file_name())
+                                .collect::<HashSet<_>>();
+                            let changes = params
+                                .changes
+                                .iter()
+                                .map(|change| (uri_to_path(change.uri.as_str()), change.typ))
+                                .filter(|(path, _)| is_server_change(path, &dependency_names))
+                                .collect::<Vec<_>>();
+                            let project_changed =
+                                changes.iter().any(|(path, _)| is_project_config(path));
+                            let dependency_changed = changes.iter().any(|(path, _)| {
+                                path.file_name()
+                                    .is_some_and(|name| dependency_names.contains(name))
+                                    && {
+                                        let path = crate::uri::canonicalize(path)
+                                            .unwrap_or_else(|_| path.clone());
+                                        self.preprocess_dependencies
+                                            .values()
+                                            .any(|dependencies| dependencies.contains(&path))
+                                    }
+                            });
+                            let package_changed = changes.iter().any(|(path, _)| {
+                                path.file_name().is_some_and(|name| name == "package.json")
+                                    && !is_in_node_modules(path)
+                            });
+                            (
+                                changes,
+                                project_changed,
+                                dependency_changed,
+                                package_changed,
+                            )
+                        };
                         if package_changed && !project_changed && !dependency_changed {
                             self.refresh_package_imports();
                         }
@@ -2828,10 +2844,6 @@ impl Server {
                             self.rebuild_tsgo_overlays();
                             self.restart_preprocessing();
                         } else if !changes.is_empty() {
-                            let changes = changes
-                                .iter()
-                                .map(|change| (uri_to_path(change.uri.as_str()), change.typ))
-                                .collect::<Vec<_>>();
                             if self.background.in_flight.is_some() {
                                 self.background
                                     .missed_events
@@ -7226,10 +7238,90 @@ fn is_typescript_or_javascript(language_id: &str, path: &Path) -> bool {
     })
 }
 
-fn is_project_config(uri: &Uri) -> bool {
-    project_config_names()
-        .iter()
-        .any(|name| uri.as_str().rsplit('/').next() == Some(name))
+/// A config of the workspace's own: one under a `node_modules` is a
+/// dependency's, and configures no project here.
+fn is_project_config(path: &Path) -> bool {
+    !is_in_node_modules(path)
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| project_config_names().contains(&name))
+}
+
+fn is_in_node_modules(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == "node_modules")
+}
+
+/// Whether a watched-file event can matter to this server, decided without
+/// touching the disk. The overlay cache is its own output. A watcher that
+/// covers `node_modules` has an editor report all of it (Zed reports what it
+/// loads there as created: 538,072 events opening a pnpm monorepo), and each
+/// event cost a path lookup on disk per project. There only a dependency's
+/// component (which a project shadows) and a preprocessor's own file count.
+fn is_server_change(path: &Path, dependency_names: &HashSet<&std::ffi::OsStr>) -> bool {
+    !tsgo_overlay::is_cache_path(path)
+        && (!is_in_node_modules(path)
+            || path
+                .extension()
+                .is_some_and(|extension| extension == "svelte")
+            || path
+                .file_name()
+                .is_some_and(|name| dependency_names.contains(name)))
+}
+
+#[cfg(test)]
+mod watched_file_tests {
+    use std::collections::HashSet;
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    use super::{is_project_config, is_server_change};
+
+    #[test]
+    fn a_dependencys_config_is_no_project_config() {
+        for config in [
+            "/w/tsconfig.json",
+            "/w/apps/web/vite.config.ts",
+            "/w/svelte.config.js",
+        ] {
+            assert!(is_project_config(Path::new(config)), "{config}");
+        }
+        for other in [
+            "/w/node_modules/dep/tsconfig.json",
+            "/w/node_modules/.pnpm/a@1/node_modules/a/vite.config.ts",
+            "/w/src/App.svelte",
+        ] {
+            assert!(!is_project_config(Path::new(other)), "{other}");
+        }
+    }
+
+    #[test]
+    fn of_node_modules_only_components_and_preprocessor_files_matter() {
+        let dependencies = HashSet::from([OsStr::new("vitePreprocess.js")]);
+        for kept in [
+            "/w/src/App.svelte",
+            "/w/src/lib/util.ts",
+            "/w/src",
+            "/w/package.json",
+            "/w/node_modules/ui/Button.svelte",
+            "/w/node_modules/@sveltejs/vite-plugin-svelte/src/vitePreprocess.js",
+        ] {
+            assert!(is_server_change(Path::new(kept), &dependencies), "{kept}");
+        }
+        for dropped in [
+            "/w/node_modules/.pnpm",
+            "/w/node_modules/dep/index.js",
+            "/w/node_modules/dep/tsconfig.json",
+            "/w/node_modules/dep/package.json",
+            "/w/.svelte-language-server-rs/tsgo/tsconfig.json",
+        ] {
+            assert!(
+                !is_server_change(Path::new(dropped), &dependencies),
+                "{dropped}"
+            );
+        }
+    }
 }
 
 /// `FoldingRangeProvider.ts:54-56`: a client that folds by line has no use for a

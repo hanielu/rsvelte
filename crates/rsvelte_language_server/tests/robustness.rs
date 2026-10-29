@@ -938,6 +938,62 @@ fn tsgo_checks_the_component_as_written_and_the_compiler_as_preprocessed() {
     server.shutdown();
 }
 
+/// A watcher that covers `node_modules` (tsgo's on the workspace root) has an
+/// editor report it: opening a pnpm monorepo, Zed reported all it loaded there
+/// as created, 538,072 events with 485 dependencies' `tsconfig.json` and
+/// `vite.config.ts` among them. A dependency's config configures no project
+/// of the workspace; each such event reloaded every project, restarted tsgo
+/// and aborted the requests in flight ("TypeScript project configuration
+/// changed" on a go to definition).
+#[test]
+fn a_dependencys_config_in_node_modules_reloads_no_project() {
+    let dir = TestDir::new("node-modules-config");
+    let helper = traffic_recorder(&dir.0);
+    let log = dir.0.join("tsgo.log");
+    let root = one_project(&dir.0);
+    fs::create_dir_all(root.join("node_modules/dep")).unwrap();
+    fs::write(root.join("node_modules/dep/tsconfig.json"), "{}").unwrap();
+    fs::write(root.join("node_modules/dep/vite.config.ts"), "").unwrap();
+    let mut server = Server::start_with_settings(
+        Some(&root),
+        &[
+            ("TSGO_BIN", helper.as_path()),
+            ("RSVELTE_TEST_TSGO_LOG", log.as_path()),
+            (
+                "RSVELTE_TEST_SLOW_METHODS",
+                Path::new("textDocument/definition"),
+            ),
+            ("RSVELTE_TEST_SLOW_MS", Path::new("1500")),
+        ],
+        json!({ "backgroundProjects": { "enable": false } }),
+    );
+    let x = file_uri(&root.join("X.svelte"));
+    server.open(&x, &fs::read_to_string(root.join("X.svelte")).unwrap());
+    assert!(hover(&mut server, &x).to_string().contains("recorded"));
+
+    let definition = server.request(
+        "textDocument/definition",
+        json!({ "textDocument": { "uri": x }, "position": { "line": 1, "character": 5 } }),
+    );
+    let created = |path: &str| json!({ "uri": file_uri(&root.join(path)), "type": 1 });
+    server.notify(
+        "workspace/didChangeWatchedFiles",
+        json!({ "changes": [
+            created("node_modules/dep"),
+            created("node_modules/dep/tsconfig.json"),
+            created("node_modules/dep/vite.config.ts"),
+        ] }),
+    );
+    let answer = server.response(definition, Duration::from_secs(10));
+    assert!(answer.get("error").is_none(), "{answer}");
+    let traffic = traffic(&log);
+    assert!(
+        !traffic.iter().any(|line| line.starts_with("shutdown")),
+        "tsgo was restarted: {traffic:?}"
+    );
+    server.shutdown();
+}
+
 /// A `Cannot find name` on a component's tag in the markup gets the
 /// component's import as a quick fix. TypeScript's own fix cannot find a
 /// component, whose default export carries svelte2tsx's suffix, so, as
@@ -1652,7 +1708,6 @@ fn a_request_tsgo_never_answers_is_answered_without_it_and_holds_nothing_back() 
 }
 
 /// One project at `<dir>/ws` holding `X.svelte`; returns the workspace root.
-#[cfg(unix)]
 fn one_project(dir: &Path) -> PathBuf {
     let root = rsvelte_language_server::uri::canonicalize(dir)
         .unwrap()
